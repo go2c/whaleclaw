@@ -55,34 +55,16 @@ class MemorySearchResult(BaseModel):
     score: float                     # 相似度分数 (0-1)
 ```
 
-### 1.2 向量存储 — `whaleclaw/memory/vector.py`
+### 1.2 当前实现后端 — `whaleclaw/memory/vector.py`
 
-基于 ChromaDB:
+当前默认实现为 `SimpleMemoryStore`：
 
-```python
-class ChromaMemoryStore(MemoryStore):
-    """ChromaDB 向量记忆存储"""
+- 存储: `~/.whaleclaw/memory/memory.json`
+- 检索: 关键词匹配 + 分数阈值
+- 管理: `MemoryManager` 中做去重、限频、批量写入、重排与裁剪
 
-    def __init__(self, persist_dir: Path):
-        """初始化 ChromaDB 客户端和集合"""
-
-    async def add(self, content, source, tags) -> MemoryEntry:
-        """
-        1. 生成 embedding (通过 LLM Provider 或本地模型)
-        2. 存入 ChromaDB
-        """
-
-    async def search(self, query, limit, min_score) -> list[MemorySearchResult]:
-        """
-        1. 将 query 转为 embedding
-        2. ChromaDB 相似度搜索
-        3. 过滤低分结果
-        """
-```
-
-Embedding 生成:
-- 优先使用 OpenAI `text-embedding-3-small`
-- 备选: 本地 sentence-transformers 模型
+说明:
+- 设计上保留 `MemoryStore` 抽象，可后续切换到向量库（如 ChromaDB/LanceDB）。
 
 ### 1.3 自动摘要 — `whaleclaw/memory/summary.py`
 
@@ -118,25 +100,35 @@ class MemoryManager:
         动态层预算决定 (默认 ~500 tokens)。
         """
 
-    async def memorize(self, session: Session) -> None:
-        """对话结束后自动提取并存储重要信息"""
+    async def auto_capture_user_message(...) -> bool:
+        """按规则自动捕获，支持去重/限频/缓冲批量写入"""
 
-    async def compact(self, session: Session) -> list[Message]:
-        """
-        /compact 命令:
-        1. 生成对话摘要
-        2. 提取关键事实存入长期记忆
-        3. 用摘要替换历史消息
-        """
+    async def organize_if_needed(...) -> bool:
+        """低频调用 LLM 生成 L0/L1 画像，并裁剪旧原始记忆"""
+
+    async def get_global_style_directive() -> str:
+        """读取长期记忆提炼出的全局回复风格"""
 ```
 
 记忆注入时机:
-- 每次用户发消息时，PromptAssembler 动态层调用 `recall(query, max_tokens)`
-- max_tokens 由 PromptAssembler 根据剩余预算动态计算
-- 如果技能路由命中了 2 个技能 (占用 ~800 tokens)，记忆预算会相应减少
-- 如果无技能命中，记忆可获得更多预算 (最多 ~800 tokens)
+- `run_agent` 入口先按 `recall_policy` 判断是否触发 recall
+- 创作类任务（PPT/文档/代码等）自动注入 L0 画像
+- raw 记忆只在强意图（继续上次/按之前）时补充
+- 全局风格指令（style_directive）可每轮低成本注入，用户本轮明确要求优先
 
-### 1.5 EvoMap 知识集成
+### 1.5 全局风格 API
+
+Gateway 提供:
+
+```
+GET    /api/memory/style
+POST   /api/memory/style
+DELETE /api/memory/style
+```
+
+用于 WebChat 设置面板查看/手动覆盖/清除全局回复风格。
+
+### 1.6 EvoMap 知识集成
 
 EvoMap 拉取的已验证资产 (Capsule) 可作为记忆来源:
 

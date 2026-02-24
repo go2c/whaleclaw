@@ -62,7 +62,9 @@ createApp({
 
     const token = ref(localStorage.getItem('wc-token') || '');
     const needLogin = ref(false);
+    const authMode = ref('none');
     const loginPassword = ref('');
+    const loginToken = ref('');
     const loginError = ref('');
 
     const sessions = ref([]);
@@ -73,6 +75,10 @@ createApp({
     const showSettings = ref(false);
     const showSidebar = ref(false);
     const pendingImages = ref([]);
+    const memoryStyle = ref('');
+    const memoryStyleEnabled = ref(true);
+    const memoryStyleLoading = ref(false);
+    const memoryStyleSaving = ref(false);
 
     const currentModel = ref('');
     const thinkingLevel = ref('off');
@@ -129,7 +135,7 @@ createApp({
       if (token.value) headers['Authorization'] = `Bearer ${token.value}`;
       const res = await fetch(`${apiBase}${path}`, { ...opts, headers });
       if (res.status === 401) {
-        needLogin.value = true;
+        if (!needLogin.value) needLogin.value = true;
         throw new Error('auth');
       }
       const data = await res.json();
@@ -151,6 +157,24 @@ createApp({
 
     async function doLogin() {
       loginError.value = '';
+
+      if (authMode.value === 'token') {
+        const t = loginToken.value.trim();
+        if (!t) { loginError.value = '请输入 Token'; return; }
+        token.value = t;
+        localStorage.setItem('wc-token', t);
+        try {
+          await apiFetch('/api/auth/verify');
+          needLogin.value = false;
+          await init();
+        } catch {
+          token.value = '';
+          localStorage.removeItem('wc-token');
+          loginError.value = 'Token 无效';
+        }
+        return;
+      }
+
       try {
         const res = await fetch(`${apiBase}/api/auth/login`, {
           method: 'POST',
@@ -171,6 +195,20 @@ createApp({
       }
     }
 
+    function doLogout() {
+      token.value = '';
+      localStorage.removeItem('wc-token');
+      loginPassword.value = '';
+      loginToken.value = '';
+      loginError.value = '';
+      needLogin.value = true;
+      if (ws) {
+        ws._intentionalClose = true;
+        ws.close();
+        ws = null;
+      }
+    }
+
     /* ── Models ── */
     async function loadModels() {
       try {
@@ -186,15 +224,22 @@ createApp({
       } catch { /* ignore */ }
     }
 
-    async function loadTokenUsage(sessionId) {
-      try {
-        const [sData, tData] = await Promise.all([
-          apiFetch(`/api/sessions/${sessionId}/token-usage`),
-          apiFetch('/api/token-usage'),
-        ]);
-        sessionTokens.value = sData;
-        totalTokens.value = tData.total || { input_tokens: 0, output_tokens: 0 };
-      } catch { /* ignore */ }
+    let _tokenUsageTimer = null;
+    function loadTokenUsage(sessionId) {
+      if (needLogin.value) return;
+      if (!token.value && authMode.value !== 'none') return;
+      clearTimeout(_tokenUsageTimer);
+      _tokenUsageTimer = setTimeout(async () => {
+        if (needLogin.value) return;
+        try {
+          const [sData, tData] = await Promise.all([
+            apiFetch(`/api/sessions/${sessionId}/token-usage`),
+            apiFetch('/api/token-usage'),
+          ]);
+          sessionTokens.value = sData;
+          totalTokens.value = tData.total || { input_tokens: 0, output_tokens: 0 };
+        } catch { /* ignore */ }
+      }, 500);
     }
 
     /* ── Skills & Tools ── */
@@ -208,6 +253,50 @@ createApp({
       try {
         tools.value = await apiFetch('/api/tools');
       } catch { /* ignore */ }
+    }
+
+    /* ── Global Memory Style ── */
+    async function loadMemoryStyle() {
+      memoryStyleLoading.value = true;
+      try {
+        const data = await apiFetch('/api/memory/style');
+        memoryStyleEnabled.value = data.enabled !== false;
+        memoryStyle.value = data.style_directive || '';
+      } catch { /* ignore */ }
+      finally {
+        memoryStyleLoading.value = false;
+      }
+    }
+
+    async function saveMemoryStyle() {
+      if (!memoryStyle.value.trim()) {
+        alert('风格指令不能为空');
+        return;
+      }
+      memoryStyleSaving.value = true;
+      try {
+        await apiFetch('/api/memory/style', {
+          method: 'POST',
+          body: JSON.stringify({ style_directive: memoryStyle.value.trim() }),
+        });
+      } catch (e) {
+        alert('保存失败: ' + (e.message || e));
+      } finally {
+        memoryStyleSaving.value = false;
+      }
+    }
+
+    async function clearMemoryStyle() {
+      if (!confirm('确定清除全局回复风格吗？')) return;
+      memoryStyleSaving.value = true;
+      try {
+        await apiFetch('/api/memory/style', { method: 'DELETE' });
+        memoryStyle.value = '';
+      } catch (e) {
+        alert('清除失败: ' + (e.message || e));
+      } finally {
+        memoryStyleSaving.value = false;
+      }
     }
 
     const _SKILL_CATEGORIES = {
@@ -595,13 +684,19 @@ createApp({
     };
     const _IMAGE_EXTS = new Set(['jpg','jpeg','png','gif','webp','bmp','svg','ico']);
 
+    function _appendToken(url) {
+      if (!token.value) return url;
+      const sep = url.includes('?') ? '&' : '?';
+      return `${url}${sep}token=${encodeURIComponent(token.value)}`;
+    }
+
     function _fileCard(filePath) {
       const name = filePath.split('/').pop();
       const ext = (name.split('.').pop() || '').toLowerCase();
       const icon = _FILE_ICONS[ext] || '📎';
       const encPath = encodeURIComponent(filePath);
-      const downloadUrl = `/api/local-file?path=${encPath}&download=true`;
-      const openUrl = `/api/local-file?path=${encPath}`;
+      const downloadUrl = _appendToken(`/api/local-file?path=${encPath}&download=true`);
+      const openUrl = _appendToken(`/api/local-file?path=${encPath}`);
       return `<div class="file-card" onclick="window.open('${openUrl}','_blank')">` +
         `<div class="file-card-icon">${icon}</div>` +
         `<div class="file-card-info">` +
@@ -621,7 +716,7 @@ createApp({
           if (!p || el.dataset.loaded) return;
           el.dataset.loaded = '1';
           try {
-            const resp = await fetch(`/api/file-info?path=${p}`);
+            const resp = await fetch(_appendToken(`/api/file-info?path=${p}`));
             if (resp.ok) {
               const info = await resp.json();
               el.textContent = `${info.ext.toUpperCase()} 文件 · ${info.size_human}`;
@@ -655,6 +750,14 @@ createApp({
           return _fileCard(filePath);
         }
       );
+
+      /* Append auth token to /api/ URLs so <img> and file cards pass auth */
+      if (token.value) {
+        html = html.replace(
+          /((?:src|href)=["'])(\/api\/[^"']+)(["'])/gi,
+          (m, pre, url, post) => `${pre}${_appendToken(url)}${post}`
+        );
+      }
 
       nextTick(_loadFileCardMeta);
       return html;
@@ -690,23 +793,30 @@ createApp({
       }
       loadSkills();
       loadTools();
+      loadMemoryStyle();
     }
 
     onMounted(async () => {
       try {
         const status = await fetch(`${apiBase}/api/status`).then((r) => r.json());
         if (status.status === 'ok') {
-          await checkAuth();
-          if (!needLogin.value) await init();
+          authMode.value = status.auth_mode || 'none';
+          if (authMode.value === 'none') {
+            needLogin.value = false;
+            await init();
+          } else {
+            await checkAuth();
+            if (!needLogin.value) await init();
+          }
         }
       } catch {
-        needLogin.value = false;
-        await init();
+        /* Gateway unreachable — assume no auth, try to init */
+        try { await init(); } catch { /* ignore */ }
       }
     });
 
     return {
-      theme, token, needLogin, loginPassword, loginError, doLogin,
+      theme, token, needLogin, authMode, loginPassword, loginToken, loginError, doLogin, doLogout,
       sessions, activeSessionId, activeSession, messages,
       inputText, isStreaming, showSettings, showSidebar, pendingImages,
       currentModel, thinkingLevel, availableModels, defaultModel, groupedModels, messagesEl,
@@ -714,6 +824,8 @@ createApp({
       activeTab, skills, tools, groupedSkills, groupedTools,
       skillInstallSource, skillInstalling, skillDetail, installSkill, uninstallSkill, showSkillDetail,
       toolDetail,
+      memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving,
+      loadMemoryStyle, saveMemoryStyle, clearMemoryStyle,
       createSession, deleteSession, switchSession,
       sendMessage, handleKeydown, switchModel, loadModels,
       toggleTheme, formatTime, renderMarkdown,
@@ -727,12 +839,22 @@ createApp({
       <div class="login-card">
         <h2>WhaleClaw</h2>
         <p v-if="loginError" class="login-error">{{ loginError }}</p>
-        <input
-          v-model="loginPassword"
-          type="password"
-          placeholder="输入密码"
-          @keydown.enter="doLogin"
-        />
+        <template v-if="authMode === 'token'">
+          <input
+            v-model="loginToken"
+            type="password"
+            placeholder="输入 Token"
+            @keydown.enter="doLogin"
+          />
+        </template>
+        <template v-else>
+          <input
+            v-model="loginPassword"
+            type="password"
+            placeholder="输入密码"
+            @keydown.enter="doLogin"
+          />
+        </template>
         <button class="btn-send" @click="doLogin">登录</button>
       </div>
     </div>
@@ -977,6 +1099,31 @@ createApp({
             <option value="light">亮色</option>
             <option value="dark">暗色</option>
           </select>
+        </div>
+        <div class="setting-group">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <label style="margin:0">全局回复风格（自动生成，可手动覆盖）</label>
+            <button class="btn-mini" @click="loadMemoryStyle" :disabled="memoryStyleLoading">刷新</button>
+          </div>
+          <p class="setting-hint" v-if="memoryStyleEnabled">系统会根据多轮对话自动提炼并填入；你也可以在这里手动修正。每轮默认应用，用户本轮明确要求优先。</p>
+          <p class="setting-hint" v-else>全局风格功能已关闭（config: agent.memory.global_style_enabled=false）。</p>
+          <textarea
+            class="setting-textarea"
+            v-model="memoryStyle"
+            rows="4"
+            placeholder="自动生成后会显示在这里；也可手动输入，例如：回答风格：简洁明了，先结论后细节，优先要点列表。"
+          ></textarea>
+          <div class="setting-actions">
+            <button class="btn-pill" @click="saveMemoryStyle" :disabled="memoryStyleSaving || !memoryStyleEnabled || !memoryStyle.trim()">
+              {{ memoryStyleSaving ? '保存中…' : '手动覆盖保存' }}
+            </button>
+            <button class="btn-outline" @click="clearMemoryStyle" :disabled="memoryStyleSaving || !memoryStyleEnabled || !memoryStyle.trim()">
+              清除当前风格
+            </button>
+          </div>
+        </div>
+        <div v-if="token" class="setting-group" style="margin-top:24px;border-top:1px solid var(--border);padding-top:16px">
+          <button class="btn-logout" @click="doLogout">退出登录</button>
         </div>
       </div>
 

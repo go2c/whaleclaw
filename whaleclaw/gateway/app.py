@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,13 +16,15 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from whaleclaw.agent.loop import create_default_registry
-from whaleclaw.config.paths import WHALECLAW_HOME
+from whaleclaw.config.paths import MEMORY_DIR, WHALECLAW_HOME
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.cron.scheduler import CronAction, CronScheduler
 from whaleclaw.cron.store import CronStore
 from whaleclaw.gateway.middleware import AuthMiddleware, create_jwt
 from whaleclaw.gateway.protocol import make_message
 from whaleclaw.gateway.ws import push_to_session, websocket_handler
+from whaleclaw.memory.manager import MemoryManager
+from whaleclaw.memory.vector import SimpleMemoryStore
 from whaleclaw.plugins.loader import PluginLoader
 from whaleclaw.plugins.registry import PluginRegistry
 from whaleclaw.sessions.manager import SessionManager
@@ -61,7 +64,6 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 if isinstance(mgr, SessionManager):
                     s = await mgr.get(session_id)
                     if s and s.channel == "feishu" and feishu_channel.client:
-                        import json as _json
                         from whaleclaw.channels.feishu.card import FeishuCard
                         card = FeishuCard.text_card(content)
                         await feishu_channel.client.send_message(
@@ -82,6 +84,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     state: dict[str, object] = {
         "manager": None,
         "registry": None,
+        "memory_manager": None,
     }
 
     @asynccontextmanager
@@ -95,10 +98,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         manager = SessionManager(store, config)
         state["manager"] = manager
+        memory_store = SimpleMemoryStore(persist_dir=MEMORY_DIR)
+        memory_manager = MemoryManager(memory_store)
+        state["memory_manager"] = memory_manager
 
         registry = create_default_registry(
             session_manager=manager,
             cron_scheduler=cron_scheduler,
+            memory_manager=memory_manager,
+            memory_store=memory_store,
         )
 
         await _load_plugins(config, registry, plugin_registry)
@@ -116,7 +124,9 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             feishu_channel = FeishuChannel(FeishuConfig(**feishu_cfg.model_dump()))
             await feishu_channel.start()
             if feishu_channel.bot is not None:
-                feishu_channel.bot.bind_agent(config, manager, registry)
+                feishu_channel.bot.bind_agent(
+                    config, manager, registry, memory_manager=memory_manager
+                )
 
         _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -143,6 +153,11 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         reg = state["registry"]
         assert isinstance(reg, ToolRegistry), "App not started"
         return reg
+
+    def _memory_manager() -> MemoryManager:
+        mgr = state["memory_manager"]
+        assert isinstance(mgr, MemoryManager), "App not started"
+        return mgr
 
     app = FastAPI(
         title="WhaleClaw Gateway",
@@ -175,6 +190,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 "bind": config.gateway.bind,
             },
             "agent": {"model": config.agent.model},
+            "auth_mode": config.gateway.auth.mode,
         }
 
     # ── Models ───────────────────────────────────────────────
@@ -192,12 +208,12 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         providers_cfg = config.models
         available: list[dict[str, object]] = []
 
-        _ALL_PROVIDERS = [
+        all_providers = [
             "anthropic", "openai", "deepseek", "qwen", "zhipu",
             "minimax", "moonshot", "google", "nvidia",
         ]
 
-        for pname in _ALL_PROVIDERS:
+        for pname in all_providers:
             pcfg = getattr(providers_cfg, pname, None)
             if not pcfg:
                 continue
@@ -406,7 +422,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     async def list_tools() -> list[dict[str, object]]:
         reg = _tool_registry()
         tools = reg.list_tools()
-        _TOOL_CATEGORIES: dict[str, str] = {
+        tool_categories: dict[str, str] = {
             "bash": "system",
             "file_read": "file", "file_write": "file", "file_edit": "file",
             "browser": "browser",
@@ -418,7 +434,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             result.append({
                 "name": t.name,
                 "description": t.description,
-                "category": _TOOL_CATEGORIES.get(t.name, "other"),
+                "category": tool_categories.get(t.name, "other"),
                 "parameters": [
                     {
                         "name": p.name,
@@ -431,6 +447,38 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 ],
             })
         return result
+
+    # ── Memory Style REST ─────────────────────────────────
+
+    @app.get("/api/memory/style")
+    async def get_memory_style() -> JSONResponse:
+        mgr = _memory_manager()
+        style = await mgr.get_global_style_directive()
+        return JSONResponse({
+            "enabled": config.agent.memory.global_style_enabled,
+            "style_directive": style,
+            "has_style": bool(style.strip()),
+        })
+
+    @app.post("/api/memory/style")
+    async def set_memory_style(body: dict[str, str]) -> JSONResponse:
+        directive = str(body.get("style_directive", "")).strip()
+        if not directive:
+            return JSONResponse({"error": "style_directive 不能为空"}, status_code=400)
+        if len(directive) > 300:
+            return JSONResponse({"error": "style_directive 过长（最多 300 字）"}, status_code=400)
+        mgr = _memory_manager()
+        changed = await mgr.set_global_style_directive(
+            directive,
+            source="api:webchat",
+        )
+        return JSONResponse({"ok": True, "changed": changed})
+
+    @app.delete("/api/memory/style")
+    async def clear_memory_style() -> JSONResponse:
+        mgr = _memory_manager()
+        removed = await mgr.clear_global_style_directive()
+        return JSONResponse({"ok": True, "removed": removed})
 
     # ── File upload ─────────────────────────────────────────
 
@@ -517,6 +565,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             config,
             session_manager=_mgr(),
             registry=_tool_registry(),
+            memory_manager=_memory_manager(),
         )
 
     # ── Static files & SPA fallback ────────────────────────
@@ -529,10 +578,12 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 name="assets",
             )
 
+        _boot_ts = str(int(time.time()))
+
         @app.get("/")
         async def index() -> HTMLResponse:
             html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-            v = __version__
+            v = f"{__version__}.{_boot_ts}"
             html = html.replace("/assets/app.css", f"/assets/app.css?v={v}")
             html = html.replace("/assets/app.js", f"/assets/app.js?v={v}")
             return HTMLResponse(html, headers={"Cache-Control": "no-cache"})

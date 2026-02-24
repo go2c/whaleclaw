@@ -195,13 +195,14 @@ show_menu() {
     echo "  ─── 操作菜单 ────────────────────────────"
     echo ""
     echo "  1) 配置 AI 模型"
-    echo "  2) 修改 Gateway 端口"
-    echo "  3) 设置登录密码"
-    echo "  4) 配置上下文压缩"
-    echo "  5) 配置飞书渠道"
-    echo "  6) 编辑配置文件 (系统编辑器)"
-    echo "  7) 运行诊断 (doctor)"
-    echo "  8) 查看完整配置"
+    echo "  2) 删除 AI 模型"
+    echo "  3) 修改 Gateway 端口"
+    echo "  4) 设置登录密码"
+    echo "  5) 配置上下文压缩"
+    echo "  6) 配置飞书渠道"
+    echo "  7) 编辑配置文件 (系统编辑器)"
+    echo "  8) 运行诊断 (doctor)"
+    echo "  9) 查看完整配置"
     echo "  0) 退出"
     echo ""
 }
@@ -427,9 +428,8 @@ _MODELS_deepseek=(
 _URL_deepseek="https://api.deepseek.com"
 
 _MODELS_qwen=(
-    "qwen-max|Qwen Max|off"
-    "qwen-plus|Qwen Plus|off"
-    "qwq-plus|QwQ Plus (思考)|medium"
+    "qwen3.5-plus|Qwen 3.5 Plus|off"
+    "qwen3-max|Qwen 3 Max|off"
 )
 _URL_qwen="https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -1224,34 +1224,246 @@ PYEOF
     esac
 }
 
+configure_custom_provider() {
+    echo ""
+    echo "  ═══ 自定义 AI 模型 ═══"
+    echo ""
+    echo "  适用于任何兼容 OpenAI Chat Completions 接口的服务。"
+    echo ""
+
+    read -p "  提供商名称 (英文，如 my-provider): " custom_pname
+    if [ -z "$custom_pname" ]; then
+        echo "  ⚠️  名称为空，已取消"
+        return
+    fi
+
+    read -p "  显示名称 (如 我的模型): " custom_label
+    [ -z "$custom_label" ] && custom_label="$custom_pname"
+
+    read -p "  API Key: " custom_key
+    if [ -z "$custom_key" ]; then
+        echo "  ⚠️  API Key 为空，已取消"
+        return
+    fi
+
+    read -p "  Base URL (如 https://api.example.com/v1): " custom_url
+    if [ -z "$custom_url" ]; then
+        echo "  ⚠️  Base URL 为空，已取消"
+        return
+    fi
+
+    read -p "  模型 ID (如 my-model-v1): " custom_mid
+    if [ -z "$custom_mid" ]; then
+        echo "  ⚠️  模型 ID 为空，已取消"
+        return
+    fi
+
+    read -p "  模型显示名称 (回车同模型 ID): " custom_mname
+    [ -z "$custom_mname" ] && custom_mname="$custom_mid"
+
+    # 保存到配置
+    "$PYTHON" << PYEOF
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+prov = cfg.setdefault('models', {}).setdefault('$custom_pname', {})
+prov['api_key'] = '''$custom_key'''
+prov['base_url'] = '$custom_url'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ API Key 和 Base URL 已保存')
+PYEOF
+
+    echo ""
+    echo "  ⏳ 验证 $custom_mid ..."
+    verify_api "$custom_pname" "$custom_mid" "$custom_key" "$custom_url"
+    local vresult=$?
+
+    _save_model_entry "$custom_pname" "$custom_mid" "$custom_mname" "$custom_url" "$vresult" "off"
+
+    if [ "$vresult" -eq 0 ]; then
+        echo ""
+        read -p "  是否设为默认模型? [y/N]: " set_default
+        if echo "$set_default" | grep -qi '^y'; then
+            "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+cfg.setdefault('agent', {})['model'] = '$custom_pname/$custom_mid'
+cfg['agent']['thinking_level'] = 'off'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ 默认模型: $custom_pname/$custom_mid')
+"
+        fi
+    fi
+}
+
+# ══════════════════════════════════════════════
+#  删除 AI 模型 / 提供商
+# ══════════════════════════════════════════════
+delete_models() {
+    echo ""
+    echo "  ═══ 删除 AI 模型 ═══"
+    echo ""
+
+    # 列出所有已配置的提供商及其模型
+    "$PYTHON" << 'PYEOF'
+import json, pathlib, os
+
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+models_cfg = cfg.get('models', {})
+
+entries = []
+idx = 1
+for pname, pconf in models_cfg.items():
+    key = pconf.get('api_key')
+    is_oauth = pname == 'openai' and pconf.get('auth_mode') == 'oauth' and pconf.get('oauth_access')
+    if not key and not is_oauth:
+        continue
+    cm = pconf.get('configured_models', [])
+    if not cm:
+        print(f'  {idx}) [{pname}] (无模型，仅有 API Key)')
+        entries.append((pname, None))
+        idx += 1
+        continue
+    for m in cm:
+        v = '✅' if m.get('verified') else '❌'
+        tk = f' [thinking={m.get("thinking","off")}]' if m.get('thinking', 'off') != 'off' else ''
+        print(f'  {idx}) [{pname}] {v} {m["id"]} — {m.get("name","")}{tk}')
+        entries.append((pname, m['id']))
+        idx += 1
+
+if not entries:
+    print('  (没有已配置的模型)')
+
+# Write entries to temp file for bash to read
+tmp = pathlib.Path('/tmp/.whaleclaw_delete_list.json')
+tmp.write_text(json.dumps(entries, ensure_ascii=False))
+print(f'\n  共 {len(entries)} 项')
+PYEOF
+
+    echo ""
+    echo "  ─── 操作 ──────────────────────────────"
+    echo "  输入编号删除单个模型"
+    echo "  输入 p 删除整个提供商 (含所有模型和 Key)"
+    echo "  输入 0 返回"
+    echo ""
+    read -p "  选择: " del_choice
+
+    if [ "$del_choice" = "0" ] || [ -z "$del_choice" ]; then
+        return
+    fi
+
+    if [ "$del_choice" = "p" ] || [ "$del_choice" = "P" ]; then
+        read -p "  输入要删除的提供商名称 (如 deepseek): " del_pname
+        if [ -z "$del_pname" ]; then
+            echo "  已取消"
+            return
+        fi
+        "$PYTHON" << PYEOF
+import json, pathlib, os
+
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+models_cfg = cfg.get('models', {})
+pname = '$del_pname'
+
+if pname not in models_cfg:
+    print(f'  ❌ 提供商 {pname} 不存在')
+else:
+    cm = models_cfg[pname].get('configured_models', [])
+    count = len(cm)
+    del models_cfg[pname]
+    p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    print(f'  ✅ 已删除提供商 {pname} (含 {count} 个模型)')
+
+    # 检查默认模型是否被删了
+    agent_model = cfg.get('agent', {}).get('model', '')
+    if agent_model.startswith(pname + '/'):
+        print(f'  ⚠️  默认模型 {agent_model} 已被删除，请重新设置')
+PYEOF
+        eval "$(read_status)"
+        return
+    fi
+
+    # 数字选择 — 删除单个模型
+    "$PYTHON" << PYEOF
+import json, pathlib, os
+
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+
+tmp = pathlib.Path('/tmp/.whaleclaw_delete_list.json')
+if not tmp.exists():
+    print('  ❌ 列表已失效，请重试')
+    exit(1)
+
+entries = json.loads(tmp.read_text())
+choice = int('$del_choice') - 1
+
+if choice < 0 or choice >= len(entries):
+    print('  ❌ 无效编号')
+    exit(1)
+
+pname, mid = entries[choice]
+models_cfg = cfg.get('models', {})
+pconf = models_cfg.get(pname, {})
+
+if mid is None:
+    # 删除仅有 Key 无模型的提供商
+    del models_cfg[pname]
+    p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    print(f'  ✅ 已删除提供商 {pname}')
+else:
+    cm = pconf.get('configured_models', [])
+    cm = [m for m in cm if m.get('id') != mid]
+    pconf['configured_models'] = cm
+    p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    remaining = len(cm)
+    print(f'  ✅ 已删除模型 {pname}/{mid}')
+    if remaining == 0:
+        print(f'  ℹ️  {pname} 已无模型 (API Key 保留)')
+
+    # 检查默认模型
+    agent_model = cfg.get('agent', {}).get('model', '')
+    if agent_model == f'{pname}/{mid}':
+        print(f'  ⚠️  默认模型 {agent_model} 已被删除，请重新设置')
+
+tmp.unlink(missing_ok=True)
+PYEOF
+    eval "$(read_status)"
+}
+
 configure_model() {
     echo ""
     echo "  ═══ 配置 AI 模型 ═══"
     echo ""
     echo "  选择提供商:"
     echo "  ─────────────────────────────────────────────────"
-    echo "  a) Anthropic  — Claude Sonnet 4 / Opus 4"
-    echo "  b) OpenAI     — GPT-5.2"
-    echo "  c) DeepSeek   — deepseek-chat / deepseek-reasoner"
-    echo "  d) 通义千问   — qwen-max / qwen-plus / qwq-plus"
-    echo "  e) 智谱 GLM   — glm-5 / glm-4.7 / glm-4.7-flash"
-    echo "  f) MiniMax    — MiniMax-M2.5 / M2.1"
-    echo "  g) 月之暗面   — kimi-k2.5"
-    echo "  h) Google     — Gemini 3 Flash / 3.1 Pro"
-    echo "  i) NVIDIA NIM — Qwen 3.5 / GLM / Kimi / Llama"
+    echo "  1) Anthropic  — Claude Sonnet 4 / Opus 4"
+    echo "  2) OpenAI     — GPT-5.2"
+    echo "  3) 通义千问   — qwen3.5-plus / qwen3-max / qwq-plus"
+    echo "  4) 智谱 GLM   — glm-5 / glm-4.7 / glm-4.7-flash"
+    echo "  5) MiniMax    — MiniMax-M2.5 / M2.1"
+    echo "  6) 月之暗面   — kimi-k2.5"
+    echo "  7) Google     — Gemini 3 Flash / 3.1 Pro"
+    echo "  8) NVIDIA NIM — Qwen 3.5 / GLM / Kimi / Llama"
+    echo "  9) 自定义     — 任意 OpenAI 兼容接口"
+    echo "  0) 返回"
     echo ""
-    read -p "  选择提供商 [a-i]: " provider_choice
+    read -p "  选择提供商 [0-9]: " provider_choice
 
     case $provider_choice in
-        a) configure_provider "anthropic" "Anthropic" ;;
-        b) configure_openai ;;
-        c) configure_provider "deepseek" "DeepSeek" ;;
-        d) configure_provider "qwen" "通义千问" ;;
-        e) configure_provider "zhipu" "智谱 GLM" ;;
-        f) configure_provider "minimax" "MiniMax" ;;
-        g) configure_provider "moonshot" "月之暗面" ;;
-        h) configure_provider "google" "Google" ;;
-        i) configure_provider "nvidia" "NVIDIA NIM" ;;
+        1) configure_provider "anthropic" "Anthropic" ;;
+        2) configure_openai ;;
+        3) configure_provider "qwen" "通义千问" ;;
+        4) configure_provider "zhipu" "智谱 GLM" ;;
+        5) configure_provider "minimax" "MiniMax" ;;
+        6) configure_provider "moonshot" "月之暗面" ;;
+        7) configure_provider "google" "Google" ;;
+        8) configure_provider "nvidia" "NVIDIA NIM" ;;
+        9) configure_custom_provider ;;
+        0) return ;;
         *) echo "  ❌ 无效选择" ;;
     esac
 }
@@ -1262,7 +1474,7 @@ configure_model() {
 while true; do
     eval "$(read_status)"
     show_menu
-    read -p "  请输入选项 [0-8]: " choice
+    read -p "  请输入选项 [0-9]: " choice
 
     case $choice in
         1)
@@ -1271,6 +1483,11 @@ while true; do
             read -p "  按回车键继续..."
             ;;
         2)
+            delete_models
+            echo ""
+            read -p "  按回车键继续..."
+            ;;
+        3)
             echo ""
             echo "  当前端口: ${PORT}"
             read -p "  请输入新端口号: " port
@@ -1288,76 +1505,93 @@ print('  ⚠️  需要重启 Gateway 生效')
             echo ""
             read -p "  按回车键继续..."
             ;;
-        3)
+        4)
             echo ""
             echo "  当前认证模式: ${AUTH_MODE}"
             echo ""
-            echo "  a) 无需认证 (none)"
-            echo "  b) 密码认证 (password)"
-            echo "  c) Token 认证 (token)"
+            echo "  1) 设置密码认证"
+            echo "  2) 设置 Token 认证"
+            echo "  3) 关闭认证 (删除密码和 Token)"
+            echo "  0) 返回"
             echo ""
-            read -p "  选择模式 [a-c]: " authmode
+            read -p "  选择 [0-3]: " authmode
 
             case $authmode in
-                a)
-                    "$PYTHON" -c "
-import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
-cfg = json.loads(p.read_text())
-cfg.setdefault('gateway', {}).setdefault('auth', {})['mode'] = 'none'
-cfg['gateway']['auth']['password'] = None
-p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-print('  ✅ 已关闭认证')
-"
-                    ;;
-                b)
+                1)
                     read -p "  请设置登录密码: " pw
-                    "$PYTHON" -c "
+                    if [ -z "$pw" ]; then
+                        echo "  ⚠️  密码为空，已取消"
+                    else
+                        "$PYTHON" -c "
 import json, pathlib, os
 p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
 cfg = json.loads(p.read_text())
 auth = cfg.setdefault('gateway', {}).setdefault('auth', {})
 auth['mode'] = 'password'
 auth['password'] = '$pw'
+auth.pop('token', None)
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 print('  ✅ 密码认证已启用')
+print('  ⚠️  需要重启 Gateway 生效')
 "
+                    fi
                     ;;
-                c)
+                2)
                     read -p "  请设置 Token: " tk
-                    "$PYTHON" -c "
+                    if [ -z "$tk" ]; then
+                        echo "  ⚠️  Token 为空，已取消"
+                    else
+                        "$PYTHON" -c "
 import json, pathlib, os
 p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
 cfg = json.loads(p.read_text())
 auth = cfg.setdefault('gateway', {}).setdefault('auth', {})
 auth['mode'] = 'token'
 auth['token'] = '$tk'
+auth.pop('password', None)
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 print('  ✅ Token 认证已启用')
+print('  ⚠️  需要重启 Gateway 生效')
+"
+                    fi
+                    ;;
+                3)
+                    "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+auth = cfg.setdefault('gateway', {}).setdefault('auth', {})
+auth['mode'] = 'none'
+auth.pop('password', None)
+auth.pop('token', None)
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ 已关闭认证 (密码和 Token 已清除)')
+print('  ⚠️  需要重启 Gateway 生效')
 "
                     ;;
+                0) ;;
                 *) echo "  ❌ 无效选择" ;;
             esac
             echo ""
             read -p "  按回车键继续..."
             ;;
-        4)
+        5)
             configure_summarizer
             echo ""
             read -p "  按回车键继续..."
             ;;
-        5)
+        6)
             configure_feishu
             echo ""
             read -p "  按回车键继续..."
             ;;
-        6)
+        7)
             open -t "$CONFIG_FILE"
             echo "  📝 已用系统编辑器打开配置文件"
             echo ""
             read -p "  按回车键继续..."
             ;;
-        7)
+        8)
             echo ""
             "$PYTHON" -c "
 import asyncio
@@ -1373,7 +1607,7 @@ asyncio.run(main())
             echo ""
             read -p "  按回车键继续..."
             ;;
-        8)
+        9)
             echo ""
             echo "  完整配置内容:"
             echo "  ─────────────────────────────────"

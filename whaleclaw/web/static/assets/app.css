@@ -652,6 +652,49 @@ body {
   color: var(--text-primary);
   font-size: 13px;
 }
+.setting-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  resize: vertical;
+  min-height: 84px;
+}
+.setting-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.setting-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.btn-mini {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 2px 8px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+.btn-mini:hover { color: var(--text-primary); border-color: var(--accent); }
+.btn-mini:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-outline {
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  padding: 8px 14px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-outline:hover { border-color: var(--danger); color: var(--danger); }
+.btn-outline:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Typing indicator ── */
 .typing-dot {
@@ -1031,6 +1074,22 @@ body {
   transition: background 0.2s;
 }
 .btn-danger-sm:hover { background: color-mix(in srgb, var(--danger) 22%, transparent); }
+
+.btn-logout {
+  width: 100%;
+  padding: 8px 16px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+.btn-logout:hover {
+  background: var(--danger);
+  color: #fff;
+}
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 6px; }

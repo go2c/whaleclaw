@@ -32,6 +32,8 @@ MODEL_MAX_CONTEXT: dict[str, int] = {
     "gpt-5.3-codex": 1_000_000,
     "deepseek-chat": 64_000,
     "deepseek-reasoner": 64_000,
+    "qwen3.5-plus": 1_000_000,
+    "qwen3-max": 262_144,
     "qwen-max": 32_000,
     "qwen-plus": 131_072,
     "qwen-turbo": 131_072,

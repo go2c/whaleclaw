@@ -105,7 +105,8 @@ whaleclaw/                    # Python 包根目录
   memory/                     # 记忆系统
     __init__.py
     base.py                   # Memory 抽象基类
-    vector.py                 # 向量存储 (ChromaDB)
+    vector.py                 # 轻量记忆存储 (JSON 持久化 + 关键词检索)
+    manager.py                # 记忆编排 (Recall/Capture/Organizer/全局风格)
     summary.py                # 自动摘要
   media/                      # 媒体处理
     __init__.py
@@ -131,7 +132,6 @@ whaleclaw/                    # Python 包根目录
     table.py                  # 表格输出
   web/                        # WebChat 前端静态资源
     static/
-    templates/
   utils/                      # 通用工具
     __init__.py
     log.py                    # structlog 日志配置
@@ -163,7 +163,7 @@ docs/
 | 测试 | pytest + pytest-asyncio | 单元/集成/E2E 测试 |
 | HTTP 客户端 | httpx | 异步 HTTP 请求 (调用 LLM API) |
 | WebSocket | websockets | WS 客户端/服务端 |
-| 向量存储 | ChromaDB / LanceDB | 记忆系统 (Phase 7) |
+| 记忆存储 | SimpleMemoryStore (JSON) | 当前默认记忆后端，可扩展到向量库 |
 | 浏览器控制 | Playwright | 浏览器工具 (Phase 5) |
 | 前端 | Vue 3 + Vite | WebChat SPA (Phase 3) |
 | 桌面应用 | Tauri | 桌面端包装 (Phase 8) |
@@ -225,6 +225,7 @@ WhaleClaw 采用分层按需加载架构，严格控制每轮 system prompt 的 
 - **工具走原生参数**: 工具 JSON Schema 通过 LLM API 的 `tools` 参数传递，不占 prompt token
 - **技能按需路由**: SkillRouter 根据用户消息关键词匹配 0~2 个技能，不匹配则不注入
 - **记忆有预算**: `MemoryManager.recall(max_tokens=N)` 严格控制记忆注入量
+- **全局风格常驻**: 从长期记忆提炼的 `style_directive` 以低 token 成本每轮注入，且用户本轮明确要求优先
 - **AGENTS.md 摘要化**: 仅首轮注入精简摘要 (~500 tokens)，后续轮次不重复
 - **预算分配**: PromptAssembler 根据模型 max_context 自动分配各层 token 预算
 - **缓存优化**: 静态层标记 `cache_control` 支持 Anthropic prompt caching
@@ -241,6 +242,7 @@ WhaleClaw 采用分层按需加载架构，严格控制每轮 system prompt 的 
 - 插件目录: `~/.whaleclaw/plugins/`
 - Agent 摘要: `~/.whaleclaw/workspace/AGENTS.summary.md` (自动生成)
 - 技能目录: `~/.whaleclaw/workspace/skills/`
+- 记忆文件: `~/.whaleclaw/memory/memory.json`
 - 日志目录: `~/.whaleclaw/logs/`
 
 配置优先级 (高 -> 低):

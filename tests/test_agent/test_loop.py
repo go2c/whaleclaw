@@ -663,3 +663,198 @@ class TestParseFallbackToolCalls:
         text = "这是普通文本，没有工具调用。"
         calls = _parse_fallback_tool_calls(text)
         assert calls == []
+
+
+class _DummyMemoryManager:
+    def __init__(self, recalled: str = "") -> None:
+        self._recalled = recalled
+        self.recall_calls = 0
+        self.capture_calls = 0
+        self.capture_payloads: list[str] = []
+        self.policy_calls = 0
+        self.style_calls = 0
+
+    def recall_policy(self, query: str) -> tuple[bool, bool]:  # noqa: ARG002
+        self.policy_calls += 1
+        return (True, True)
+
+    async def get_global_style_directive(self) -> str:
+        self.style_calls += 1
+        return ""
+
+    async def recall(  # noqa: PLR0913
+        self,
+        query: str,  # noqa: ARG002
+        max_tokens: int = 500,  # noqa: ARG002
+        limit: int = 10,  # noqa: ARG002
+        *,
+        include_profile: bool = True,
+        include_raw: bool = True,
+    ) -> str:
+        self.recall_calls += 1
+        if include_profile and not include_raw:
+            return "【长期记忆画像】\n用户偏好简洁。"
+        if include_raw and not include_profile:
+            return self._recalled
+        return self._recalled
+
+    async def auto_capture_user_message(  # noqa: PLR0913
+        self,
+        content: str,
+        *,
+        source: str,  # noqa: ARG002
+        mode: str = "balanced",  # noqa: ARG002
+        cooldown_seconds: int = 180,  # noqa: ARG002
+        max_per_hour: int = 12,  # noqa: ARG002
+        batch_size: int = 3,  # noqa: ARG002
+        merge_window_seconds: int = 120,  # noqa: ARG002
+    ) -> bool:
+        self.capture_calls += 1
+        self.capture_payloads.append(content)
+        return True
+
+    async def organize_if_needed(self, **kwargs: Any) -> bool:  # noqa: ARG002
+        return False
+
+
+@pytest.mark.asyncio
+async def test_run_agent_injects_recalled_memory_into_system_prompt() -> None:
+    captured_messages: list[Any] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        captured_messages[:] = messages
+        return AgentResponse(content="收到", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    memory: Any = _DummyMemoryManager(recalled="- 用户喜欢简洁回答")
+    cfg = WhaleclawConfig()
+    cfg.agent.memory.organizer_background = False
+
+    result = await run_agent(
+        message="继续上次的话题",
+        session_id="test-memory-recall",
+        config=cfg,
+        router=router,
+        memory_manager=memory,
+    )
+
+    assert result == "收到"
+    assert memory.policy_calls == 1
+    assert memory.recall_calls == 2
+    assert any(
+        m.role == "system" and "长期记忆召回" in m.content
+        for m in captured_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_auto_captures_user_fact_into_memory() -> None:
+    router = _make_router(response=AgentResponse(content="记住了", model="test-model"))
+    memory: Any = _DummyMemoryManager()
+    cfg = WhaleclawConfig()
+    cfg.agent.memory.organizer_background = False
+
+    _ = await run_agent(
+        message="我喜欢 Rust，请记住",
+        session_id="test-memory-compact",
+        config=cfg,
+        router=router,
+        memory_manager=memory,
+    )
+
+    assert memory.capture_calls == 1
+    assert "我喜欢 Rust" in memory.capture_payloads[0]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_skips_recall_when_policy_not_triggered() -> None:
+    class _NoRecallMemory(_DummyMemoryManager):
+        def recall_policy(self, query: str) -> tuple[bool, bool]:  # noqa: ARG002
+            self.policy_calls += 1
+            return (False, False)
+
+    router = _make_router(response=AgentResponse(content="ok", model="test-model"))
+    memory: Any = _NoRecallMemory(recalled="- should_not_be_used")
+    cfg = WhaleclawConfig()
+    cfg.agent.memory.organizer_background = False
+
+    result = await run_agent(
+        message="你好",
+        session_id="test-memory-no-recall",
+        config=cfg,
+        router=router,
+        memory_manager=memory,
+    )
+
+    assert result == "ok"
+    assert memory.policy_calls == 1
+    assert memory.recall_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_agent_creation_task_auto_injects_profile_memory() -> None:
+    class _NoRecallMemory(_DummyMemoryManager):
+        def recall_policy(self, query: str) -> tuple[bool, bool]:  # noqa: ARG002
+            self.policy_calls += 1
+            return (False, False)
+
+    router = _make_router(response=AgentResponse(content="已开始制作", model="test-model"))
+    memory: Any = _NoRecallMemory(recalled="- raw_should_not_be_used")
+    cfg = WhaleclawConfig()
+    cfg.agent.memory.organizer_background = False
+
+    result = await run_agent(
+        message="帮我做一份香港两日游PPT",
+        session_id="test-memory-creation-auto-l0",
+        config=cfg,
+        router=router,
+        memory_manager=memory,
+    )
+
+    assert result == "已开始制作"
+    assert memory.policy_calls == 1
+    assert memory.recall_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_run_agent_injects_global_style_directive() -> None:
+    captured_messages: list[Any] = []
+
+    class _StyleMemory(_DummyMemoryManager):
+        async def get_global_style_directive(self) -> str:
+            self.style_calls += 1
+            return "回答风格：简洁明了，先结论后细节。"
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        captured_messages[:] = messages
+        return AgentResponse(content="ok", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    memory: Any = _StyleMemory()
+    cfg = WhaleclawConfig()
+    cfg.agent.memory.organizer_background = False
+
+    _ = await run_agent(
+        message="你好",
+        session_id="test-memory-style-inject",
+        config=cfg,
+        router=router,
+        memory_manager=memory,
+    )
+    assert memory.style_calls == 1
+    assert any(
+        m.role == "system" and "全局回复风格偏好" in m.content
+        for m in captured_messages
+    )

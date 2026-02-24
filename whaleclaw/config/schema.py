@@ -77,6 +77,30 @@ class SummarizerConfig(BaseModel):
     enabled: bool = True
 
 
+class AgentMemoryConfig(BaseModel):
+    """Long-term memory capture/recall settings."""
+
+    enabled: bool = True
+    auto_capture_mode: Literal["conservative", "balanced", "aggressive"] = "balanced"
+    recall_limit: int = 8
+    recall_max_tokens: int = 600
+    recall_profile_max_tokens: int = 220
+    recall_raw_max_tokens: int = 380
+    cooldown_seconds: int = 180
+    max_per_hour: int = 12
+    capture_batch_size: int = 3
+    capture_merge_window_seconds: int = 120
+    organizer_enabled: bool = True
+    organizer_background: bool = True
+    global_style_enabled: bool = True
+    organizer_model: str = "zhipu/glm-4.7-flash"
+    organizer_min_new_entries: int = 5
+    organizer_interval_seconds: int = 900
+    organizer_max_raw_window: int = 120
+    keep_profile_versions: int = 3
+    max_raw_entries: int = 800
+
+
 class AgentConfig(BaseModel):
     """Agent runtime configuration."""
 
@@ -85,6 +109,7 @@ class AgentConfig(BaseModel):
     workspace: str = str(WORKSPACE_DIR)
     thinking_level: str = "off"
     summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
+    memory: AgentMemoryConfig = Field(default_factory=AgentMemoryConfig)
 
 
 class FeishuGroupConfig(BaseModel):

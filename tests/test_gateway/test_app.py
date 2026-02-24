@@ -98,3 +98,37 @@ async def test_models_oauth_openai_only_shows_gpt52() -> None:
     models = resp.json()["models"]
     ids = [m["id"] for m in models if m["provider"] == "openai"]
     assert ids == ["openai/gpt-5.2"]
+
+
+@pytest.mark.asyncio
+async def test_memory_style_rest_api(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(app_mod, "MEMORY_DIR", tmp_path / "memory")
+
+    config = WhaleclawConfig()
+    test_app = create_app(config)
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        test_app.router.lifespan_context(test_app),
+    ):
+        resp = await client.get("/api/memory/style")
+        assert resp.status_code == 200
+        assert resp.json()["has_style"] is False
+
+        resp = await client.post("/api/memory/style", json={"style_directive": "回答简洁明了"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        resp = await client.get("/api/memory/style")
+        assert resp.status_code == 200
+        assert "简洁明了" in resp.json()["style_directive"]
+
+        resp = await client.delete("/api/memory/style")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True

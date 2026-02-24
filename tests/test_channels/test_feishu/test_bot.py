@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from whaleclaw.channels.feishu.bot import FeishuBot
+from whaleclaw.channels.feishu.bot import FeishuBot, _format_exception_text
 
 
 class TestExtractText:
@@ -36,3 +36,11 @@ class TestExtractText:
     def test_invalid_json(self) -> None:
         message = {"message_type": "text", "content": "not json"}
         assert FeishuBot.extract_text(message) == ""
+
+
+class TestFormatExceptionText:
+    def test_empty_exception_message(self) -> None:
+        assert _format_exception_text(TimeoutError()) == "TimeoutError"
+
+    def test_non_empty_exception_message(self) -> None:
+        assert _format_exception_text(RuntimeError("boom")) == "boom"

@@ -21,7 +21,7 @@ from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
 
-_PUBLIC_PATHS = {"/", "/api/status", "/api/auth/login", "/api/auth/verify"}
+_PUBLIC_PATHS = {"/", "/api/status", "/api/auth/login"}
 _PUBLIC_PREFIXES = ("/static/", "/assets/")
 
 
@@ -105,6 +105,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         else:
             auth_header = request.headers.get("authorization", "")
             token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+            if not token:
+                token = request.query_params.get("token", "")
 
         if self._config.mode == "token":
             if token == self._config.token:

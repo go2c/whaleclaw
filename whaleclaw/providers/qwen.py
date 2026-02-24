@@ -6,7 +6,7 @@ from whaleclaw.providers.openai_compat import OpenAICompatProvider
 
 
 class QwenProvider(OpenAICompatProvider):
-    """DashScope API (qwen-max, qwen-plus, qwen-turbo)."""
+    """DashScope API (qwen3.5-plus, qwen3-max, qwq-plus, qwen-max, qwen-plus)."""
 
     provider_name = "qwen"
     default_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"

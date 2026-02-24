@@ -107,6 +107,9 @@ DELETE /api/sessions/{id}           # 删除会话
 POST /api/sessions/{id}/compact     # 压缩会话上下文
 POST /api/auth/login                # 登录 (密码认证)
 GET  /api/auth/verify               # 验证 Token
+GET  /api/memory/style              # 获取全局回复风格 (长期记忆)
+POST /api/memory/style              # 手动覆盖全局回复风格
+DELETE /api/memory/style            # 清除当前全局回复风格
 ```
 
 ### 2.3 认证中间件 — `whaleclaw/gateway/middleware.py`
@@ -205,6 +208,7 @@ class AuthMiddleware:
 - 模型选择下拉框
 - 思考深度滑块
 - 主题切换 (亮/暗)
+- 全局回复风格设置 (自动生成，可手动覆盖/清除)
 
 ### 3.4 WebSocket 客户端
 
@@ -316,6 +320,11 @@ Content-Type: multipart/form-data
 ### AC-7: 移动端适配
 - 手机浏览器访问，布局自适应
 - 侧边栏可折叠
+
+### AC-8: 全局回复风格设置
+- 设置面板可查看当前长期记忆提炼出的全局回复风格
+- 支持手动覆盖并保存
+- 支持清除当前全局风格
 
 ---
 

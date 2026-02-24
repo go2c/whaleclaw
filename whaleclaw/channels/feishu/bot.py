@@ -22,10 +22,17 @@ _FILE_EXTS = {".pptx", ".ppt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv",
 
 if TYPE_CHECKING:
     from whaleclaw.config.schema import WhaleclawConfig
+    from whaleclaw.memory.manager import MemoryManager
     from whaleclaw.sessions.manager import SessionManager
     from whaleclaw.tools.registry import ToolRegistry
 
 log = get_logger(__name__)
+
+
+def _format_exception_text(exc: Exception) -> str:
+    """Return a readable exception text even when ``str(exc)`` is empty."""
+    msg = str(exc).strip()
+    return msg if msg else exc.__class__.__name__
 
 
 class FeishuBot:
@@ -46,6 +53,7 @@ class FeishuBot:
         self._whaleclaw_config: WhaleclawConfig | None = None
         self._session_manager: SessionManager | None = None
         self._tool_registry: ToolRegistry | None = None
+        self._memory_manager: MemoryManager | None = None
 
     def set_bot_open_id(self, bot_open_id: str) -> None:
         self._bot_open_id = bot_open_id
@@ -55,11 +63,13 @@ class FeishuBot:
         config: WhaleclawConfig,
         session_manager: SessionManager,
         registry: ToolRegistry,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         """Inject Agent dependencies so handle_message can run the full loop."""
         self._whaleclaw_config = config
         self._session_manager = session_manager
         self._tool_registry = registry
+        self._memory_manager = memory_manager
 
     async def handle_event(
         self, event_type: str, body: dict[str, Any]
@@ -156,13 +166,15 @@ class FeishuBot:
                 registry=self._tool_registry,
                 session_manager=self._session_manager,
                 session_store=self._session_manager._store,  # noqa: SLF001
+                memory_manager=self._memory_manager,
             )
             log.info("feishu.agent_reply", reply_len=len(reply), preview=reply[:200])
         except Exception as exc:
-            log.error("feishu.agent_error", error=str(exc))
-            error_card = FeishuCard.error_card(f"处理失败: {exc}")
+            error_text = _format_exception_text(exc)
+            log.exception("feishu.agent_error", error=error_text, model=session.model)
+            error_card = FeishuCard.error_card(f"处理失败: {error_text}")
             await self._client.update_message(card_msg_id, error_card)
-            await broadcast_all(make_message(session.id, f"❌ **飞书处理失败**: {exc}"))
+            await broadcast_all(make_message(session.id, f"❌ **飞书处理失败**: {error_text}"))
             return
 
         if not reply.strip():

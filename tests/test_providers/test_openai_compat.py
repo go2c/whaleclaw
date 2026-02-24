@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from whaleclaw.providers.base import Message
@@ -64,6 +65,25 @@ class _RouteClient:
         pass
 
 
+class _FlakyClient:
+    def __init__(self, failures: int, resp: _FakeResponse) -> None:
+        self._failures = failures
+        self._resp = resp
+        self.calls = 0
+
+    def stream(self, *a: object, **kw: object) -> _FakeResponse:
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise httpx.ConnectError("boom")
+        return self._resp
+
+    async def __aenter__(self):  # noqa: ANN204
+        return self
+
+    async def __aexit__(self, *a: object) -> None:
+        pass
+
+
 @pytest.fixture()
 def provider() -> OpenAIProvider:
     return OpenAIProvider(api_key="test-key")
@@ -108,6 +128,23 @@ async def test_auth_error(provider: OpenAIProvider) -> None:
         pytest.raises(ProviderAuthError),
     ):
         await provider.chat([Message(role="user", content="hi")], "gpt-5.2")
+
+
+@pytest.mark.asyncio
+async def test_network_retry_then_success(provider: OpenAIProvider) -> None:
+    lines = [
+        "data: " + json.dumps({
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }),
+        "data: [DONE]",
+    ]
+    fake = _FlakyClient(failures=1, resp=_FakeResponse(200, lines))
+    with patch("whaleclaw.providers.openai_compat.httpx.AsyncClient", return_value=fake):
+        result = await provider.chat([Message(role="user", content="hi")], "gpt-5.2")
+
+    assert result.content == "ok"
+    assert fake.calls == 2
 
 
 @pytest.mark.asyncio

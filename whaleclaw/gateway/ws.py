@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -27,6 +27,9 @@ from whaleclaw.sessions.manager import Session, SessionManager
 from whaleclaw.tools.base import ToolResult
 from whaleclaw.tools.registry import ToolRegistry
 from whaleclaw.utils.log import get_logger
+
+if TYPE_CHECKING:
+    from whaleclaw.memory.manager import MemoryManager
 
 log = get_logger(__name__)
 
@@ -88,6 +91,7 @@ async def websocket_handler(
     config: WhaleclawConfig,
     session_manager: SessionManager,
     registry: ToolRegistry,
+    memory_manager: MemoryManager | None = None,
 ) -> None:
     """Handle a single WebSocket connection lifecycle."""
     await websocket.accept()
@@ -227,6 +231,7 @@ async def websocket_handler(
                     images=images or None,
                     session_manager=session_manager,
                     session_store=_store,
+                    memory_manager=memory_manager,
                 )
                 await session_manager.add_message(session, "assistant", reply)
                 await _safe_send(websocket, make_message(session.id, reply))

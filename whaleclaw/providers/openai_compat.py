@@ -7,6 +7,7 @@ provides a reusable base that all of them inherit.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -69,6 +70,7 @@ class OpenAICompatProvider(LLMProvider):
     provider_name: str = "openai"
     default_base_url: str = "https://api.openai.com/v1"
     env_key: str = "OPENAI_API_KEY"
+    max_network_retries: int = 2
 
     def __init__(
         self,
@@ -166,73 +168,109 @@ class OpenAICompatProvider(LLMProvider):
         headers = self._build_headers()
         url = f"{self._base_url}/chat/completions"
 
-        collected: list[str] = []
-        input_tokens = 0
-        output_tokens = 0
-        stop_reason: str | None = None
-        tc_acc = _ToolCallAccumulator()
-
-        async with (
-            httpx.AsyncClient(timeout=self._timeout) as client,
-            client.stream("POST", url, json=body, headers=headers) as resp,
-        ):
-                if resp.status_code == 401:
-                    raise ProviderAuthError(f"{self.provider_name} API Key 无效")
-                if resp.status_code == 429:
-                    raise ProviderRateLimitError(f"{self.provider_name} API 速率限制")
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    raise ProviderError(
-                        f"{self.provider_name} API error {resp.status_code}: "
-                        f"{error_body.decode(errors='replace')}"
-                    )
-
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[6:].strip()
-                    if payload == "[DONE]":
-                        break
-
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-
-                    usage = event.get("usage")
-                    if usage:
-                        input_tokens = usage.get("prompt_tokens", input_tokens)
-                        output_tokens = usage.get("completion_tokens", output_tokens)
-
-                    for choice in event.get("choices") or []:
-                        delta = choice.get("delta", {})
-                        text = delta.get("content", "")
-                        if text:
-                            collected.append(text)
-                            if on_stream:
-                                await on_stream(text)
-
-                        for tc_delta in delta.get("tool_calls") or []:
-                            tc_acc.feed(tc_delta.get("index", 0), tc_delta)
-
-                        fr = choice.get("finish_reason")
-                        if fr:
-                            stop_reason = fr
-
-        full_text = "".join(collected)
-        tool_calls = tc_acc.build()
-        log.debug(
-            f"{self.provider_name}.response",
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            tool_calls=len(tool_calls),
+        retryable_errors: tuple[type[Exception], ...] = (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
         )
-        return AgentResponse(
-            content=full_text,
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            stop_reason=stop_reason,
-            tool_calls=tool_calls,
-        )
+        last_exc: Exception | None = None
+        max_attempts = self.max_network_retries + 1
+
+        for attempt in range(1, max_attempts + 1):
+            collected: list[str] = []
+            input_tokens = 0
+            output_tokens = 0
+            stop_reason: str | None = None
+            tc_acc = _ToolCallAccumulator()
+            try:
+                async with (
+                    httpx.AsyncClient(timeout=self._timeout) as client,
+                    client.stream("POST", url, json=body, headers=headers) as resp,
+                ):
+                        if resp.status_code == 401:
+                            raise ProviderAuthError(f"{self.provider_name} API Key 无效")
+                        if resp.status_code == 429:
+                            raise ProviderRateLimitError(f"{self.provider_name} API 速率限制")
+                        if resp.status_code != 200:
+                            error_body = await resp.aread()
+                            raise ProviderError(
+                                f"{self.provider_name} API error {resp.status_code}: "
+                                f"{error_body.decode(errors='replace')}"
+                            )
+
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:].strip()
+                            if payload == "[DONE]":
+                                break
+
+                            try:
+                                event = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+
+                            usage = event.get("usage")
+                            if usage:
+                                input_tokens = usage.get("prompt_tokens", input_tokens)
+                                output_tokens = usage.get("completion_tokens", output_tokens)
+                                if input_tokens == 0 and output_tokens == 0:
+                                    total = usage.get("total_tokens", 0)
+                                    if total > 0:
+                                        input_tokens = total
+                                        output_tokens = 0
+
+                            for choice in event.get("choices") or []:
+                                delta = choice.get("delta", {})
+                                text = delta.get("content", "")
+                                if text:
+                                    collected.append(text)
+                                    if on_stream:
+                                        await on_stream(text)
+
+                                for tc_delta in delta.get("tool_calls") or []:
+                                    tc_acc.feed(tc_delta.get("index", 0), tc_delta)
+
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    stop_reason = fr
+            except retryable_errors as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    break
+                backoff_seconds = 0.25 * attempt
+                log.warning(
+                    f"{self.provider_name}.network_retry",
+                    model=model,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    error=exc.__class__.__name__,
+                )
+                await asyncio.sleep(backoff_seconds)
+                continue
+
+            full_text = "".join(collected)
+            tool_calls = tc_acc.build()
+            log.debug(
+                f"{self.provider_name}.response",
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                tool_calls=len(tool_calls),
+            )
+            return AgentResponse(
+                content=full_text,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                stop_reason=stop_reason,
+                tool_calls=tool_calls,
+            )
+
+        if last_exc is not None:
+            raise ProviderError(
+                f"{self.provider_name} 网络连接失败({last_exc.__class__.__name__})"
+            ) from last_exc
+        raise ProviderError(f"{self.provider_name} 请求失败")
