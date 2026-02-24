@@ -68,6 +68,13 @@ class ModelRouter:
         if cfg.base_url and cls not in (AnthropicProvider, GoogleProvider):
             kwargs["base_url"] = cfg.base_url
 
+        if provider_name == "openai" and cfg.auth_mode == "oauth":
+            kwargs["auth_mode"] = "oauth"
+            kwargs["oauth_access"] = cfg.oauth_access
+            kwargs["oauth_refresh"] = cfg.oauth_refresh
+            kwargs["oauth_expires"] = cfg.oauth_expires
+            kwargs["oauth_account_id"] = cfg.oauth_account_id
+
         try:
             instance = cls(**kwargs)  # type: ignore[arg-type]
         except Exception as exc:

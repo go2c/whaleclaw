@@ -25,8 +25,8 @@ class TestModelRouter:
     def test_resolve_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
         router = ModelRouter(ModelsConfig())
-        provider, model = router.resolve("openai/gpt-4o")
-        assert model == "gpt-4o"
+        provider, model = router.resolve("openai/gpt-5.2")
+        assert model == "gpt-5.2"
 
     def test_resolve_nvidia_subpath(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("NVIDIA_API_KEY", "test-key")

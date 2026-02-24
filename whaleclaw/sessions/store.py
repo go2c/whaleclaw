@@ -40,6 +40,32 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS context_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    level TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source_msg_start INTEGER NOT NULL,
+    source_msg_end INTEGER NOT NULL,
+    token_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_session
+    ON context_summaries(session_id, level);
+
+CREATE TABLE IF NOT EXISTS token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_usage_session
+    ON token_usage(session_id);
 """
 
 
@@ -91,6 +117,31 @@ class MessageRow:
         self.tool_name: str | None = row[5]
         self.timestamp: str = row[6]
         self.metadata: dict[str, object] = json.loads(row[7]) if row[7] else {}
+
+
+class SummaryRow:
+    """Typed wrapper for a context_summaries row."""
+
+    __slots__ = (
+        "id",
+        "session_id",
+        "level",
+        "content",
+        "source_msg_start",
+        "source_msg_end",
+        "token_count",
+        "created_at",
+    )
+
+    def __init__(self, row: aiosqlite.Row) -> None:
+        self.id: int = row[0]
+        self.session_id: str = row[1]
+        self.level: str = row[2]
+        self.content: str = row[3]
+        self.source_msg_start: int = row[4]
+        self.source_msg_end: int = row[5]
+        self.token_count: int = row[6]
+        self.created_at: str = row[7]
 
 
 class SessionStore:
@@ -255,3 +306,118 @@ class SessionStore:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # ── Context summaries (L0/L1) ──
+
+    async def save_summary(
+        self,
+        *,
+        session_id: str,
+        level: str,
+        content: str,
+        source_msg_start: int,
+        source_msg_end: int,
+        token_count: int,
+    ) -> int:
+        """Persist an L0 or L1 summary. Returns the new row id."""
+        ts = datetime.now().isoformat()
+        cursor = await self._conn.execute(
+            """INSERT INTO context_summaries
+               (session_id, level, content, source_msg_start, source_msg_end,
+                token_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, level, content, source_msg_start, source_msg_end,
+             token_count, ts),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid or 0
+
+    async def get_summaries(
+        self, session_id: str, *, level: str | None = None,
+    ) -> list[SummaryRow]:
+        """Get summaries for a session, optionally filtered by level."""
+        if level:
+            cursor = await self._conn.execute(
+                "SELECT * FROM context_summaries"
+                " WHERE session_id = ? AND level = ?"
+                " ORDER BY source_msg_start ASC",
+                (session_id, level),
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT * FROM context_summaries"
+                " WHERE session_id = ?"
+                " ORDER BY source_msg_start ASC",
+                (session_id,),
+            )
+        return [SummaryRow(r) for r in await cursor.fetchall()]
+
+    async def get_latest_summary(
+        self, session_id: str, level: str,
+    ) -> SummaryRow | None:
+        """Get the most recent summary of the given level."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM context_summaries"
+            " WHERE session_id = ? AND level = ?"
+            " ORDER BY source_msg_end DESC LIMIT 1",
+            (session_id, level),
+        )
+        row = await cursor.fetchone()
+        return SummaryRow(row) if row else None
+
+    async def delete_summaries(self, session_id: str) -> None:
+        """Delete all summaries for a session."""
+        await self._conn.execute(
+            "DELETE FROM context_summaries WHERE session_id = ?",
+            (session_id,),
+        )
+        await self._conn.commit()
+
+    # ── Token usage ──
+
+    async def record_token_usage(
+        self,
+        *,
+        session_id: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        ts = datetime.now().isoformat()
+        await self._conn.execute(
+            """INSERT INTO token_usage
+               (session_id, model, input_tokens, output_tokens, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, model, input_tokens, output_tokens, ts),
+        )
+        await self._conn.commit()
+
+    async def get_session_token_usage(self, session_id: str) -> dict[str, int]:
+        """Return {input_tokens, output_tokens} totals for a session."""
+        cursor = await self._conn.execute(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)"
+            " FROM token_usage WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return {"input_tokens": row[0], "output_tokens": row[1]} if row else {"input_tokens": 0, "output_tokens": 0}
+
+    async def get_total_token_usage(self) -> dict[str, int]:
+        """Return global {input_tokens, output_tokens} totals."""
+        cursor = await self._conn.execute(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)"
+            " FROM token_usage"
+        )
+        row = await cursor.fetchone()
+        return {"input_tokens": row[0], "output_tokens": row[1]} if row else {"input_tokens": 0, "output_tokens": 0}
+
+    async def get_token_usage_by_model(self) -> list[dict[str, object]]:
+        """Return token usage grouped by model."""
+        cursor = await self._conn.execute(
+            "SELECT model, SUM(input_tokens), SUM(output_tokens), COUNT(*)"
+            " FROM token_usage GROUP BY model ORDER BY SUM(input_tokens)+SUM(output_tokens) DESC"
+        )
+        return [
+            {"model": r[0], "input_tokens": r[1], "output_tokens": r[2], "calls": r[3]}
+            for r in await cursor.fetchall()
+        ]

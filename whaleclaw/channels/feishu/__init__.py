@@ -1,7 +1,8 @@
-"""Feishu channel — bot integration via Webhook."""
+"""Feishu channel — bot integration via WebSocket long-connection or Webhook."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -16,7 +17,7 @@ log = get_logger(__name__)
 
 
 class FeishuChannel(ChannelPlugin):
-    """Feishu channel plugin — manages client, bot, and webhook."""
+    """Feishu channel plugin — manages client, bot, and ws/webhook."""
 
     name = "feishu"
 
@@ -29,6 +30,7 @@ class FeishuChannel(ChannelPlugin):
         )
         self._client: FeishuClient | None = None
         self._bot: FeishuBot | None = None
+        self._ws_bridge: Any = None
         self._callback: Callable[
             [ChannelMessage], Awaitable[None]
         ] | None = None
@@ -49,9 +51,38 @@ class FeishuChannel(ChannelPlugin):
             self._config.app_id, self._config.app_secret
         )
         self._bot = FeishuBot(self._client, self._config)
-        log.info("feishu.started")
+
+        if self._config.mode == "ws":
+            await self._start_ws()
+        else:
+            log.info("feishu.webhook_mode", path=self._config.webhook_path)
+
+        log.info("feishu.started", mode=self._config.mode)
+
+    async def _start_ws(self) -> None:
+        """Start the SDK long-connection in a background thread."""
+        from whaleclaw.channels.feishu.ws_client import FeishuWSBridge
+
+        loop = asyncio.get_running_loop()
+
+        async def _on_sdk_message(body: dict[str, Any]) -> None:
+            """Bridge callback: SDK thread -> main loop -> Bot."""
+            event = body.get("event", {})
+            if self._bot:
+                await self._bot.handle_message(event)
+
+        self._ws_bridge = FeishuWSBridge(
+            app_id=self._config.app_id,
+            app_secret=self._config.app_secret,
+            on_message=_on_sdk_message,
+            main_loop=loop,
+        )
+        self._ws_bridge.start()
 
     async def stop(self) -> None:
+        if self._ws_bridge:
+            self._ws_bridge.stop()
+            self._ws_bridge = None
         log.info("feishu.stopped")
 
     async def send(

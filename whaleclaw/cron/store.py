@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
 
-from whaleclaw.cron.scheduler import CronAction, CronJob
+from whaleclaw.cron.scheduler import CronAction, CronJob, Schedule
 
 
 class CronStore:
@@ -34,9 +35,11 @@ class CronStore:
             CREATE TABLE IF NOT EXISTS cron_jobs (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                schedule TEXT NOT NULL,
+                schedule TEXT NOT NULL DEFAULT '',
+                schedule_obj_json TEXT,
                 action_json TEXT NOT NULL,
                 enabled INTEGER NOT NULL,
+                one_shot INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_run TEXT,
                 next_run TEXT
@@ -45,41 +48,48 @@ class CronStore:
         )
         await self._conn.commit()
 
-    def _job_to_row(self, job: CronJob) -> tuple:
+    def _job_to_row(self, job: CronJob) -> tuple[object, ...]:
         return (
             job.id,
             job.name,
             job.schedule,
+            json.dumps(job.schedule_obj.model_dump()) if job.schedule_obj else None,
             json.dumps(job.action.model_dump()),
             1 if job.enabled else 0,
+            1 if job.one_shot else 0,
             job.created_at.isoformat(),
             job.last_run.isoformat() if job.last_run else None,
             job.next_run.isoformat() if job.next_run else None,
         )
 
-    def _row_to_job(self, row: tuple) -> CronJob:
-        from datetime import datetime
-
+    def _row_to_job(self, row: tuple[object, ...]) -> CronJob:
         (
             id_,
             name,
             schedule,
+            schedule_obj_json,
             action_json,
             enabled,
+            one_shot,
             created_at,
             last_run,
             next_run,
         ) = row
-        action_data = json.loads(action_json)
+        action_data = json.loads(str(action_json))
+        sched_obj = None
+        if schedule_obj_json:
+            sched_obj = Schedule.model_validate(json.loads(str(schedule_obj_json)))
         return CronJob(
-            id=id_,
-            name=name,
-            schedule=schedule,
+            id=str(id_),
+            name=str(name),
+            schedule=str(schedule) if schedule else "",
+            schedule_obj=sched_obj,
             action=CronAction.model_validate(action_data),
             enabled=bool(enabled),
-            created_at=datetime.fromisoformat(created_at),
-            last_run=datetime.fromisoformat(last_run) if last_run else None,
-            next_run=datetime.fromisoformat(next_run) if next_run else None,
+            one_shot=bool(one_shot),
+            created_at=datetime.fromisoformat(str(created_at)),
+            last_run=datetime.fromisoformat(str(last_run)) if last_run else None,
+            next_run=datetime.fromisoformat(str(next_run)) if next_run else None,
         )
 
     async def save_job(self, job: CronJob) -> None:
@@ -89,8 +99,9 @@ class CronStore:
         await self._conn.execute(
             """
             INSERT OR REPLACE INTO cron_jobs
-            (id, name, schedule, action_json, enabled, created_at, last_run, next_run)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, name, schedule, schedule_obj_json, action_json,
+             enabled, one_shot, created_at, last_run, next_run)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             row,
         )

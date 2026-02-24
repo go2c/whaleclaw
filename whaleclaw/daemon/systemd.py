@@ -18,7 +18,7 @@ class SystemdService:
     def _gen_unit(
         self,
         python_path: str,
-        port: int = 18789,
+        port: int = 18666,
         bind: str = "127.0.0.1",
     ) -> str:
         return f"""[Unit]
@@ -38,7 +38,7 @@ WantedBy=default.target
     def install(
         self,
         python_path: str,
-        port: int = 18789,
+        port: int = 18666,
         bind: str = "127.0.0.1",
     ) -> None:
         self._unit_path.parent.mkdir(parents=True, exist_ok=True)

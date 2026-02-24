@@ -90,7 +90,7 @@ class ConfigFileCheck(HealthCheck):
 class PortCheck(HealthCheck):
     """Verify gateway port is available."""
 
-    def __init__(self, port: int = 18789) -> None:
+    def __init__(self, port: int = 18666) -> None:
         self._port = port
 
     @property

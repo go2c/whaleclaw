@@ -32,7 +32,7 @@ async def test_record_and_query(tmp_path: object) -> None:
     await tracker.open()
     try:
         usage = TokenUsage(
-            model="gpt-4o",
+            model="gpt-5.2",
             input_tokens=100,
             output_tokens=50,
             thinking_tokens=0,

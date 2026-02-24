@@ -54,5 +54,5 @@ async def test_reset(manager: SessionManager) -> None:
 @pytest.mark.asyncio
 async def test_update_model(manager: SessionManager) -> None:
     session = await manager.create("webchat", "user5")
-    await manager.update_model(session, "openai/gpt-4o")
-    assert session.model == "openai/gpt-4o"
+    await manager.update_model(session, "openai/gpt-5.2")
+    assert session.model == "openai/gpt-5.2"

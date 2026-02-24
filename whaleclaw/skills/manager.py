@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
+import socket
 import subprocess
 import tempfile
 from pathlib import Path
@@ -161,6 +163,25 @@ class SkillManager:
         sub_path = "/".join(parts[2:]) if len(parts) > 2 else ""
         return self._clone_and_install(user, repo, sub_path)
 
+    @staticmethod
+    def _git_env() -> dict[str, str]:
+        """Build env dict with proxy for git subprocess."""
+        env = os.environ.copy()
+        if env.get("https_proxy") or env.get("HTTPS_PROXY"):
+            return env
+        for port in (7897, 7890, 1087, 8080):
+            with contextlib.suppress(OSError):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect(("127.0.0.1", port))
+                s.close()
+                proxy = f"http://127.0.0.1:{port}"
+                env["https_proxy"] = proxy
+                env["http_proxy"] = proxy
+                log.info("git.proxy_detected", proxy=proxy)
+                return env
+        return env
+
     def _clone_and_install(
         self, user: str, repo: str, sub_path: str
     ) -> Skill:
@@ -174,6 +195,7 @@ class SkillManager:
                 capture_output=True,
                 text=True,
                 timeout=60,
+                env=self._git_env(),
             )
             if result.returncode != 0:
                 raise RuntimeError(

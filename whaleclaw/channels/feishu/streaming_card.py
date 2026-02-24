@@ -11,13 +11,13 @@ from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
 
-_MIN_INTERVAL = 0.5
+_MIN_INTERVAL = 3.0
 
 
 class StreamingCard:
     """Incrementally update a Feishu card message.
 
-    Throttles updates to at most one every 500 ms to avoid API rate limits.
+    Throttles updates to at most one every 3s to avoid API rate limits.
     """
 
     def __init__(self, client: FeishuClient, message_id: str) -> None:

@@ -6,20 +6,22 @@ import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 from fastapi import FastAPI, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from whaleclaw.agent.loop import create_default_registry
 from whaleclaw.config.paths import WHALECLAW_HOME
 from whaleclaw.config.schema import WhaleclawConfig
-from whaleclaw.cron.scheduler import CronScheduler
+from whaleclaw.cron.scheduler import CronAction, CronScheduler
 from whaleclaw.cron.store import CronStore
 from whaleclaw.gateway.middleware import AuthMiddleware, create_jwt
-from whaleclaw.gateway.ws import websocket_handler
+from whaleclaw.gateway.protocol import make_message
+from whaleclaw.gateway.ws import push_to_session, websocket_handler
 from whaleclaw.plugins.loader import PluginLoader
 from whaleclaw.plugins.registry import PluginRegistry
 from whaleclaw.sessions.manager import SessionManager
@@ -40,8 +42,42 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
     store = SessionStore()
     cron_store = CronStore(_CRON_DB_PATH)
-    cron_scheduler = CronScheduler()
+    async def _on_cron_fire(job_id: str, action: CronAction) -> None:
+        if action.type == "message":
+            session_id = action.target
+            text = action.payload.get("text", "")
+            if not (session_id and text):
+                return
+            content = f"⏰ **提醒**: {text}"
+
+            sent = await push_to_session(session_id, make_message(session_id, content))
+
+            if not sent:
+                from whaleclaw.gateway.ws import broadcast_all
+                await broadcast_all(make_message(session_id, content))
+
+            if not sent and feishu_channel is not None:
+                mgr = state.get("manager")
+                if isinstance(mgr, SessionManager):
+                    s = await mgr.get(session_id)
+                    if s and s.channel == "feishu" and feishu_channel.client:
+                        import json as _json
+                        from whaleclaw.channels.feishu.card import FeishuCard
+                        card = FeishuCard.text_card(content)
+                        await feishu_channel.client.send_message(
+                            s.peer_id, "interactive", card,
+                        )
+
+            mgr = state.get("manager")
+            if isinstance(mgr, SessionManager):
+                s = await mgr.get(session_id)
+                if s:
+                    await mgr.add_message(s, "assistant", content)
+
+    cron_scheduler = CronScheduler(on_fire=_on_cron_fire)
     plugin_registry = PluginRegistry()
+
+    feishu_channel: Any = None
 
     state: dict[str, object] = {
         "manager": None,
@@ -71,6 +107,17 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         await plugin_registry.start_all()
         await cron_scheduler.start()
 
+        nonlocal feishu_channel
+        feishu_cfg = config.channels.feishu
+        if feishu_cfg.app_id and feishu_cfg.app_secret:
+            from whaleclaw.channels.feishu import FeishuChannel
+            from whaleclaw.channels.feishu.config import FeishuConfig
+
+            feishu_channel = FeishuChannel(FeishuConfig(**feishu_cfg.model_dump()))
+            await feishu_channel.start()
+            if feishu_channel.bot is not None:
+                feishu_channel.bot.bind_agent(config, manager, registry)
+
         _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
         log.info(
@@ -80,6 +127,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         )
         yield
 
+        if feishu_channel is not None:
+            await feishu_channel.stop()
         await cron_scheduler.stop()
         await plugin_registry.stop_all()
         await cron_store.close()
@@ -150,12 +199,17 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         for pname in _ALL_PROVIDERS:
             pcfg = getattr(providers_cfg, pname, None)
-            if not pcfg or not pcfg.api_key:
+            if not pcfg:
+                continue
+            has_auth = bool(pcfg.api_key) or (pcfg.auth_mode == "oauth" and pcfg.oauth_access)
+            if not has_auth:
                 continue
 
             if pcfg.configured_models:
                 for cm in pcfg.configured_models:
                     if not cm.verified:
+                        continue
+                    if pname == "openai" and pcfg.auth_mode == "oauth" and cm.id != "gpt-5.2":
                         continue
                     tools: bool = True
                     if pname == "nvidia":
@@ -199,19 +253,21 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     async def list_sessions() -> list[dict[str, object]]:
         mgr = _mgr()
         sessions = await mgr.list_sessions()
-        return [
-            {
+        result = []
+        for s in sessions:
+            usage = await store.get_session_token_usage(s.id)
+            result.append({
                 "id": s.id,
                 "channel": s.channel,
                 "peer_id": s.peer_id,
                 "model": s.model,
                 "thinking_level": s.thinking_level,
                 "message_count": s.message_count or len(s.messages),
+                "tokens": usage["input_tokens"] + usage["output_tokens"],
                 "created_at": s.created_at.isoformat(),
                 "updated_at": s.updated_at.isoformat(),
-            }
-            for s in sessions
-        ]
+            })
+        return result
 
     @app.post("/api/sessions")
     async def create_session() -> dict[str, object]:
@@ -255,6 +311,126 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return JSONResponse(
             {"message": "上下文压缩功能将在后续版本实现"}
         )
+
+    @app.get("/api/token-usage")
+    async def get_total_token_usage() -> JSONResponse:
+        total = await store.get_total_token_usage()
+        by_model = await store.get_token_usage_by_model()
+        return JSONResponse({
+            "total": total,
+            "by_model": by_model,
+        })
+
+    @app.get("/api/sessions/{session_id}/token-usage")
+    async def get_session_token_usage(session_id: str) -> JSONResponse:
+        usage = await store.get_session_token_usage(session_id)
+        return JSONResponse(usage)
+
+    # ── Skills REST ────────────────────────────────────────
+
+    _skill_manager: Any = None
+
+    def _get_skill_manager() -> Any:
+        nonlocal _skill_manager
+        if _skill_manager is None:
+            from whaleclaw.skills.manager import SkillManager
+            _skill_manager = SkillManager()
+        return _skill_manager
+
+    @app.get("/api/skills")
+    async def list_skills() -> list[dict[str, object]]:
+        mgr = _get_skill_manager()
+        bundled = mgr.discover()
+        installed_ids = {s.id for s in mgr.list_installed()}
+        result: list[dict[str, object]] = []
+        for s in bundled:
+            result.append({
+                "id": s.id,
+                "name": s.name,
+                "triggers": s.triggers,
+                "trigger_description": s.trigger_description,
+                "tools": s.tools,
+                "max_tokens": s.max_tokens,
+                "source": "user" if s.id in installed_ids else "bundled",
+            })
+        return result
+
+    @app.post("/api/skills/install")
+    async def install_skill(body: dict[str, str]) -> JSONResponse:
+        source = body.get("source", "").strip()
+        if not source:
+            return JSONResponse({"error": "缺少 source 参数"}, status_code=400)
+        mgr = _get_skill_manager()
+        try:
+            skill = mgr.install(source)
+            return JSONResponse({
+                "ok": True,
+                "skill": {"id": skill.id, "name": skill.name},
+            })
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.get("/api/skills/{skill_id}", response_model=None)
+    async def get_skill_detail(skill_id: str):
+        mgr = _get_skill_manager()
+        all_skills = mgr.discover()
+        skill = next((s for s in all_skills if s.id == skill_id), None)
+        if not skill:
+            return JSONResponse({"error": "技能不存在"}, status_code=404)
+        installed_ids = {s.id for s in mgr.list_installed()}
+        raw_content = skill.source_path.read_text(encoding="utf-8")
+        return {
+            "id": skill.id,
+            "name": skill.name,
+            "triggers": skill.triggers,
+            "trigger_description": skill.trigger_description,
+            "instructions": skill.instructions,
+            "tools": skill.tools,
+            "examples": skill.examples,
+            "max_tokens": skill.max_tokens,
+            "source": "user" if skill.id in installed_ids else "bundled",
+            "raw_markdown": raw_content,
+        }
+
+    @app.delete("/api/skills/{skill_id}")
+    async def uninstall_skill(skill_id: str) -> JSONResponse:
+        mgr = _get_skill_manager()
+        removed = mgr.uninstall(skill_id)
+        if not removed:
+            return JSONResponse({"error": "技能不存在或为内置技能"}, status_code=404)
+        return JSONResponse({"ok": True})
+
+    # ── Tools REST ────────────────────────────────────────
+
+    @app.get("/api/tools")
+    async def list_tools() -> list[dict[str, object]]:
+        reg = _tool_registry()
+        tools = reg.list_tools()
+        _TOOL_CATEGORIES: dict[str, str] = {
+            "bash": "system",
+            "file_read": "file", "file_write": "file", "file_edit": "file",
+            "browser": "browser",
+            "sessions_list": "session", "sessions_history": "session", "sessions_send": "session",
+            "cron_manage": "automation", "reminder": "automation",
+        }
+        result: list[dict[str, object]] = []
+        for t in tools:
+            result.append({
+                "name": t.name,
+                "description": t.description,
+                "category": _TOOL_CATEGORIES.get(t.name, "other"),
+                "parameters": [
+                    {
+                        "name": p.name,
+                        "type": p.type,
+                        "description": p.description,
+                        "required": p.required,
+                        **({"enum": p.enum} if p.enum else {}),
+                    }
+                    for p in t.parameters
+                ],
+            })
+        return result
 
     # ── File upload ─────────────────────────────────────────
 
@@ -354,8 +530,12 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             )
 
         @app.get("/")
-        async def index() -> FileResponse:
-            return FileResponse(str(_STATIC_DIR / "index.html"))
+        async def index() -> HTMLResponse:
+            html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            v = __version__
+            html = html.replace("/assets/app.css", f"/assets/app.css?v={v}")
+            html = html.replace("/assets/app.js", f"/assets/app.js?v={v}")
+            return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     else:
 

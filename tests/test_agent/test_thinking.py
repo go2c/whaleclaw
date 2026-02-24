@@ -33,7 +33,7 @@ def test_apply_anthropic() -> None:
 
 def test_apply_openai() -> None:
     """Verify reasoning_effort set for OpenAI provider."""
-    params: dict[str, object] = {"model": "gpt-4o"}
+    params: dict[str, object] = {"model": "gpt-5.2"}
     out = apply_thinking_params(ThinkingLevel.LOW, "openai", params)
     assert out["reasoning_effort"] == "low"
     out = apply_thinking_params(ThinkingLevel.MEDIUM, "openai", params)

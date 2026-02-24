@@ -45,10 +45,10 @@ async def test_status(cmd) -> None:  # noqa: ANN001
 @pytest.mark.asyncio
 async def test_model_switch(cmd) -> None:  # noqa: ANN001
     chat_cmd, session = cmd
-    result = await chat_cmd.handle("/model openai/gpt-4o", session)
+    result = await chat_cmd.handle("/model openai/gpt-5.2", session)
     assert result is not None
-    assert "gpt-4o" in result
-    assert session.model == "openai/gpt-4o"
+    assert "gpt-5.2" in result
+    assert session.model == "openai/gpt-5.2"
 
 
 @pytest.mark.asyncio

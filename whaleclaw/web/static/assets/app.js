@@ -78,10 +78,25 @@ createApp({
     const thinkingLevel = ref('off');
     const availableModels = ref([]);
     const defaultModel = ref('');
+    const sessionTokens = ref({ input_tokens: 0, output_tokens: 0 });
+    const totalTokens = ref({ input_tokens: 0, output_tokens: 0 });
+
+    const activeTab = ref('chat');
+    const skills = ref([]);
+    const tools = ref([]);
+    const skillInstallSource = ref('');
+    const skillInstalling = ref(false);
+    const skillDetail = ref(null);
+    const toolDetail = ref(null);
 
     const activeSession = computed(() =>
       sessions.value.find((s) => s.id === activeSessionId.value)
     );
+
+    function _bumpMessageCount() {
+      const s = sessions.value.find((s) => s.id === activeSessionId.value);
+      if (s) s.message_count = messages.value.length;
+    }
 
     const _PROVIDER_LABELS = {
       anthropic: 'Anthropic', openai: 'OpenAI', deepseek: 'DeepSeek',
@@ -117,7 +132,11 @@ createApp({
         needLogin.value = true;
         throw new Error('auth');
       }
-      return res.json();
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || data.detail || `请求失败 (${res.status})`);
+      }
+      return data;
     }
 
     /* ── Auth ── */
@@ -167,6 +186,110 @@ createApp({
       } catch { /* ignore */ }
     }
 
+    async function loadTokenUsage(sessionId) {
+      try {
+        const [sData, tData] = await Promise.all([
+          apiFetch(`/api/sessions/${sessionId}/token-usage`),
+          apiFetch('/api/token-usage'),
+        ]);
+        sessionTokens.value = sData;
+        totalTokens.value = tData.total || { input_tokens: 0, output_tokens: 0 };
+      } catch { /* ignore */ }
+    }
+
+    /* ── Skills & Tools ── */
+    async function loadSkills() {
+      try {
+        skills.value = await apiFetch('/api/skills');
+      } catch { /* ignore */ }
+    }
+
+    async function loadTools() {
+      try {
+        tools.value = await apiFetch('/api/tools');
+      } catch { /* ignore */ }
+    }
+
+    const _SKILL_CATEGORIES = {
+      bundled: '内置技能',
+      user: '已安装技能',
+    };
+
+    const groupedSkills = computed(() => {
+      const groups = {};
+      for (const s of skills.value) {
+        const src = s.source || 'bundled';
+        if (!groups[src]) groups[src] = { label: _SKILL_CATEGORIES[src] || src, items: [] };
+        groups[src].items.push(s);
+      }
+      return Object.values(groups);
+    });
+
+    const _TOOL_CATEGORY_LABELS = {
+      system: '系统',
+      file: '文件操作',
+      browser: '浏览器',
+      session: '会话管理',
+      automation: '自动化',
+      other: '其他',
+    };
+    const _TOOL_CATEGORY_ORDER = ['system', 'file', 'browser', 'session', 'automation', 'other'];
+
+    const groupedTools = computed(() => {
+      const groups = {};
+      for (const t of tools.value) {
+        const cat = t.category || 'other';
+        if (!groups[cat]) groups[cat] = { label: _TOOL_CATEGORY_LABELS[cat] || cat, items: [] };
+        groups[cat].items.push(t);
+      }
+      return _TOOL_CATEGORY_ORDER
+        .filter((k) => groups[k])
+        .map((k) => groups[k]);
+    });
+
+    async function installSkill() {
+      const src = skillInstallSource.value.trim();
+      if (!src) return;
+      skillInstalling.value = true;
+      try {
+        await apiFetch('/api/skills/install', {
+          method: 'POST',
+          body: JSON.stringify({ source: src }),
+        });
+        skillInstallSource.value = '';
+        await loadSkills();
+      } catch (e) {
+        alert('安装失败: ' + (e.message || e));
+      } finally {
+        skillInstalling.value = false;
+      }
+    }
+
+    async function uninstallSkill(skillId) {
+      if (!confirm(`确定卸载技能「${skillId}」?`)) return;
+      try {
+        await apiFetch(`/api/skills/${skillId}`, { method: 'DELETE' });
+        await loadSkills();
+      } catch (e) {
+        alert('卸载失败: ' + (e.message || e));
+      }
+    }
+
+    async function showSkillDetail(skillId) {
+      try {
+        const data = await apiFetch(`/api/skills/${skillId}`);
+        skillDetail.value = data;
+      } catch (e) {
+        skillDetail.value = null;
+      }
+    }
+
+    function formatTokens(n) {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+      return String(n);
+    }
+
     /* ── Sessions ── */
     async function loadSessions() {
       try {
@@ -203,29 +326,38 @@ createApp({
         currentModel.value = data.model || '';
         thinkingLevel.value = data.thinking_level || 'off';
       } catch { /* ignore */ }
+      loadTokenUsage(id);
       connectWS(id);
       await nextTick();
       scrollToBottom();
     }
 
     /* ── WebSocket ── */
+    let _wsGeneration = 0;
+
     function connectWS(sessionId) {
-      if (ws) { ws.close(); ws = null; }
+      if (ws) {
+        ws._intentionalClose = true;
+        ws.close();
+        ws = null;
+      }
+      const gen = ++_wsGeneration;
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       let url = `${protocol}//${location.host}/ws`;
       if (token.value) url += `?token=${encodeURIComponent(token.value)}`;
-      ws = new WebSocket(url);
+      const socket = new WebSocket(url);
+      ws = socket;
 
-      ws.onopen = () => {
-        /* ping to keep alive */
-        ws._ping = setInterval(() => {
-          if (ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'ping' }));
+      socket.onopen = () => {
+        socket._ping = setInterval(() => {
+          if (socket.readyState === 1) {
+            socket.send(JSON.stringify({ type: 'ping' }));
           }
         }, 25000);
       };
 
-      ws.onmessage = (evt) => {
+      socket.onmessage = (evt) => {
+        if (gen !== _wsGeneration) return;
         let msg;
         try { msg = JSON.parse(evt.data); } catch { return; }
 
@@ -244,12 +376,14 @@ createApp({
           streamingMessage.rendered = renderMarkdown(streamingMessage.content);
           scrollToBottom();
         } else if (msg.type === 'message') {
+          const msgSid = msg.session_id || '';
+          const isOwnSession = msgSid && msgSid === activeSessionId.value;
           isStreaming.value = false;
           if (streamingMessage) {
             streamingMessage.content = msg.payload.content || streamingMessage.content;
             streamingMessage.rendered = renderMarkdown(streamingMessage.content);
             streamingMessage = null;
-          } else {
+          } else if (isOwnSession) {
             messages.value.push({
               id: `msg-${Date.now()}`,
               role: 'assistant',
@@ -258,6 +392,8 @@ createApp({
               toolCalls: [],
             });
           }
+          _bumpMessageCount();
+          if (activeSessionId.value) loadTokenUsage(activeSessionId.value);
           scrollToBottom();
         } else if (msg.type === 'tool_call') {
           if (!streamingMessage) {
@@ -306,11 +442,14 @@ createApp({
         }
       };
 
-      ws.onclose = () => {
-        clearInterval(ws?._ping);
-        /* auto-reconnect with backoff */
+      socket.onclose = () => {
+        clearInterval(socket._ping);
+        if (socket._intentionalClose) return;
+        if (gen !== _wsGeneration) return;
         setTimeout(() => {
-          if (activeSessionId.value === sessionId) connectWS(sessionId);
+          if (gen === _wsGeneration && activeSessionId.value === sessionId) {
+            connectWS(sessionId);
+          }
         }, 2000);
       };
     }
@@ -354,6 +493,7 @@ createApp({
       pendingImages.value = [];
       isStreaming.value = true;
       streamingMessage = null;
+      _bumpMessageCount();
       nextTick(scrollToBottom);
     }
 
@@ -548,6 +688,8 @@ createApp({
       } else {
         await createSession();
       }
+      loadSkills();
+      loadTools();
     }
 
     onMounted(async () => {
@@ -568,6 +710,10 @@ createApp({
       sessions, activeSessionId, activeSession, messages,
       inputText, isStreaming, showSettings, showSidebar, pendingImages,
       currentModel, thinkingLevel, availableModels, defaultModel, groupedModels, messagesEl,
+      sessionTokens, totalTokens, formatTokens,
+      activeTab, skills, tools, groupedSkills, groupedTools,
+      skillInstallSource, skillInstalling, skillDetail, installSkill, uninstallSkill, showSkillDetail,
+      toolDetail,
       createSession, deleteSession, switchSession,
       sendMessage, handleKeydown, switchModel, loadModels,
       toggleTheme, formatTime, renderMarkdown,
@@ -605,7 +751,7 @@ createApp({
             <button class="btn-icon" @click="showSettings = !showSettings" title="设置">⚙</button>
           </div>
         </div>
-        <div class="session-list">
+        <div class="session-list" v-show="activeTab === 'chat'">
           <div
             v-for="s in sessions"
             :key="s.id"
@@ -615,16 +761,22 @@ createApp({
           >
             <div class="session-info">
               <div class="session-title">{{ s.model || '会话' }}</div>
-              <div class="session-meta">{{ formatTime(s.created_at) }} · {{ s.message_count || 0 }} 条</div>
+              <div class="session-meta">{{ formatTime(s.created_at) }} · {{ s.message_count || 0 }} 条<template v-if="s.tokens"> · 🪙{{ formatTokens(s.tokens) }}</template></div>
             </div>
             <button class="session-delete" @click.stop="deleteSession(s.id)">✕</button>
           </div>
+        </div>
+        <div class="sidebar-tab-bar">
+          <button class="sidebar-tab" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">💬 聊天</button>
+          <button class="sidebar-tab" :class="{ active: activeTab === 'skills' }" @click="activeTab = 'skills'; loadSkills()">🧩 技能</button>
+          <button class="sidebar-tab" :class="{ active: activeTab === 'tools' }" @click="activeTab = 'tools'; loadTools()">🔧 工具</button>
         </div>
       </aside>
 
       <!-- Main Area -->
       <div class="main">
-        <div class="chat-header">
+        <!-- Chat Header (only in chat tab) -->
+        <div class="chat-header" v-if="activeTab === 'chat'">
           <div style="display:flex;align-items:center;gap:8px">
             <button class="btn-icon mobile-menu" @click="showSidebar = !showSidebar">☰</button>
             <select
@@ -647,69 +799,152 @@ createApp({
             </select>
             <span v-if="thinkingLevel !== 'off'" class="thinking-badge">💭 {{ thinkingLevel }}</span>
           </div>
-          <span class="chat-header-info" v-if="activeSession">
-            {{ activeSession.message_count || messages.length }} 条消息
-          </span>
+          <div class="chat-header-info" v-if="activeSession">
+            <span>{{ activeSession.message_count || messages.length }} 条消息</span>
+            <span class="token-badge"
+              :title="'本会话: ↑' + sessionTokens.input_tokens.toLocaleString() + ' ↓' + sessionTokens.output_tokens.toLocaleString() + '\\n总计: ↑' + totalTokens.input_tokens.toLocaleString() + ' ↓' + totalTokens.output_tokens.toLocaleString()"
+            >🪙 ↑{{ formatTokens(sessionTokens.input_tokens) }} ↓{{ formatTokens(sessionTokens.output_tokens) }} · 总{{ formatTokens(totalTokens.input_tokens + totalTokens.output_tokens) }}</span>
+          </div>
         </div>
 
-        <div class="messages" ref="messagesEl">
-          <div
-            v-for="msg in messages"
-            :key="msg.id"
-            class="message-row"
-            :class="msg.role"
-          >
-            <div class="bubble" :class="msg.role">
-              <div v-if="msg.rendered" v-html="msg.rendered"></div>
-              <div v-if="msg.toolCalls && msg.toolCalls.length" class="tool-calls">
-                <div v-for="(tc, ti) in msg.toolCalls" :key="ti" class="tool-card" :class="{ loading: tc.loading }">
-                  <div class="tool-card-header" @click="tc.collapsed = !tc.collapsed">
-                    <span class="tool-card-icon">{{ tc.loading ? '⏳' : '✅' }}</span>
-                    <span class="tool-card-name">{{ tc.name }}</span>
-                    <span class="tool-card-status">{{ tc.loading ? '执行中...' : '完成' }}</span>
-                    <span class="tool-card-toggle">{{ tc.collapsed ? '▸' : '▾' }}</span>
-                  </div>
-                  <div v-if="!tc.collapsed" class="tool-card-body">
-                    <pre class="tool-card-args">{{ tc.args }}</pre>
-                    <pre v-if="tc.result" class="tool-card-result">{{ tc.result.length > 500 ? tc.result.slice(0, 500) + '...' : tc.result }}</pre>
+        <!-- Page Header (skills / tools) -->
+        <div class="page-header" v-if="activeTab !== 'chat'">
+          <button class="btn-icon mobile-menu" @click="showSidebar = !showSidebar">☰</button>
+          <h2 v-if="activeTab === 'skills'">🧩 技能管理</h2>
+          <h2 v-if="activeTab === 'tools'">🔧 工具列表 <small>({{ tools.length }})</small></h2>
+        </div>
+
+        <!-- Chat Tab -->
+        <template v-if="activeTab === 'chat'">
+          <div class="messages" ref="messagesEl">
+            <div
+              v-for="msg in messages"
+              :key="msg.id"
+              class="message-row"
+              :class="msg.role"
+            >
+              <div class="bubble" :class="msg.role">
+                <div v-if="msg.rendered" v-html="msg.rendered"></div>
+                <div v-if="msg.toolCalls && msg.toolCalls.length" class="tool-calls">
+                  <div v-for="(tc, ti) in msg.toolCalls" :key="ti" class="tool-card" :class="{ loading: tc.loading }">
+                    <div class="tool-card-header" @click="tc.collapsed = !tc.collapsed">
+                      <span class="tool-card-icon">{{ tc.loading ? '⏳' : '✅' }}</span>
+                      <span class="tool-card-name">{{ tc.name }}</span>
+                      <span class="tool-card-status">{{ tc.loading ? '执行中...' : '完成' }}</span>
+                      <span class="tool-card-toggle">{{ tc.collapsed ? '▸' : '▾' }}</span>
+                    </div>
+                    <div v-if="!tc.collapsed" class="tool-card-body">
+                      <pre class="tool-card-args">{{ tc.args }}</pre>
+                      <pre v-if="tc.result" class="tool-card-result">{{ tc.result.length > 500 ? tc.result.slice(0, 500) + '...' : tc.result }}</pre>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
-          </div>
 
-          <div v-if="isStreaming && !messages.length" class="message-row assistant">
-            <div class="bubble assistant">
-              <span class="typing-dot"></span>
-              <span class="typing-dot"></span>
-              <span class="typing-dot"></span>
+            <div v-if="isStreaming && !messages.length" class="message-row assistant">
+              <div class="bubble assistant">
+                <span class="typing-dot"></span>
+                <span class="typing-dot"></span>
+                <span class="typing-dot"></span>
+              </div>
             </div>
           </div>
-        </div>
 
-        <div class="input-area" @drop="onDrop" @dragover="onDragOver">
-          <div v-if="pendingImages.length" class="image-preview-strip">
-            <div v-for="(img, idx) in pendingImages" :key="idx" class="image-preview-item">
-              <img :src="img.dataUrl" />
-              <button class="image-remove-btn" @click="removeImage(idx)">✕</button>
+          <div class="input-area" @drop="onDrop" @dragover="onDragOver">
+            <div v-if="pendingImages.length" class="image-preview-strip">
+              <div v-for="(img, idx) in pendingImages" :key="idx" class="image-preview-item">
+                <img :src="img.dataUrl" />
+                <button class="image-remove-btn" @click="removeImage(idx)">✕</button>
+              </div>
+            </div>
+            <div class="input-wrapper">
+              <button class="btn-attach" @click="triggerFileInput" title="添加图片">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+              </button>
+              <textarea
+                v-model="inputText"
+                placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 可粘贴/拖拽图片)"
+                @keydown="handleKeydown"
+                @paste="onPaste"
+                rows="1"
+              ></textarea>
+              <button class="btn-send" :disabled="isStreaming || (!inputText.trim() && !pendingImages.length)" @click="sendMessage">
+                发送
+              </button>
             </div>
           </div>
-          <div class="input-wrapper">
-            <button class="btn-attach" @click="triggerFileInput" title="添加图片">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-            </button>
-            <textarea
-              v-model="inputText"
-              placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 可粘贴/拖拽图片)"
-              @keydown="handleKeydown"
-              @paste="onPaste"
-              rows="1"
-            ></textarea>
-            <button class="btn-send" :disabled="isStreaming || (!inputText.trim() && !pendingImages.length)" @click="sendMessage">
-              发送
-            </button>
+        </template>
+
+        <!-- Skills Tab -->
+        <template v-if="activeTab === 'skills'">
+          <div class="tab-content">
+            <div class="panel-toolbar">
+              <input
+                v-model="skillInstallSource"
+                class="panel-search"
+                placeholder="输入 GitHub 地址或本地路径安装技能…"
+                @keydown.enter="installSkill"
+              />
+              <button class="btn-pill" :disabled="skillInstalling || !skillInstallSource.trim()" @click="installSkill">
+                {{ skillInstalling ? '安装中…' : '+ 安装' }}
+              </button>
+            </div>
+            <div class="tab-content-body">
+              <div v-if="!skills.length" class="tab-empty">暂无技能</div>
+              <details v-for="group in groupedSkills" :key="group.label" class="panel-group" open>
+                <summary class="panel-group-header">
+                  <span>{{ group.label }}</span>
+                  <span class="panel-group-count">{{ group.items.length }}</span>
+                </summary>
+                <div class="panel-grid skills-grid">
+                  <div v-for="s in group.items" :key="s.id" class="panel-card skill-card" @click="showSkillDetail(s.id)">
+                    <div class="panel-card-main">
+                      <div class="panel-card-title">🧩 {{ s.name }}</div>
+                      <div v-if="s.trigger_description" class="panel-card-desc">{{ s.trigger_description }}</div>
+                      <div class="chip-row">
+                        <span class="chip" :class="s.source === 'user' ? 'chip-accent' : 'chip-ok'">{{ s.source === 'user' ? '已安装' : '内置' }}</span>
+                        <span class="chip" v-for="t in (s.triggers || []).slice(0, 3)" :key="t">{{ t }}</span>
+                      </div>
+                      <div v-if="s.tools && s.tools.length" class="panel-card-tools">
+                        <code v-for="t in s.tools" :key="t" class="tool-code">{{ t }}</code>
+                      </div>
+                    </div>
+                    <div class="panel-card-action">
+                      <button v-if="s.source === 'user'" class="btn-danger-sm" @click.stop="uninstallSkill(s.id)" title="卸载">✕</button>
+                    </div>
+                  </div>
+                </div>
+              </details>
+            </div>
           </div>
-        </div>
+        </template>
+
+        <!-- Tools Tab -->
+        <template v-if="activeTab === 'tools'">
+          <div class="tab-content">
+            <div class="tab-content-body">
+              <div v-if="!tools.length" class="tab-empty">暂无工具</div>
+              <details v-for="group in groupedTools" :key="group.label" class="panel-group" open>
+                <summary class="panel-group-header">
+                  <span>{{ group.label }}</span>
+                  <span class="panel-group-count">{{ group.items.length }}</span>
+                </summary>
+                <div class="panel-grid tools-grid">
+                  <div v-for="t in group.items" :key="t.name" class="panel-card tool-item tool-card" @click="toolDetail = t">
+                    <div class="panel-card-main">
+                      <div class="panel-card-title"><code class="tool-name-code">{{ t.name }}</code></div>
+                      <div class="panel-card-desc">{{ t.description }}</div>
+                    </div>
+                    <div v-if="t.parameters && t.parameters.length" class="tool-params-strip">
+                      <span v-for="p in t.parameters" :key="p.name" class="tool-param-chip" :class="{ required: p.required }">{{ p.name }}<em>{{ p.type }}</em></span>
+                    </div>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- Settings Panel -->
@@ -742,6 +977,46 @@ createApp({
             <option value="light">亮色</option>
             <option value="dark">暗色</option>
           </select>
+        </div>
+      </div>
+
+      <!-- Skill Detail Modal -->
+      <div v-if="skillDetail" class="detail-overlay" @click.self="skillDetail = null">
+        <div class="detail-modal">
+          <div class="detail-modal-header">
+            <h2>🧩 {{ skillDetail.name }}</h2>
+            <button class="btn-icon" @click="skillDetail = null" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body markdown-body" v-html="renderMarkdown(skillDetail.raw_markdown || '')"></div>
+        </div>
+      </div>
+
+      <!-- Tool Detail Modal -->
+      <div v-if="toolDetail" class="detail-overlay" @click.self="toolDetail = null">
+        <div class="detail-modal">
+          <div class="detail-modal-header">
+            <h2><code style="font-size:16px">🔧 {{ toolDetail.name }}</code></h2>
+            <button class="btn-icon" @click="toolDetail = null" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body">
+            <p class="tool-detail-desc">{{ toolDetail.description }}</p>
+            <div v-if="toolDetail.parameters && toolDetail.parameters.length" class="tool-detail-params">
+              <h3>参数</h3>
+              <div v-for="p in toolDetail.parameters" :key="p.name" class="tool-detail-param">
+                <div class="tool-detail-param-header">
+                  <code>{{ p.name }}</code>
+                  <span class="tool-detail-param-type">{{ p.type }}</span>
+                  <span v-if="p.required" class="chip chip-accent" style="font-size:11px;padding:1px 6px">必填</span>
+                  <span v-else class="chip" style="font-size:11px;padding:1px 6px">可选</span>
+                </div>
+                <div v-if="p.description" class="tool-detail-param-desc">{{ p.description }}</div>
+                <div v-if="p.enum && p.enum.length" class="tool-detail-param-enum">
+                  可选值：<code v-for="e in p.enum" :key="e">{{ e }}</code>
+                </div>
+              </div>
+            </div>
+            <div v-else class="tool-detail-no-params">此工具无需参数</div>
+          </div>
         </div>
       </div>
     </template>

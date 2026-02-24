@@ -11,7 +11,7 @@ from whaleclaw.config.schema import AgentConfig, GatewayConfig, WhaleclawConfig
 class TestGatewayConfig:
     def test_defaults(self) -> None:
         cfg = GatewayConfig()
-        assert cfg.port == 18789
+        assert cfg.port == 18666
         assert cfg.bind == "127.0.0.1"
         assert cfg.verbose is False
 
@@ -38,7 +38,7 @@ class TestAgentConfig:
 class TestWhaleclawConfig:
     def test_defaults(self) -> None:
         cfg = WhaleclawConfig()
-        assert cfg.gateway.port == 18789
+        assert cfg.gateway.port == 18666
         assert "anthropic" in cfg.agent.model
 
     def test_nested_override(self) -> None:

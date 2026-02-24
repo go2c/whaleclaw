@@ -1,6 +1,6 @@
 """Pydantic v2 configuration schema for WhaleClaw."""
 
-from __future__ import annotations
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -20,7 +20,7 @@ class AuthConfig(BaseModel):
 class GatewayConfig(BaseModel):
     """Gateway server configuration."""
 
-    port: int = Field(default=18789, ge=1, le=65535)
+    port: int = Field(default=18666, ge=1, le=65535)
     bind: str = "127.0.0.1"
     verbose: bool = False
     auth: AuthConfig = Field(default_factory=AuthConfig)
@@ -43,6 +43,11 @@ class ProviderConfig(BaseModel):
     base_url: str | None = None
     timeout: int = 120
     configured_models: list[ProviderModelEntry] = Field(default_factory=list)
+    auth_mode: Literal["api_key", "oauth"] = "api_key"
+    oauth_access: str | None = None
+    oauth_refresh: str | None = None
+    oauth_expires: int = 0
+    oauth_account_id: str | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -59,6 +64,19 @@ class ModelsConfig(BaseModel):
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
+class SummarizerConfig(BaseModel):
+    """Configuration for L0/L1 hierarchical context compression.
+
+    Uses a cheap, fast model to generate layered summaries of older
+    conversation history, persisted in SQLite for on-demand loading.
+    Set ``enabled = false`` or leave the model provider unconfigured
+    to disable; context will simply be truncated when it overflows.
+    """
+
+    model: str = "zhipu/glm-4.7-flash"
+    enabled: bool = True
+
+
 class AgentConfig(BaseModel):
     """Agent runtime configuration."""
 
@@ -66,6 +84,34 @@ class AgentConfig(BaseModel):
     max_tool_rounds: int = 25
     workspace: str = str(WORKSPACE_DIR)
     thinking_level: str = "off"
+    summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
+
+
+class FeishuGroupConfig(BaseModel):
+    """Per-group settings for Feishu."""
+
+    require_mention: bool = True
+    activation: Literal["mention", "always"] = "mention"
+
+
+class FeishuChannelConfig(BaseModel):
+    """Feishu bot channel configuration."""
+
+    mode: Literal["ws", "webhook"] = "ws"
+    app_id: str = ""
+    app_secret: str = ""
+    verification_token: str | None = None
+    encrypt_key: str | None = None
+    allow_from: list[str] = Field(default_factory=list)
+    groups: dict[str, FeishuGroupConfig] = Field(default_factory=dict)
+    dm_policy: Literal["pairing", "open", "closed"] = "pairing"
+    webhook_path: str = "/webhook/feishu"
+
+
+class ChannelsConfig(BaseModel):
+    """Configuration for all message channels."""
+
+    feishu: FeishuChannelConfig = Field(default_factory=FeishuChannelConfig)
 
 
 class SecurityConfig(BaseModel):
@@ -97,5 +143,6 @@ class WhaleclawConfig(BaseModel):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)

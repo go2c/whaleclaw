@@ -110,6 +110,64 @@ class _EchoTool(Tool):
         return ToolResult(success=True, output=kwargs.get("text", ""))
 
 
+class _BrowserProbeTool(Tool):
+    """Dummy browser tool to assert required browser arguments."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="browser",
+            description="Probe browser arguments.",
+            parameters=[
+                ToolParameter(name="action", type="string", description="action"),
+                ToolParameter(name="text", type="string", description="text"),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        action = kwargs.get("action", "")
+        text = kwargs.get("text", "")
+        if action == "search_images" and bool(text):
+            return ToolResult(success=True, output=f"ok:{text}")
+        return ToolResult(success=False, output="", error="bad args")
+
+
+class _BrowserAlwaysFailTool(Tool):
+    """Dummy browser tool that always fails."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="browser",
+            description="Always fails.",
+            parameters=[
+                ToolParameter(name="action", type="string", description="action"),
+                ToolParameter(name="text", type="string", description="text"),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:  # noqa: ARG002
+        return ToolResult(success=False, output="", error="browser failed")
+
+
+class _BashProbeTool(Tool):
+    """Dummy bash tool to assert command arg exists."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="bash",
+            description="Probe bash arguments.",
+            parameters=[ToolParameter(name="command", type="string", description="command")],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        command = str(kwargs.get("command", "")).strip()
+        if command:
+            return ToolResult(success=True, output=f"ok:{command}")
+        return ToolResult(success=False, output="", error="bad command")
+
+
 @pytest.mark.asyncio
 async def test_run_agent_tool_call_loop() -> None:
     """Agent should execute tools and loop back to LLM."""
@@ -263,6 +321,328 @@ async def test_run_agent_fallback_mode() -> None:
 
     assert result == "查到了: hello"
     assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_retries_when_tool_args_invalid_then_succeeds() -> None:
+    invalid_tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[ToolCall(id="tc_browser", name="browser", arguments={})],
+    )
+    valid_tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_browser_2",
+                name="browser",
+                arguments={"action": "search_images", "text": "杨幂近照"},
+            )
+        ],
+    )
+    final_response = AgentResponse(
+        content="已完成",
+        model="test-model",
+    )
+
+    call_count = 0
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return invalid_tool_response
+        if call_count == 2:
+            return valid_tool_response
+        return final_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BrowserProbeTool())
+
+    result = await run_agent(
+        message="给我张杨幂近照",
+        session_id="test-browser-repair",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "已完成"
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_run_agent_circuit_breaker_blocks_repeated_browser_failures() -> None:
+    browser_tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_browser",
+                name="browser",
+                arguments={"action": "search_images", "text": "杨幂近照"},
+            )
+        ],
+    )
+    final_response = AgentResponse(
+        content="改用 bash 处理",
+        model="test-model",
+    )
+
+    call_count = 0
+    prompts_seen: list[str] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        prompts_seen.append("\n".join(m.content for m in messages if hasattr(m, "content")))
+        if call_count <= 2:
+            return browser_tool_response
+        return final_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BrowserAlwaysFailTool())
+
+    result = await run_agent(
+        message="给我张杨幂近照",
+        session_id="test-browser-circuit",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "改用 bash 处理"
+    assert call_count == 3
+    assert any("browser 工具连续失败，已自动熔断" in p for p in prompts_seen)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_repairs_browser_query_without_action() -> None:
+    tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[ToolCall(id="tc_browser", name="browser", arguments={"query": "杨幂近照"})],
+    )
+    final_response = AgentResponse(content="已完成", model="test-model")
+
+    call_count = 0
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return tool_response
+        return final_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BrowserProbeTool())
+
+    result = await run_agent(
+        message="给我张杨幂近照",
+        session_id="test-browser-repair-query",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "已完成"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_repairs_bash_cmd_alias() -> None:
+    tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[ToolCall(id="tc_bash", name="bash", arguments={"cmd": "echo hi"})],
+    )
+    final_response = AgentResponse(content="done", model="test-model")
+
+    call_count = 0
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return tool_response
+        return final_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BashProbeTool())
+
+    result = await run_agent(
+        message="执行命令",
+        session_id="test-bash-repair-cmd",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "done"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_repairs_garbled_browser_query_to_user_message() -> None:
+    tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_browser",
+                name="browser",
+                arguments={"action": "search_images", "text": "2026 \\n0\\n0\\n0\\n0"},
+            )
+        ],
+    )
+    final_response = AgentResponse(content="ok", model="test-model")
+
+    call_count = 0
+    captured: list[str] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return tool_response
+        return final_response
+
+    class _BrowserCaptureTool(Tool):
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(
+                name="browser",
+                description="capture",
+                parameters=[
+                    ToolParameter(name="action", type="string", description="action"),
+                    ToolParameter(name="text", type="string", description="text"),
+                ],
+            )
+
+        async def execute(self, **kwargs: Any) -> ToolResult:
+            captured.append(str(kwargs.get("text", "")))
+            return ToolResult(success=True, output="ok")
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BrowserCaptureTool())
+
+    result = await run_agent(
+        message="给我杨幂新年写真高清图",
+        session_id="test-browser-repair-garbled",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "ok"
+    assert call_count == 2
+    assert captured and captured[0] == "给我杨幂新年写真高清图"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_rejects_escaped_block_file_edit_args() -> None:
+    bad_file_edit = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_edit",
+                name="file_edit",
+                arguments={
+                    "path": "/tmp/a.py",
+                    "old_string": "line1\\nline2\\nline3\\nline4",
+                    "new_string": "x\\ny\\nz\\nw",
+                },
+            )
+        ],
+    )
+    final_response = AgentResponse(content="我改用 file_write 重写脚本", model="test-model")
+
+    call_count = 0
+    tool_called = False
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return bad_file_edit
+        return final_response
+
+    class _FileEditProbeTool(Tool):
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(
+                name="file_edit",
+                description="probe file_edit",
+                parameters=[
+                    ToolParameter(name="path", type="string", description="path"),
+                    ToolParameter(name="old_string", type="string", description="old"),
+                    ToolParameter(name="new_string", type="string", description="new"),
+                ],
+            )
+
+        async def execute(self, **kwargs: Any) -> ToolResult:  # noqa: ARG002
+            nonlocal tool_called
+            tool_called = True
+            return ToolResult(success=True, output="edited")
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_FileEditProbeTool())
+
+    result = await run_agent(
+        message="重做这个 python 脚本",
+        session_id="test-file-edit-escaped-block",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "我改用 file_write 重写脚本"
+    assert call_count == 2
+    assert not tool_called
 
 
 class TestParseFallbackToolCalls:

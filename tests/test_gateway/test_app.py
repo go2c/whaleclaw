@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from whaleclaw.config.schema import WhaleclawConfig
+from whaleclaw.config.schema import ProviderModelEntry, WhaleclawConfig
 from whaleclaw.gateway.app import create_app
 
 
@@ -23,7 +23,7 @@ async def test_status_endpoint(app) -> None:  # noqa: ANN001
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
-    assert data["gateway"]["port"] == 18789
+    assert data["gateway"]["port"] == 18666
 
 
 @pytest.mark.asyncio
@@ -78,3 +78,23 @@ async def test_auth_login_no_password_mode(app) -> None:  # noqa: ANN001
             json={"password": "test"},
         )
         assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_models_oauth_openai_only_shows_gpt52() -> None:
+    config = WhaleclawConfig()
+    config.models.openai.auth_mode = "oauth"
+    config.models.openai.oauth_access = "token"
+    config.models.openai.configured_models = [
+        ProviderModelEntry(id="gpt-5.2", name="GPT-5.2", verified=True),
+        ProviderModelEntry(id="gpt-5.2-codex", name="GPT-5.2 Codex", verified=True),
+    ]
+
+    app = create_app(config)
+    transport = ASGITransport(app=app)  # type: ignore[arg-type]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/models")
+    assert resp.status_code == 200
+    models = resp.json()["models"]
+    ids = [m["id"] for m in models if m["provider"] == "openai"]
+    assert ids == ["openai/gpt-5.2"]

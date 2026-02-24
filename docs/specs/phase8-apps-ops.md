@@ -249,7 +249,7 @@ WhaleClaw Doctor
 [检查项]                        [状态]
 Python 版本                     ✅ 3.12.4
 配置文件                        ✅ ~/.whaleclaw/whaleclaw.json
-Gateway 端口                    ✅ 18789 可用
+Gateway 端口                    ✅ 18666 可用
 Anthropic API Key               ✅ 已配置
 OpenAI API Key                  ⚠️ 未配置
 DeepSeek API Key                ✅ 已配置

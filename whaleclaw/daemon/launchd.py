@@ -20,7 +20,7 @@ class LaunchdService:
     def _gen_plist(
         self,
         python_path: str,
-        port: int = 18789,
+        port: int = 18666,
         bind: str = "127.0.0.1",
     ) -> str:
         log_dir = Path.home() / ".whaleclaw/logs"
@@ -57,7 +57,7 @@ class LaunchdService:
     def install(
         self,
         python_path: str,
-        port: int = 18789,
+        port: int = 18666,
         bind: str = "127.0.0.1",
     ) -> None:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)

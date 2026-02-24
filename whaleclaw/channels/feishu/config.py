@@ -17,6 +17,7 @@ class GroupConfig(BaseModel):
 class FeishuConfig(BaseModel):
     """Feishu bot configuration."""
 
+    mode: Literal["ws", "webhook"] = "ws"
     app_id: str = ""
     app_secret: str = ""
     verification_token: str | None = None

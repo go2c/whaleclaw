@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+import re
 from typing import Any
 
 from whaleclaw.config.paths import WHALECLAW_HOME
@@ -29,6 +30,36 @@ _DOWNLOAD_DIR = WHALECLAW_HOME / "downloads"
 
 _VIEWPORT = {"width": 1280, "height": 800}
 _TIMEOUT = 15_000
+_GENERIC_IMAGE_QUERIES = {
+    "图",
+    "图片",
+    "照片",
+    "近照",
+    "高清",
+    "最新",
+    "随便",
+    "来一张",
+    "1",
+    "2",
+    "3",
+    "?",
+    "？",
+}
+_IMAGE_INTENT_HINTS = (
+    "近照",
+    "高清",
+    "写真",
+    "活动",
+    "机场",
+    "红毯",
+    "肖像",
+    "人像",
+    "photo",
+    "portrait",
+    "recent",
+    "latest",
+    "hd",
+)
 
 _BING_JS = """
 () => {
@@ -155,7 +186,11 @@ class BrowserTool(Tool):
                 ToolParameter(
                     name="text",
                     type="string",
-                    description="Text to type, or search query for search_images.",
+                    description=(
+                        "Text to type, or search query for search_images. "
+                        "For image search use explicit keywords, e.g. "
+                        "'杨幂 近照 高清 人像' or 'cute cat photo hd'."
+                    ),
                     required=False,
                 ),
                 ToolParameter(
@@ -293,7 +328,18 @@ class BrowserTool(Tool):
                 return ToolResult(
                     success=False, output="", error="text 参数为空（搜索关键词）"
                 )
-            return await self._search_images(page, query)
+            try:
+                normalized_query = _normalize_image_query(str(query))
+            except ValueError as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"{exc}。请使用明确关键词，如："
+                        "“杨幂 近照 高清 人像”或“可爱猫咪 photo hd”"
+                    ),
+                )
+            return await self._search_images(page, normalized_query)
 
         elif action == "back":
             await page.go_back(timeout=_TIMEOUT)
@@ -370,6 +416,7 @@ class BrowserTool(Tool):
                     return ToolResult(
                         success=True,
                         output=(
+                            f"搜索词: {query}\n"
                             f"图片已下载，请使用以下路径展示（禁止修改或编造路径）:\n"
                             f"![图片]({path})\n"
                             f"文件: {path}\n"
@@ -384,3 +431,25 @@ class BrowserTool(Tool):
             output="",
             error="所有图片 URL 下载失败",
         )
+
+
+def _normalize_image_query(query: str) -> str:
+    """Normalize and validate image-search query quality."""
+    # strip ASCII control chars that may appear in malformed tool arguments
+    q = "".join(ch for ch in query if ord(ch) >= 32 and ord(ch) != 127)
+    # strip literal escaped noise like "\\n0\\n0\\x10"
+    q = re.sub(r"(?:\\[nrt]\d*|\\x[0-9a-fA-F]{2})+", " ", q)
+    q = " ".join(q.strip().split())
+    if not q:
+        raise ValueError("搜索关键词为空")
+    if q.lower() in _GENERIC_IMAGE_QUERIES or q in _GENERIC_IMAGE_QUERIES:
+        raise ValueError(f"搜索关键词过于泛化: {q}")
+    if re.fullmatch(r"[\d\s\W_]+", q):
+        raise ValueError(f"搜索关键词无效: {q}")
+    if len(q) < 2:
+        raise ValueError(f"搜索关键词过短: {q}")
+
+    has_hint = any(h in q.lower() for h in _IMAGE_INTENT_HINTS)
+    if not has_hint:
+        q = f"{q} 近照 高清 人像"
+    return q

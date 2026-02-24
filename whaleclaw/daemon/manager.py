@@ -39,7 +39,7 @@ class DaemonManager:
     def install(
         self,
         python_path: str,
-        port: int = 18789,
+        port: int = 18666,
         bind: str = "127.0.0.1",
     ) -> None:
         self._service.install(python_path=python_path, port=port, bind=bind)

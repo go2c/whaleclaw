@@ -9,29 +9,40 @@ path regardless of whether the provider supports native ``tools`` API:
   prompt; the LLM outputs a JSON block which the loop parses.
 """
 
-from __future__ import annotations
-
+import asyncio
 import json
 import re
+from typing import TYPE_CHECKING, cast
 
 from whaleclaw.agent.context import OnToolCall, OnToolResult
 from whaleclaw.agent.prompt import PromptAssembler
-from whaleclaw.config.schema import WhaleclawConfig
+from whaleclaw.config.schema import (
+    AgentConfig,
+    ModelsConfig,
+    SummarizerConfig,
+    WhaleclawConfig,
+)
 from whaleclaw.providers.base import AgentResponse, ImageContent, Message, ToolCall
 from whaleclaw.providers.router import ModelRouter
-from whaleclaw.sessions.context_window import ContextWindow
-from whaleclaw.sessions.manager import Session
+from whaleclaw.sessions.compressor import ContextCompressor
+from whaleclaw.sessions.context_window import RECENT_PROTECTED, ContextWindow
+from whaleclaw.sessions.manager import Session, SessionManager
+from whaleclaw.sessions.store import SessionStore
 from whaleclaw.tools.base import ToolResult
 from whaleclaw.tools.registry import ToolRegistry
 from whaleclaw.types import StreamCallback
 from whaleclaw.utils.log import get_logger
 
+if TYPE_CHECKING:
+    from whaleclaw.cron.scheduler import CronScheduler
+
 log = get_logger(__name__)
 
 _assembler = PromptAssembler()
 _context_window = ContextWindow()
+_compressor = ContextCompressor()
 
-_MAX_TOOL_ROUNDS = 8
+_MAX_OUTPUT_TOKENS = 200_000
 
 _IMG_MD_RE = re.compile(r"!\[([^\]]*)\]\((/[^)]+)\)")
 
@@ -47,7 +58,7 @@ _TOOL_HINTS: dict[str, str] = {
 
 def _make_plan_hint(tool_names: list[str], user_msg: str) -> str:
     """Generate a brief plan message when LLM jumps straight to tool calls."""
-    steps = []
+    steps: list[str] = []
     seen: set[str] = set()
     for name in tool_names:
         if name in seen:
@@ -107,8 +118,8 @@ def _fix_image_paths(text: str, known_paths: list[str] | None = None) -> str:
 
 
 def create_default_registry(
-    session_manager: object | None = None,
-    cron_scheduler: object | None = None,
+    session_manager: SessionManager | None = None,
+    cron_scheduler: "CronScheduler | None" = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry with all built-in tools registered.
 
@@ -179,13 +190,14 @@ def _parse_fallback_tool_calls(text: str) -> list[ToolCall]:
             continue
         if not isinstance(obj, dict):
             continue
-        name = obj.get("tool", "")
-        args = obj.get("arguments", {})
-        if name and isinstance(args, dict):
+        d = cast(dict[str, object], obj)
+        raw_name = d.get("tool", "")
+        raw_args = d.get("arguments", {})
+        if isinstance(raw_name, str) and raw_name and isinstance(raw_args, dict):
             calls.append(ToolCall(
                 id=f"fallback_{len(calls)}",
-                name=name,
-                arguments=args,
+                name=raw_name,
+                arguments=raw_args,
             ))
 
     return calls
@@ -208,7 +220,7 @@ def _strip_tool_json(text: str) -> str:
 
 
 async def _persist_message(
-    manager: object,
+    manager: SessionManager,
     session: Session,
     role: str,
     content: str,
@@ -218,12 +230,10 @@ async def _persist_message(
 ) -> None:
     """Persist a message to session store (best-effort, never raises)."""
     try:
-        from whaleclaw.sessions.manager import SessionManager
-        if isinstance(manager, SessionManager):
-            await manager.add_message(
-                session, role, content,
-                tool_call_id=tool_call_id, tool_name=tool_name,
-            )
+        await manager.add_message(
+            session, role, content,
+            tool_call_id=tool_call_id, tool_name=tool_name,
+        )
     except Exception as exc:
         log.debug("agent.persist_failed", error=str(exc))
 
@@ -238,6 +248,9 @@ async def _execute_tool(
     if on_tool_call:
         await on_tool_call(tc.name, tc.arguments)
 
+    import time
+    t0 = time.monotonic()
+
     tool = registry.get(tc.name)
     if tool is None:
         result = ToolResult(
@@ -250,6 +263,15 @@ async def _execute_tool(
             result = await tool.execute(**tc.arguments)
         except Exception as exc:
             result = ToolResult(success=False, output="", error=str(exc))
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    log.info(
+        "agent.tool_exec",
+        tool=tc.name,
+        success=result.success,
+        elapsed_ms=elapsed_ms,
+        args_preview=str(tc.arguments)[:200],
+    )
 
     if on_tool_result:
         await on_tool_result(tc.name, result)
@@ -264,6 +286,166 @@ def _format_tool_output(result: ToolResult) -> str:
     return f"[ERROR] {result.error or 'unknown error'}\n{result.output}".strip()
 
 
+def _validate_tool_call_args(tc: ToolCall, registry: ToolRegistry) -> str | None:
+    """Return validation error text for invalid tool call args, else None."""
+    tool = registry.get(tc.name)
+    if tool is None:
+        return None
+    for p in tool.definition.parameters:
+        if not p.required:
+            continue
+        if p.name not in tc.arguments:
+            return f"{tc.name}.{p.name} 缺失"
+        val = tc.arguments.get(p.name)
+        if isinstance(val, str) and not val.strip():
+            return f"{tc.name}.{p.name} 为空"
+    if tc.name == "browser":
+        action = str(tc.arguments.get("action", "")).strip()
+        if not action:
+            return "browser.action 为空"
+        action_reqs: dict[str, tuple[str, ...]] = {
+            "navigate": ("url",),
+            "click": ("selector",),
+            "type": ("selector", "text"),
+            "evaluate": ("script",),
+            "search_images": ("text",),
+        }
+        required_fields = action_reqs.get(action, ())
+        for field in required_fields:
+            value = tc.arguments.get(field)
+            if isinstance(value, str):
+                if not value.strip():
+                    return f"browser.{field} 为空"
+            elif value is None:
+                return f"browser.{field} 缺失"
+    if tc.name == "file_edit":
+        old_s = tc.arguments.get("old_string")
+        new_s = tc.arguments.get("new_string")
+        for field_name, field_val in (("old_string", old_s), ("new_string", new_s)):
+            if not isinstance(field_val, str):
+                continue
+            # If the payload is mostly literal escape sequences (\\n/\\t),
+            # model likely attempted a brittle large block replace via JSON string.
+            # Force retry with file_write full rewrite to avoid corrupt edits.
+            if field_val.count("\\n") >= 3 and "\n" not in field_val:
+                return f"file_edit.{field_name} 疑似转义块文本，改用 file_write 重写文件"
+    return None
+
+
+def _is_non_empty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _first_non_empty_arg(arguments: dict[str, object], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = arguments.get(name)
+        if _is_non_empty_str(value):
+            return str(value).strip()
+    return None
+
+
+def _looks_like_image_request(text: str) -> bool:
+    lower = text.lower()
+    keywords = (
+        "图", "图片", "照片", "近照", "头像", "搜图", "找图", "壁纸", "海报", "背景", "写真",
+        "image", "photo", "picture", "wallpaper", "poster",
+    )
+    return any(k.lower() in lower for k in keywords)
+
+
+def _is_garbled_query(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    escaped_noise = t.count("\\n") + t.count("\\t") + t.count("\\r") + t.count("\\x")
+    if escaped_noise >= 2:
+        return True
+    if (
+        re.search(r"(?:\\+[nrt]\d*){2,}", t)
+        or re.search(r"(?:\n\d*){2,}", t)
+        or t.count("\\x") >= 2
+    ):
+        return True
+    if len(t) > 40 and len(set(t)) < 10:
+        return True
+    return False
+
+
+def _repair_tool_call(tc: ToolCall, user_message: str) -> tuple[ToolCall, str | None]:
+    """Best-effort deterministic arg repair for common malformed tool calls."""
+    args: dict[str, object] = dict(tc.arguments)
+    changed = False
+    reasons: list[str] = []
+
+    # normalize common aliases
+    alias_by_tool: dict[str, dict[str, tuple[str, ...]]] = {
+        "bash": {"command": ("cmd", "script", "shell")},
+        "browser": {"text": ("query", "keyword", "keywords", "q"), "selector": ("css",)},
+        "file_read": {"path": ("file", "file_path")},
+        "file_write": {"path": ("file", "file_path"), "content": ("text", "code")},
+        "file_edit": {
+            "path": ("file", "file_path"),
+            "old_string": ("old", "old_text"),
+            "new_string": ("new", "new_text"),
+        },
+    }
+    alias_map = alias_by_tool.get(tc.name, {})
+    for canonical, aliases in alias_map.items():
+        if _is_non_empty_str(args.get(canonical)):
+            continue
+        value = _first_non_empty_arg(args, aliases)
+        if value is None:
+            continue
+        args[canonical] = value
+        changed = True
+        reasons.append(f"{canonical}<-alias")
+
+    if tc.name == "browser":
+        action = str(args.get("action", "")).strip().lower()
+        inferred_action: str | None = None
+
+        if not action:
+            if _is_non_empty_str(args.get("url")):
+                inferred_action = "navigate"
+            elif _is_non_empty_str(args.get("script")):
+                inferred_action = "evaluate"
+            elif _is_non_empty_str(args.get("selector")) and _is_non_empty_str(args.get("text")):
+                inferred_action = "type"
+            elif _is_non_empty_str(args.get("selector")):
+                if any(k in user_message for k in ("读取", "提取", "文本", "内容", "text")):
+                    inferred_action = "get_text"
+                else:
+                    inferred_action = "click"
+            else:
+                query = _first_non_empty_arg(args, ("text", "query", "keyword", "keywords", "q"))
+                if query is not None and _looks_like_image_request(user_message):
+                    args["text"] = query
+                    inferred_action = "search_images"
+
+            if inferred_action is not None:
+                args["action"] = inferred_action
+                action = inferred_action
+                changed = True
+                reasons.append("action<-inferred")
+
+        if action == "navigate" and not _is_non_empty_str(args.get("url")):
+            candidate = _first_non_empty_arg(args, ("text",))
+            if candidate and candidate.startswith(("http://", "https://")):
+                args["url"] = candidate
+                changed = True
+                reasons.append("url<-text")
+        if action == "search_images":
+            q = str(args.get("text", "")).strip()
+            if _is_garbled_query(q) and _looks_like_image_request(user_message):
+                args["text"] = user_message.strip()
+                changed = True
+                reasons.append("text<-user_message")
+
+    if not changed:
+        return tc, None
+    return ToolCall(id=tc.id, name=tc.name, arguments=args), ",".join(reasons)
+
+
 async def run_agent(
     message: str,
     session_id: str,
@@ -276,7 +458,8 @@ async def run_agent(
     on_tool_call: OnToolCall | None = None,
     on_tool_result: OnToolResult | None = None,
     images: list[ImageContent] | None = None,
-    session_manager: object | None = None,
+    session_manager: SessionManager | None = None,
+    session_store: SessionStore | None = None,
 ) -> str:
     """Run the Agent loop with tool support and multi-turn context.
 
@@ -284,12 +467,16 @@ async def run_agent(
     1. Check if provider supports native tools API
     2. If yes  -> pass schemas via ``tools=``; parse structured tool_calls
     3. If no   -> inject tool descriptions into system prompt; parse JSON text
-    4. Execute tools, append results, loop (max _MAX_TOOL_ROUNDS)
+    4. Execute tools, append results, loop (until no tool calls or token budget exhausted)
     5. Return final text reply
     """
-    model_id = session.model if session else config.agent.model
+    agent_cfg = cast(AgentConfig, config.agent)
+    models_cfg = cast(ModelsConfig, config.models)
+    summarizer_cfg = cast(SummarizerConfig, agent_cfg.summarizer)
+
+    model_id: str = session.model if session else agent_cfg.model
     if router is None:
-        router = ModelRouter(config.models)
+        router = ModelRouter(models_cfg)
     if registry is None:
         registry = create_default_registry()
 
@@ -307,7 +494,7 @@ async def run_agent(
         conversation = list(session.messages)
     conversation.append(Message(role="user", content=message, images=images))
 
-    model_short = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    model_short: str = model_id.split("/", 1)[-1] if "/" in model_id else model_id
 
     log.info(
         "agent.run",
@@ -322,18 +509,43 @@ async def run_agent(
     total_input = 0
     total_output = 0
     announced_plan = False
+    db_summaries = []
+    if session_store and summarizer_cfg.enabled:
+        try:
+            db_summaries = await session_store.get_summaries(session_id)
+        except Exception as exc:
+            log.debug("agent.summaries_load_failed", error=str(exc))
 
-    for round_idx in range(_MAX_TOOL_ROUNDS):
-        all_messages = _context_window.trim(
-            [*system_messages, *conversation], model_short,
-        )
+    import hashlib as _hashlib
+    import time as _time
 
+    _recent_signatures: list[str] = []
+    _LOOP_DETECT_WINDOW = 3
+    invalid_tool_rounds = 0
+    browser_fail_streak = 0
+    blocked_tools: set[str] = set()
+
+    round_idx = -1
+    while total_output < _MAX_OUTPUT_TOKENS:
+        round_idx += 1
+        if db_summaries:
+            all_messages = _context_window.trim_with_summaries(
+                [*system_messages, *conversation], model_short, db_summaries,
+            )
+        else:
+            all_messages = _context_window.trim(
+                [*system_messages, *conversation], model_short,
+            )
+
+        _llm_t0 = _time.monotonic()
         response: AgentResponse = await router.chat(
             model_id,
             all_messages,
             tools=tool_schemas or None,
             on_stream=on_stream,
         )
+        _llm_ms = int((_time.monotonic() - _llm_t0) * 1000)
+        log.info("agent.llm_call", round=round_idx, elapsed_ms=_llm_ms, model=model_id)
 
         total_input += response.input_tokens
         total_output += response.output_tokens
@@ -341,6 +553,97 @@ async def run_agent(
         tool_calls = response.tool_calls
         if not tool_calls and not native_tools and response.content:
             tool_calls = _parse_fallback_tool_calls(response.content)
+        if tool_calls:
+            valid_tool_calls = [tc for tc in tool_calls if tc.name.strip()]
+            dropped = len(tool_calls) - len(valid_tool_calls)
+            if dropped > 0:
+                if valid_tool_calls:
+                    log.debug(
+                        "agent.invalid_tool_calls_dropped",
+                        dropped=dropped,
+                        kept=len(valid_tool_calls),
+                        session_id=session_id,
+                    )
+                else:
+                    log.warning(
+                        "agent.invalid_tool_calls_dropped",
+                        dropped=dropped,
+                        kept=0,
+                        session_id=session_id,
+                    )
+            repaired_calls: list[ToolCall] = []
+            for tc in valid_tool_calls:
+                repaired, reason = _repair_tool_call(tc, message)
+                if reason:
+                    log.info(
+                        "agent.tool_call_repaired",
+                        tool=tc.name,
+                        reason=reason,
+                        before=str(tc.arguments)[:200],
+                        after=str(repaired.arguments)[:200],
+                        session_id=session_id,
+                    )
+                repaired_calls.append(repaired)
+            tool_calls = repaired_calls
+            blocked_reasons = [
+                f"{tc.name} 已熔断，禁止继续调用"
+                for tc in tool_calls
+                if tc.name in blocked_tools
+            ]
+            if blocked_reasons:
+                invalid_tool_rounds += 1
+                log.warning(
+                    "agent.blocked_tool_calls_dropped",
+                    reasons=blocked_reasons,
+                    round=round_idx,
+                    session_id=session_id,
+                )
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 该工具已被熔断："
+                            f"{'; '.join(blocked_reasons)}。"
+                            "请改用其他工具（例如 bash）完成任务。"
+                        ),
+                    )
+                )
+                if invalid_tool_rounds >= 2:
+                    final_text_parts.append(
+                        "工具调用连续无效，已停止自动重试。请明确参数后重试。"
+                    )
+                    break
+                continue
+            invalid_reasons = [
+                reason
+                for tc in tool_calls
+                if (reason := _validate_tool_call_args(tc, registry)) is not None
+            ]
+            if invalid_reasons:
+                invalid_tool_rounds += 1
+                log.warning(
+                    "agent.invalid_tool_call_args",
+                    reasons=invalid_reasons,
+                    round=round_idx,
+                    session_id=session_id,
+                )
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 你上一轮的工具调用参数无效："
+                            f"{'; '.join(invalid_reasons)}。"
+                            "请只重发一个有效的工具调用，必填参数必须完整且非空。"
+                        ),
+                    )
+                )
+                if invalid_tool_rounds >= 2:
+                    final_text_parts.append(
+                        "工具调用参数连续无效，已停止自动重试。请明确参数后重试。"
+                    )
+                    break
+                continue
+            invalid_tool_rounds = 0
 
         content = response.content or ""
         if content:
@@ -386,10 +689,38 @@ async def run_agent(
         if session_manager and session:
             await _persist_message(session_manager, session, "assistant", assistant_persist)
 
+        for _tname in ("reminder", "cron"):
+            _tool = registry.get(_tname)
+            if _tool is not None and hasattr(_tool, "current_session_id"):
+                _tool.current_session_id = session_id  # type: ignore[union-attr]
+
         for tc in tool_calls:
             tc_id, result = await _execute_tool(
                 registry, tc, on_tool_call, on_tool_result
             )
+            if tc.name == "browser":
+                if result.success:
+                    browser_fail_streak = 0
+                else:
+                    browser_fail_streak += 1
+                    if browser_fail_streak >= 2 and "browser" not in blocked_tools:
+                        blocked_tools.add("browser")
+                        log.warning(
+                            "agent.tool_circuit_open",
+                            tool="browser",
+                            fail_streak=browser_fail_streak,
+                            session_id=session_id,
+                        )
+                        conversation.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "[系统降级] browser 工具连续失败，已自动熔断。"
+                                    "后续请不要再调用 browser。"
+                                    "请改用 bash 工具执行可复现的命令行方案完成任务。"
+                                ),
+                            )
+                        )
 
             if result.success and result.output:
                 for path_match in re.finditer(
@@ -430,16 +761,87 @@ async def run_agent(
                 output_len=len(result.output),
             )
 
+        sig_parts = []
+        for tc in tool_calls:
+            arg_str = json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]
+            sig_parts.append(f"{tc.name}:{arg_str}")
+        round_sig = _hashlib.md5("|".join(sig_parts).encode()).hexdigest()  # noqa: S324
+        _recent_signatures.append(round_sig)
+
+        if len(_recent_signatures) >= _LOOP_DETECT_WINDOW:
+            tail = _recent_signatures[-_LOOP_DETECT_WINDOW:]
+            if len(set(tail)) == 1:
+                log.warning(
+                    "agent.loop_detected",
+                    session_id=session_id,
+                    rounds=round_idx + 1,
+                    repeated_tool=tool_calls[0].name,
+                )
+                conversation.append(Message(
+                    role="user",
+                    content=(
+                        "[系统提示] 检测到你在重复执行相同操作且未取得进展。"
+                        "请换一种方式解决问题，或直接向用户说明当前遇到的困难。"
+                    ),
+                ))
+
         final_text_parts.clear()
     else:
         log.warning(
-            "agent.max_tool_rounds",
+            "agent.token_budget_exhausted",
             session_id=session_id,
-            rounds=_MAX_TOOL_ROUNDS,
+            rounds=round_idx + 1,
+            total_output=total_output,
         )
 
     final_text = "".join(final_text_parts)
     final_text = _fix_image_paths(final_text, real_image_paths)
+
+    # Background: generate L0/L1 summaries for older messages if needed
+    if (
+        session_store
+        and router
+        and summarizer_cfg.enabled
+        and session
+        and _compressor.should_compress(len(conversation))
+    ):
+        try:
+            latest = await session_store.get_latest_summary(session_id, "L0")
+            msg_rows = await session_store.get_messages(session_id)
+
+            already_covered = latest.source_msg_end if latest else 0
+            uncovered = [r for r in msg_rows if r.id > already_covered]
+            protected = min(RECENT_PROTECTED, len(uncovered))
+            to_compress = uncovered[:-protected] if protected < len(uncovered) else []
+
+            if len(to_compress) >= 8:
+                compress_msgs = [
+                    Message(role=r.role if r.role != "tool" else "assistant", content=r.content)
+                    for r in to_compress
+                ]
+                start_id = to_compress[0].id
+                end_id = to_compress[-1].id
+                _store_ref = session_store
+                _router_ref = router
+                _model_ref: str = summarizer_cfg.model
+
+                async def _bg_compress() -> None:
+                    try:
+                        await _compressor.compress_segment(
+                            session_id=session_id,
+                            messages=compress_msgs,
+                            msg_id_start=start_id,
+                            msg_id_end=end_id,
+                            store=_store_ref,
+                            router=_router_ref,
+                            model=_model_ref,
+                        )
+                    except Exception as exc:
+                        log.debug("agent.bg_compress_failed", error=str(exc))
+
+                asyncio.create_task(_bg_compress())
+        except Exception as exc:
+            log.debug("agent.bg_compress_prep_failed", error=str(exc))
 
     log.info(
         "agent.done",
@@ -448,5 +850,16 @@ async def run_agent(
         output_tokens=total_output,
         session_id=session_id,
     )
+
+    if session_store and total_input + total_output > 0:
+        try:
+            await session_store.record_token_usage(
+                session_id=session_id,
+                model=model_id,
+                input_tokens=total_input,
+                output_tokens=total_output,
+            )
+        except Exception:
+            log.debug("agent.token_usage_save_failed")
 
     return final_text

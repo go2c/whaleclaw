@@ -26,7 +26,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     cat > "$CONFIG_FILE" << 'DEFAULTCFG'
 {
   "gateway": {
-    "port": 18789,
+    "port": 18666,
     "bind": "127.0.0.1",
     "verbose": false,
     "auth": { "mode": "none", "password": null }
@@ -34,7 +34,11 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "agent": {
     "model": "deepseek/deepseek-chat",
     "max_tool_rounds": 25,
-    "thinking_level": "off"
+    "thinking_level": "off",
+    "summarizer": {
+      "model": "zhipu/glm-4.7-flash",
+      "enabled": true
+    }
   },
   "models": {
     "anthropic": { "api_key": null, "base_url": null },
@@ -46,6 +50,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
     "moonshot":  { "api_key": null, "base_url": null },
     "google":    { "api_key": null, "base_url": null },
     "nvidia":    { "api_key": null, "base_url": null }
+  },
+  "channels": {
+    "feishu": {
+      "mode": "ws",
+      "app_id": "",
+      "app_secret": "",
+      "verification_token": null,
+      "encrypt_key": null,
+      "webhook_path": "/webhook/feishu",
+      "dm_policy": "pairing"
+    }
   },
   "security": {
     "sandbox_mode": "non-main",
@@ -70,7 +85,7 @@ ag = cfg.get('agent', {})
 au = gw.get('auth', {})
 models = cfg.get('models', {})
 
-port = gw.get('port', 18789)
+port = gw.get('port', 18666)
 bind = gw.get('bind', '127.0.0.1')
 auth_mode = au.get('mode', 'none')
 model = ag.get('model', '未设置')
@@ -80,27 +95,67 @@ thinking = ag.get('thinking_level', 'off')
 configured = []
 for name, conf in models.items():
     key = conf.get('api_key')
-    if not key:
+    is_oauth = name == 'openai' and conf.get('auth_mode') == 'oauth' and conf.get('oauth_access')
+    if not key and not is_oauth:
         continue
     cm = conf.get('configured_models', [])
     verified = [m for m in cm if m.get('verified')]
     total = len(cm)
-    key_preview = key[:8] + '...' + key[-4:] if len(str(key)) > 16 else str(key)
-    if verified:
-        names = ', '.join(m.get('name') or m['id'] for m in verified[:3])
-        extra = f' +{len(verified)-3}' if len(verified) > 3 else ''
-        configured.append(f'{name} | {len(verified)}/{total} 模型 | {names}{extra}')
+    if is_oauth:
+        auth_label = '🔑 ChatGPT OAuth'
+        if verified:
+            names = ', '.join(m.get('name') or m['id'] for m in verified[:3])
+            extra = f' +{len(verified)-3}' if len(verified) > 3 else ''
+            configured.append(f'{name} | {auth_label} | {len(verified)}/{total} 模型 | {names}{extra}')
+        else:
+            configured.append(f'{name} | {auth_label} (未配置模型)')
     else:
-        configured.append(f'{name} | Key: {key_preview} (未配置模型)')
+        key_preview = key[:8] + '...' + key[-4:] if len(str(key)) > 16 else str(key)
+        if verified:
+            names = ', '.join(m.get('name') or m['id'] for m in verified[:3])
+            extra = f' +{len(verified)-3}' if len(verified) > 3 else ''
+            configured.append(f'{name} | {len(verified)}/{total} 模型 | {names}{extra}')
+        else:
+            configured.append(f'{name} | Key: {key_preview} (未配置模型)')
 
-print(f'PORT={port}')
-print(f'BIND={bind}')
-print(f'AUTH_MODE={auth_mode}')
-print(f'MODEL={model}')
-print(f'THINKING={thinking}')
-print(f'NUM_KEYS={len(configured)}')
+summ = ag.get('summarizer', {})
+summ_model = summ.get('model', 'zhipu/glm-4.7-flash')
+summ_enabled = summ.get('enabled', True)
+summ_provider = summ_model.split('/')[0] if '/' in summ_model else ''
+summ_has_key = bool(models.get(summ_provider, {}).get('api_key')) if summ_provider else False
+summ_status = '开启' if summ_enabled else '关闭'
+if summ_enabled and not summ_has_key:
+    summ_status = '⚠️ 未配置 Key'
+
+feishu = cfg.get('channels', {}).get('feishu', {})
+feishu_appid = feishu.get('app_id', '')
+feishu_secret = feishu.get('app_secret', '')
+if feishu_appid and feishu_secret:
+    fid_preview = feishu_appid[:6] + '...' + feishu_appid[-4:] if len(feishu_appid) > 14 else feishu_appid
+    feishu_status = f'已配置 (App: {fid_preview})'
+else:
+    feishu_status = '未配置'
+feishu_mode = feishu.get('mode', 'ws')
+feishu_dm = feishu.get('dm_policy', 'pairing')
+feishu_webhook = feishu.get('webhook_path', '/webhook/feishu')
+
+def q(s: str) -> str:
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+print(f'PORT={q(port)}')
+print(f'BIND={q(bind)}')
+print(f'AUTH_MODE={q(auth_mode)}')
+print(f'MODEL={q(model)}')
+print(f'THINKING={q(thinking)}')
+print(f'SUMM_MODEL={q(summ_model)}')
+print(f'SUMM_ENABLED={q(summ_status)}')
+print(f'NUM_KEYS={q(len(configured))}')
 for i, c in enumerate(configured):
-    print(f'KEY_{i}={c}')
+    print(f'KEY_{i}={q(c)}')
+print(f'FEISHU_STATUS={q(feishu_status)}')
+print(f'FEISHU_MODE={q(feishu_mode)}')
+print(f'FEISHU_DM={q(feishu_dm)}')
+print(f'FEISHU_WEBHOOK={q(feishu_webhook)}')
 PYEOF
 }
 
@@ -121,6 +176,7 @@ show_menu() {
     echo "  │  认证:     ${AUTH_MODE}"
     echo "  │  默认模型: ${MODEL}"
     echo "  │  思考深度: ${THINKING}"
+    echo "  │  压缩模型: ${SUMM_MODEL} (${SUMM_ENABLED})"
     echo "  │  已配置:   ${NUM_KEYS} 个提供商"
 
     i=0
@@ -130,6 +186,10 @@ show_menu() {
         i=$((i+1))
     done
 
+    echo "  │"
+    echo "  │  飞书渠道: ${FEISHU_STATUS}"
+    echo "  │  连接模式: ${FEISHU_MODE}"
+    echo "  │  飞书 DM:  ${FEISHU_DM}"
     echo "  └────────────────────────────────────────┘"
     echo ""
     echo "  ─── 操作菜单 ────────────────────────────"
@@ -137,9 +197,11 @@ show_menu() {
     echo "  1) 配置 AI 模型"
     echo "  2) 修改 Gateway 端口"
     echo "  3) 设置登录密码"
-    echo "  4) 编辑配置文件 (系统编辑器)"
-    echo "  5) 运行诊断 (doctor)"
-    echo "  6) 查看完整配置"
+    echo "  4) 配置上下文压缩"
+    echo "  5) 配置飞书渠道"
+    echo "  6) 编辑配置文件 (系统编辑器)"
+    echo "  7) 运行诊断 (doctor)"
+    echo "  8) 查看完整配置"
     echo "  0) 退出"
     echo ""
 }
@@ -153,12 +215,26 @@ verify_api() {
     local v_provider="$1" v_model="$2" v_apikey="$3" v_base_url="$4"
 
     "$PYTHON" << PYEOF
-import httpx, json, socket, sys, os
+import httpx, json, socket, sys, os, pathlib
 
-api_key = '''$v_apikey'''
+_raw_key = '''$v_apikey'''
 base_url = '''$v_base_url'''
 provider = '''$v_provider'''
 model = '''$v_model'''
+
+# For OpenAI OAuth mode, read the token from config to avoid bash escaping issues
+api_key = _raw_key
+_is_oauth = False
+if provider == 'openai':
+    _cp = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+    if _cp.exists():
+        _cc = json.loads(_cp.read_text())
+        _oc = _cc.get('models', {}).get('openai', {})
+        if _oc.get('auth_mode') == 'oauth':
+            _is_oauth = True
+            _tok = _oc.get('oauth_access', '')
+            if _tok:
+                api_key = _tok
 
 def find_proxy():
     for port in (7897, 7890, 1087, 8080):
@@ -191,12 +267,21 @@ elif provider == 'google':
     headers = {'Content-Type': 'application/json'}
     body = {'contents': [{'parts': [{'text': 'hi'}]}], 'generationConfig': {'maxOutputTokens': 5}}
 else:
-    url = f'{base_url}/chat/completions'
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
     }
-    body = {'model': model, 'max_tokens': 5, 'messages': [{'role': 'user', 'content': 'hi'}]}
+    if _is_oauth and _oc.get('oauth_account_id'):
+        headers['ChatGPT-Account-Id'] = _oc['oauth_account_id']
+    if _is_oauth and provider == 'openai':
+        print('  ℹ️  OAuth 模式下 OpenAI 模型跳过验证 (使用 ChatGPT OAuth 链路)')
+        sys.exit(0)
+    elif 'codex' in model:
+        url = f'{base_url}/responses'
+        body = {'model': model, 'input': 'hi', 'max_output_tokens': 5}
+    else:
+        url = f'{base_url}/chat/completions'
+        body = {'model': model, 'max_tokens': 5, 'messages': [{'role': 'user', 'content': 'hi'}]}
 
 def try_request(proxy_url=None):
     kwargs = {'timeout': 15}
@@ -253,7 +338,15 @@ elif resp.status_code == 404:
     print(f'  \033[31m❌ 模型不存在: {model} (404)\033[0m')
     sys.exit(1)
 elif resp.status_code == 429:
-    print('  \033[33m⚠️  速率限制 (429)，Key 有效\033[0m')
+    msg429 = ''
+    try:
+        msg429 = resp.json().get('error', {}).get('code', '')
+    except Exception:
+        pass
+    if _is_oauth and msg429 == 'insufficient_quota':
+        print('  \033[32m✅ OAuth 认证有效 (ChatGPT Plus 不含 API 额度，实际使用无影响)\033[0m')
+    else:
+        print('  \033[33m⚠️  速率限制 (429)，Key 有效\033[0m')
 else:
     print(f'  \033[33m⚠️  返回 {resp.status_code}\033[0m')
     try:
@@ -323,10 +416,7 @@ _MODELS_anthropic=(
 _URL_anthropic="https://api.anthropic.com"
 
 _MODELS_openai=(
-    "gpt-4o|GPT-4o|off"
-    "gpt-4.1|GPT-4.1|off"
-    "o3|o3 (思考)|medium"
-    "o4-mini|o4-mini (思考)|medium"
+    "gpt-5.2|GPT-5.2|off"
 )
 _URL_openai="https://api.openai.com/v1"
 
@@ -468,6 +558,22 @@ PYEOF
 # ══════════════════════════════════════════════
 _provider_model_menu() {
     local pname="$1" plabel="$2" apikey="$3" base_url="$4"
+    local oauth_openai_only="no"
+    if [ "$pname" = "openai" ]; then
+        local _mode
+        _mode=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+if p.exists():
+    cfg = json.loads(p.read_text())
+    print(cfg.get('models', {}).get('openai', {}).get('auth_mode', 'api_key'))
+else:
+    print('api_key')
+" 2>/dev/null)
+        if [ "$_mode" = "oauth" ]; then
+            oauth_openai_only="yes"
+        fi
+    fi
 
     # bash 3.2: 用 eval 间接获取数组
     local arr_name="_MODELS_${pname}"
@@ -490,16 +596,31 @@ _provider_model_menu() {
         echo "    $((i+1))) ${mname}${think_label}"
         i=$((i+1))
     done
-    echo "    c) 自定义输入"
-    echo "    a) 批量验证以上全部"
+    if [ "$oauth_openai_only" != "yes" ]; then
+        echo "    c) 自定义输入"
+        echo "    a) 批量验证以上全部"
+    fi
     echo "    0) 返回"
     echo ""
-    read -p "  选择 [1-${count}/c/a/0]: " mchoice
+    if [ "$oauth_openai_only" = "yes" ]; then
+        read -p "  选择 [1-${count}/0]: " mchoice
+    else
+        read -p "  选择 [1-${count}/c/a/0]: " mchoice
+    fi
 
     case $mchoice in
         0) return ;;
-        a|A) _batch_verify_provider "$pname" "$apikey" "$base_url"; return ;;
+        a|A)
+            if [ "$oauth_openai_only" = "yes" ]; then
+                echo "  ❌ OAuth 模式下 OpenAI 仅支持 GPT-5.2"
+                return
+            fi
+            _batch_verify_provider "$pname" "$apikey" "$base_url"; return ;;
         c|C)
+            if [ "$oauth_openai_only" = "yes" ]; then
+                echo "  ❌ OAuth 模式下 OpenAI 仅支持 GPT-5.2"
+                return
+            fi
             read -p "  输入模型 ID: " custom_mid
             read -p "  显示名称: " custom_name
             [ -z "$custom_mid" ] && return
@@ -654,8 +775,455 @@ PYEOF
 }
 
 # ══════════════════════════════════════════════
+#  配置上下文压缩模型
+# ══════════════════════════════════════════════
+configure_summarizer() {
+    echo ""
+    echo "  ═══ 配置上下文压缩 ═══"
+    echo ""
+    echo "  当对话过长时，WhaleClaw 会用便宜的小模型自动生成 L0/L1 分层摘要，"
+    echo "  持久化到数据库，后续对话按需加载，节省 token 开销。"
+    echo ""
+    echo "  ┌─────────────── 当前配置 ───────────────┐"
+    echo "  │  压缩模型:   ${SUMM_MODEL}"
+    echo "  │  状态:       ${SUMM_ENABLED}"
+    echo "  └────────────────────────────────────────┘"
+    echo ""
+    echo "  ─── 操作 ──────────────────────────────"
+    echo ""
+    echo "  1) 选择压缩模型"
+    echo "  2) 开启/关闭压缩"
+    echo "  0) 返回"
+    echo ""
+    read -p "  选择 [0-2]: " schoice
+
+    case $schoice in
+        1)
+            echo ""
+            echo "  推荐使用便宜、快速的模型 (几乎不花钱):"
+            echo ""
+            echo "  1) zhipu/glm-4.7-flash  — 智谱 GLM (免费)"
+            echo "  2) deepseek/deepseek-chat — DeepSeek Chat"
+            echo "  3) qwen/qwen-turbo       — 通义千问 Turbo"
+            echo "  4) moonshot/kimi-k2.5    — Kimi K2.5"
+            echo "  5) 自定义输入"
+            echo ""
+            read -p "  选择 [1-5]: " msel
+            local new_model="" new_provider="" new_model_short=""
+            case $msel in
+                1) new_model="zhipu/glm-4.7-flash"; new_provider="zhipu"; new_model_short="glm-4.7-flash" ;;
+                2) new_model="deepseek/deepseek-chat"; new_provider="deepseek"; new_model_short="deepseek-chat" ;;
+                3) new_model="qwen/qwen-turbo"; new_provider="qwen"; new_model_short="qwen-turbo" ;;
+                4) new_model="moonshot/kimi-k2.5"; new_provider="moonshot"; new_model_short="kimi-k2.5" ;;
+                5)
+                    read -p "  输入模型 ID (格式: provider/model): " new_model
+                    new_provider=$(echo "$new_model" | cut -d'/' -f1)
+                    new_model_short=$(echo "$new_model" | cut -d'/' -f2-)
+                    ;;
+                *) echo "  ❌ 无效选择"; return ;;
+            esac
+
+            if [ -z "$new_model" ] || [ -z "$new_provider" ]; then
+                return
+            fi
+
+            # ── Step 1: 获取该 provider 的默认 URL ──
+            eval "local default_url=\"\$_URL_${new_provider}\""
+            if [ -z "$default_url" ]; then
+                default_url="https://api.example.com/v1"
+            fi
+
+            # ── Step 2: 检查已有 API Key ──
+            local apikey=""
+            local existing_key
+            existing_key=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+print(cfg.get('models', {}).get('$new_provider', {}).get('api_key', '') or '')
+" 2>/dev/null)
+
+            local existing_url
+            existing_url=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+print(cfg.get('models', {}).get('$new_provider', {}).get('base_url', '') or '')
+" 2>/dev/null)
+
+            if [ -n "$existing_key" ]; then
+                local preview="${existing_key:0:8}...${existing_key: -4}"
+                echo ""
+                echo "  $new_provider 已有 API Key: $preview"
+                read -p "  回车复用，或输入新 Key: " new_key
+                if [ -n "$new_key" ]; then
+                    apikey="$new_key"
+                else
+                    apikey="$existing_key"
+                fi
+            else
+                echo ""
+                echo "  ⚠️  提供商 $new_provider 尚未配置 API Key"
+                echo ""
+                read -p "  请输入 $new_provider 的 API Key: " apikey
+                if [ -z "$apikey" ]; then
+                    echo "  ❌ API Key 为空，已取消"
+                    return
+                fi
+            fi
+
+            # ── Step 3: Base URL ──
+            local use_url="${existing_url:-$default_url}"
+            echo ""
+            echo "  默认 Base URL: $use_url"
+            read -p "  如需修改请输入，回车保持默认: " custom_url
+            local base_url="${custom_url:-$use_url}"
+
+            # ── Step 4: 保存 API Key + Base URL ──
+            "$PYTHON" << PYEOF
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+prov = cfg.setdefault('models', {}).setdefault('$new_provider', {})
+prov['api_key'] = '''$apikey'''
+prov['base_url'] = '$base_url'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ $new_provider API Key 和 Base URL 已保存')
+PYEOF
+
+            # ── Step 5: 验证 API 连通性 ──
+            echo ""
+            echo "  ─── 验证 $new_model ───"
+            verify_api "$new_provider" "$new_model_short" "$apikey" "$base_url"
+            local verify_result=$?
+
+            if [ $verify_result -ne 0 ]; then
+                echo ""
+                echo "  ⚠️  验证失败，但配置已保存。你可以稍后重试。"
+                read -p "  仍然设为压缩模型? [y/N]: " force
+                if ! echo "$force" | grep -qi '^y'; then
+                    echo "  已取消"
+                    return
+                fi
+            fi
+
+            # ── Step 6: 保存压缩模型选择 ──
+            "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+summ = cfg.setdefault('agent', {}).setdefault('summarizer', {})
+summ['model'] = '$new_model'
+summ['enabled'] = True
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print(f'  ✅ 压缩模型已设置为 $new_model')
+"
+            # 刷新状态变量
+            eval "$(read_status)"
+            ;;
+        2)
+            echo ""
+            "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+summ = cfg.setdefault('agent', {}).setdefault('summarizer', {})
+current = summ.get('enabled', True)
+summ['enabled'] = not current
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+state = '开启' if not current else '关闭'
+print(f'  ✅ 上下文压缩已{state}')
+"
+            # 刷新状态变量
+            eval "$(read_status)"
+            ;;
+        0) return ;;
+        *) echo "  ❌ 无效选择" ;;
+    esac
+}
+
+# ══════════════════════════════════════════════
+#  配置飞书渠道
+# ══════════════════════════════════════════════
+configure_feishu() {
+    echo ""
+    echo "  ═══ 配置飞书渠道 ═══"
+    echo ""
+    echo "  飞书机器人需要在飞书开放平台创建应用并获取凭证。"
+    echo "  开放平台地址: https://open.feishu.cn"
+    echo ""
+    echo "  ┌─────────────── 当前配置 ───────────────┐"
+    echo "  │  状态:       ${FEISHU_STATUS}"
+    echo "  │  连接模式:   ${FEISHU_MODE} (ws=长连接, webhook=回调)"
+    echo "  │  DM 策略:    ${FEISHU_DM}"
+    echo "  └────────────────────────────────────────┘"
+    echo ""
+    echo "  ─── 操作 ──────────────────────────────"
+    echo ""
+    echo "  1) 设置 App ID 和 App Secret"
+    echo "  2) 设置连接模式"
+    echo "  3) 设置 DM 策略"
+    echo "  0) 返回"
+    echo ""
+    read -p "  选择 [0-3]: " fchoice
+
+    case $fchoice in
+        1)
+            echo ""
+            local saved_aid saved_secret
+            saved_aid=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+print(cfg.get('channels', {}).get('feishu', {}).get('app_id', '') or '')
+" 2>/dev/null)
+            saved_secret=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+print(cfg.get('channels', {}).get('feishu', {}).get('app_secret', '') or '')
+" 2>/dev/null)
+
+            if [ -n "$saved_aid" ]; then
+                local aid_preview="${saved_aid:0:10}...${saved_aid: -4}"
+                echo "  已保存的 App ID: $aid_preview"
+                read -p "  回车复用，或输入新 App ID: " new_aid
+                if [ -n "$new_aid" ]; then
+                    saved_aid="$new_aid"
+                fi
+            else
+                read -p "  请输入 App ID (cli_ 开头): " saved_aid
+                if [ -z "$saved_aid" ]; then
+                    echo "  ⚠️  App ID 为空，跳过"
+                    return
+                fi
+            fi
+
+            if [ -n "$saved_secret" ]; then
+                local sec_preview="${saved_secret:0:8}...${saved_secret: -4}"
+                echo "  已保存的 App Secret: $sec_preview"
+                read -p "  回车复用，或输入新 App Secret: " new_secret
+                if [ -n "$new_secret" ]; then
+                    saved_secret="$new_secret"
+                fi
+            else
+                read -p "  请输入 App Secret: " saved_secret
+                if [ -z "$saved_secret" ]; then
+                    echo "  ⚠️  App Secret 为空，跳过"
+                    return
+                fi
+            fi
+
+            "$PYTHON" << PYEOF
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+feishu = cfg.setdefault('channels', {}).setdefault('feishu', {})
+feishu['app_id'] = '''$saved_aid'''
+feishu['app_secret'] = '''$saved_secret'''
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ 飞书 App ID 和 App Secret 已保存')
+print('  ⚠️  需要重启 Gateway 生效')
+PYEOF
+            eval "$(read_status)"
+            ;;
+        2)
+            echo ""
+            echo "  连接模式决定 WhaleClaw 如何接收飞书消息:"
+            echo ""
+            echo "  a) ws      — 长连接 (推荐，无需公网 IP)"
+            echo "  b) webhook — HTTP 回调 (需要公网可访问地址)"
+            echo ""
+            read -p "  选择 [a-b, 当前: ${FEISHU_MODE}]: " modechoice
+            local mode_val=""
+            case $modechoice in
+                a) mode_val="ws" ;;
+                b) mode_val="webhook" ;;
+                *) echo "  ❌ 无效选择"; return ;;
+            esac
+            "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+cfg.setdefault('channels', {}).setdefault('feishu', {})['mode'] = '$mode_val'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ 连接模式已设置为 $mode_val')
+print('  ⚠️  需要重启 Gateway 生效')
+"
+            eval "$(read_status)"
+            ;;
+        3)
+            echo ""
+            echo "  DM 策略控制谁可以与机器人私聊:"
+            echo ""
+            echo "  a) pairing — 需要配对码验证 (默认，最安全)"
+            echo "  b) open    — 任何人可直接对话"
+            echo "  c) closed  — 禁止私聊"
+            echo ""
+            read -p "  选择 [a-c]: " dmpolicy
+            local dm_val=""
+            case $dmpolicy in
+                a) dm_val="pairing" ;;
+                b) dm_val="open" ;;
+                c) dm_val="closed" ;;
+                *) echo "  ❌ 无效选择"; return ;;
+            esac
+            "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+cfg.setdefault('channels', {}).setdefault('feishu', {})['dm_policy'] = '$dm_val'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+print('  ✅ 飞书 DM 策略已设置为 $dm_val')
+"
+            eval "$(read_status)"
+            ;;
+        0) return ;;
+        *) echo "  ❌ 无效选择" ;;
+    esac
+}
+
+# ══════════════════════════════════════════════
 #  配置 AI 模型 — 选择提供商
 # ══════════════════════════════════════════════
+# ══════════════════════════════════════════════
+#  OpenAI 专用配置 (API Key / ChatGPT 账号登录)
+# ══════════════════════════════════════════════
+configure_openai() {
+    echo ""
+    echo "  ═══ 配置 OpenAI ═══"
+    echo ""
+
+    # 检查当前认证模式
+    local current_mode
+    current_mode=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+if p.exists():
+    cfg = json.loads(p.read_text())
+    print(cfg.get('models', {}).get('openai', {}).get('auth_mode', 'api_key'))
+else:
+    print('api_key')
+" 2>/dev/null)
+
+    if [ "$current_mode" = "oauth" ]; then
+        echo "  当前模式: 🔑 ChatGPT 账号登录 (OAuth)"
+        "$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+oc = cfg.get('models', {}).get('openai', {})
+aid = oc.get('oauth_account_id', '')
+exp = oc.get('oauth_expires', 0)
+import time
+if exp > time.time():
+    print(f'  Account ID: {aid}')
+    print(f'  Token 有效期至: {time.strftime(\"%Y-%m-%d %H:%M\", time.localtime(exp))}')
+else:
+    print(f'  Account ID: {aid}')
+    print('  ⚠️  Token 已过期，需要重新登录')
+" 2>/dev/null
+    else
+        echo "  当前模式: 🔐 API Key"
+    fi
+
+    echo ""
+    echo "  请选择认证方式:"
+    echo "  ─────────────────────────────────────────────────"
+    echo "  1) API Key         — 使用 OpenAI API Key (需付费)"
+    echo "  2) ChatGPT 账号登录 — 使用 ChatGPT Plus/Pro 账号 (免费)"
+    echo "  0) 返回"
+    echo ""
+    read -p "  选择 [1/2/0]: " auth_choice
+
+    case $auth_choice in
+        1)
+            configure_provider "openai" "OpenAI"
+            # 确保 auth_mode 设为 api_key
+            "$PYTHON" << 'PYEOF'
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+cfg.setdefault('models', {}).setdefault('openai', {})['auth_mode'] = 'api_key'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+PYEOF
+            ;;
+        2)
+            # 检查是否已有有效 OAuth token
+            local need_login="yes"
+            local oauth_token
+            oauth_token=$("$PYTHON" -c "
+import json, pathlib, os, time
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+if p.exists():
+    cfg = json.loads(p.read_text())
+    oc = cfg.get('models', {}).get('openai', {})
+    token = oc.get('oauth_access', '')
+    exp = oc.get('oauth_expires', 0)
+    if token and exp > time.time():
+        print(token)
+" 2>/dev/null)
+
+            if [ -n "$oauth_token" ]; then
+                need_login="no"
+                echo ""
+                echo "  ✅ 已有有效的 ChatGPT 登录，无需重新登录"
+                echo ""
+                echo "  是否重新登录？[y/N]: "
+                read -p "  " relogin_choice
+                if [ "$relogin_choice" = "y" ] || [ "$relogin_choice" = "Y" ]; then
+                    need_login="yes"
+                fi
+            fi
+
+            if [ "$need_login" = "yes" ]; then
+                echo ""
+                echo "  将打开浏览器登录你的 ChatGPT 账号"
+                echo "  (需要 ChatGPT Plus / Pro / Team 订阅)"
+                echo ""
+                "$PYTHON" << 'PYEOF'
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath('whaleclaw')))
+from whaleclaw.utils.openai_oauth import login, save_oauth_to_config
+try:
+    result = login()
+    save_oauth_to_config(result)
+    print(f'\n  ✅ ChatGPT 账号已关联')
+    print(f'  Account ID: {result.account_id}')
+except KeyboardInterrupt:
+    print('\n  ❌ 已取消')
+except Exception as e:
+    print(f'\n  ❌ 登录失败: {e}')
+PYEOF
+                # 重新读取 token
+                oauth_token=$("$PYTHON" -c "
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+print(cfg.get('models', {}).get('openai', {}).get('oauth_access', '') or '')
+" 2>/dev/null)
+            fi
+
+            if [ -n "$oauth_token" ]; then
+                "$PYTHON" << 'PYEOF'
+import json, pathlib, os
+p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+cfg = json.loads(p.read_text())
+oc = cfg.setdefault('models', {}).setdefault('openai', {})
+oc['auth_mode'] = 'oauth'
+oc['base_url'] = 'https://chatgpt.com/backend-api/codex'
+p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+PYEOF
+                echo ""
+                echo "  现在配置要使用的模型:"
+                _provider_model_menu "openai" "OpenAI" "$oauth_token" "https://chatgpt.com/backend-api/codex"
+            fi
+            ;;
+        0) return ;;
+        *) echo "  ❌ 无效选择" ;;
+    esac
+}
+
 configure_model() {
     echo ""
     echo "  ═══ 配置 AI 模型 ═══"
@@ -663,7 +1231,7 @@ configure_model() {
     echo "  选择提供商:"
     echo "  ─────────────────────────────────────────────────"
     echo "  a) Anthropic  — Claude Sonnet 4 / Opus 4"
-    echo "  b) OpenAI     — GPT-4o / GPT-4.1 / o3 / o4-mini"
+    echo "  b) OpenAI     — GPT-5.2"
     echo "  c) DeepSeek   — deepseek-chat / deepseek-reasoner"
     echo "  d) 通义千问   — qwen-max / qwen-plus / qwq-plus"
     echo "  e) 智谱 GLM   — glm-5 / glm-4.7 / glm-4.7-flash"
@@ -676,7 +1244,7 @@ configure_model() {
 
     case $provider_choice in
         a) configure_provider "anthropic" "Anthropic" ;;
-        b) configure_provider "openai" "OpenAI" ;;
+        b) configure_openai ;;
         c) configure_provider "deepseek" "DeepSeek" ;;
         d) configure_provider "qwen" "通义千问" ;;
         e) configure_provider "zhipu" "智谱 GLM" ;;
@@ -694,7 +1262,7 @@ configure_model() {
 while true; do
     eval "$(read_status)"
     show_menu
-    read -p "  请输入选项 [0-6]: " choice
+    read -p "  请输入选项 [0-8]: " choice
 
     case $choice in
         1)
@@ -774,12 +1342,22 @@ print('  ✅ Token 认证已启用')
             read -p "  按回车键继续..."
             ;;
         4)
+            configure_summarizer
+            echo ""
+            read -p "  按回车键继续..."
+            ;;
+        5)
+            configure_feishu
+            echo ""
+            read -p "  按回车键继续..."
+            ;;
+        6)
             open -t "$CONFIG_FILE"
             echo "  📝 已用系统编辑器打开配置文件"
             echo ""
             read -p "  按回车键继续..."
             ;;
-        5)
+        7)
             echo ""
             "$PYTHON" -c "
 import asyncio
@@ -795,7 +1373,7 @@ asyncio.run(main())
             echo ""
             read -p "  按回车键继续..."
             ;;
-        6)
+        8)
             echo ""
             echo "  完整配置内容:"
             echo "  ─────────────────────────────────"

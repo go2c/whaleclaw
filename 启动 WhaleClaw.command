@@ -37,7 +37,7 @@ fi
 eval $("$PYTHON" -c "
 import json, pathlib
 p = pathlib.Path.home() / '.whaleclaw/whaleclaw.json'
-port, bind = 18789, '127.0.0.1'
+port, bind = 18666, '127.0.0.1'
 if p.exists():
     cfg = json.loads(p.read_text())
     gw = cfg.get('gateway', {})
@@ -46,6 +46,16 @@ if p.exists():
 print(f'PORT={port}')
 print(f'BIND={bind}')
 " 2>/dev/null)
+
+# 释放被占用的端口
+OLD_PID=$(lsof -ti :${PORT} 2>/dev/null)
+if [ -n "$OLD_PID" ]; then
+    echo ""
+    echo "  ⚠️  端口 ${PORT} 被占用 (PID: ${OLD_PID})，正在释放..."
+    kill -9 $OLD_PID 2>/dev/null
+    sleep 1
+    echo "  ✅ 端口已释放"
+fi
 
 echo ""
 echo "  🐋 WhaleClaw Gateway 正在启动..."

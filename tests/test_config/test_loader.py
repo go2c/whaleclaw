@@ -18,7 +18,7 @@ class TestDeepMerge:
         assert result == {"a": 1, "b": 3, "c": 4}
 
     def test_nested(self) -> None:
-        base: dict[str, object] = {"gateway": {"port": 18789, "bind": "127.0.0.1"}}
+        base: dict[str, object] = {"gateway": {"port": 18666, "bind": "127.0.0.1"}}
         result = _deep_merge(base, {"gateway": {"port": 9000}})
         assert result == {"gateway": {"port": 9000, "bind": "127.0.0.1"}}
 
@@ -35,7 +35,7 @@ class TestLoadConfig:
     def test_defaults(self) -> None:
         reset_config()
         cfg = load_config()
-        assert cfg.gateway.port == 18789
+        assert cfg.gateway.port == 18666
 
     def test_cli_overrides(self) -> None:
         reset_config()

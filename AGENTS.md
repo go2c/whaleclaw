@@ -340,7 +340,7 @@ whaleclaw
 ```bash
 # 使用项目内嵌 Python
 ./python/bin/python3.12 -m pip install -e ".[dev]"
-./python/bin/python3.12 -m whaleclaw gateway run --port 18789 --verbose
+./python/bin/python3.12 -m whaleclaw gateway run --port 18666 --verbose
 
 # 或通过 CLI 入口
 ./python/bin/python3.12 -m whaleclaw --help

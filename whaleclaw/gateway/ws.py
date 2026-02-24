@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from uuid import uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -28,6 +29,33 @@ from whaleclaw.tools.registry import ToolRegistry
 from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
+
+_active_connections: dict[str, WebSocket] = {}
+
+
+async def push_to_session(session_id: str, msg: WSMessage) -> bool:
+    """Push a message to a connected WebSocket by session ID.
+
+    Returns True if sent successfully, False if session not connected.
+    """
+    ws = _active_connections.get(session_id)
+    if ws is None:
+        return False
+    return await _safe_send(ws, msg)
+
+
+async def broadcast_all(msg: WSMessage) -> int:
+    """Broadcast a message to ALL active WebSocket connections (deduplicated)."""
+    sent = 0
+    seen: set[int] = set()
+    for ws in list(_active_connections.values()):
+        ws_id = id(ws)
+        if ws_id in seen:
+            continue
+        seen.add(ws_id)
+        if await _safe_send(ws, msg):
+            sent += 1
+    return sent
 
 
 async def _safe_send(ws: WebSocket, msg: WSMessage) -> bool:
@@ -64,13 +92,26 @@ async def websocket_handler(
     """Handle a single WebSocket connection lifecycle."""
     await websocket.accept()
 
+    conn_key = f"_conn:{uuid4().hex[:12]}"
+    _active_connections[conn_key] = websocket
+
     session: Session | None = None
-    chat_cmd = ChatCommand(session_manager)
     router = ModelRouter(config.models)
+    from whaleclaw.sessions.compressor import ContextCompressor
+
+    _store = session_manager._store  # noqa: SLF001
+    _compressor = ContextCompressor()
+    chat_cmd = ChatCommand(
+        session_manager,
+        config=config,
+        router=router,
+        compressor=_compressor,
+        session_store=_store,
+    )
     ws_alive = True
     inbox: asyncio.Queue[WSMessage] = asyncio.Queue()
 
-    log.info("ws.connected")
+    log.info("ws.connected", conn_key=conn_key)
 
     async def _reader() -> None:
         """Read WS messages and dispatch: ping handled inline, others queued."""
@@ -112,6 +153,7 @@ async def websocket_handler(
             session = await _resolve_session(
                 incoming.session_id, session, session_manager,
             )
+            _active_connections[session.id] = websocket
 
             content = incoming.payload.get("content", "")
             raw_images = incoming.payload.get("images", [])
@@ -184,6 +226,7 @@ async def websocket_handler(
                     on_tool_result=on_tool_result_cb,
                     images=images or None,
                     session_manager=session_manager,
+                    session_store=_store,
                 )
                 await session_manager.add_message(session, "assistant", reply)
                 await _safe_send(websocket, make_message(session.id, reply))
@@ -215,3 +258,7 @@ async def websocket_handler(
         ws_alive = False
         reader_task.cancel()
         processor_task.cancel()
+    finally:
+        _active_connections.pop(conn_key, None)
+        if session:
+            _active_connections.pop(session.id, None)

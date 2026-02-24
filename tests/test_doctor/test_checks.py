@@ -69,7 +69,7 @@ async def test_port_check_returns_result() -> None:
     """PortCheck returns a CheckResult."""
     from whaleclaw.doctor.checks import PortCheck
 
-    check = PortCheck(port=18789)
+    check = PortCheck(port=18666)
     result = await check.check()
     assert isinstance(result, CheckResult)
     assert result.name == "Gateway 端口"

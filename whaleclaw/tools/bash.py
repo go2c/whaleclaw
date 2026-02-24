@@ -22,6 +22,14 @@ _MAX_OUTPUT = 50_000
 _PROJECT_PYTHON_BIN = Path(__file__).resolve().parents[2] / "python" / "bin"
 
 
+def _strip_control_chars(text: str) -> str:
+    """Remove ASCII control characters except LF/TAB/CR."""
+    return "".join(
+        ch for ch in text
+        if ch in ("\n", "\t", "\r") or (ord(ch) >= 32 and ord(ch) != 127)
+    )
+
+
 class BashTool(Tool):
     """Execute a bash command and return stdout/stderr/exit_code."""
 
@@ -37,15 +45,16 @@ class BashTool(Tool):
                 ToolParameter(
                     name="timeout",
                     type="integer",
-                    description="Timeout in seconds (default 120).",
+                    description="Timeout in seconds (default 30, max 300).",
                     required=False,
                 ),
             ],
         )
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        command: str = kwargs.get("command", "")
-        timeout: int = int(kwargs.get("timeout", 120))
+        raw_command: str = kwargs.get("command", "")
+        command = _strip_control_chars(raw_command)
+        timeout: int = int(kwargs.get("timeout", 30))
 
         if not command.strip():
             return ToolResult(success=False, output="", error="命令为空")

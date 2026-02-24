@@ -109,7 +109,7 @@ LOGS_DIR = WHALECLAW_HOME / "logs"
 
 ```python
 class GatewayConfig(BaseModel):
-    port: int = 18789
+    port: int = 18666
     bind: str = "127.0.0.1"
     verbose: bool = False
 
@@ -365,7 +365,7 @@ app = typer.Typer(name="whaleclaw", help="WhaleClaw — Personal AI Assistant")
 ```python
 @app.command()
 def run(
-    port: int = typer.Option(18789, help="Gateway 端口"),
+    port: int = typer.Option(18666, help="Gateway 端口"),
     bind: str = typer.Option("127.0.0.1", help="绑定地址"),
     verbose: bool = typer.Option(False, help="详细日志"),
 ) -> None:
@@ -401,13 +401,13 @@ from whaleclaw.version import __version__
 
 ### AC-1: Gateway 启动
 ```bash
-./python/bin/python3.12 -m whaleclaw gateway run --port 18789 --verbose
-# 输出: Gateway 启动日志，监听 127.0.0.1:18789
+./python/bin/python3.12 -m whaleclaw gateway run --port 18666 --verbose
+# 输出: Gateway 启动日志，监听 127.0.0.1:18666
 ```
 
 ### AC-2: 健康检查
 ```bash
-curl http://127.0.0.1:18789/
+curl http://127.0.0.1:18666/
 # 返回: {"status": "ok", "version": "0.1.0"}
 ```
 
@@ -417,7 +417,7 @@ curl http://127.0.0.1:18789/
 import asyncio, websockets, json
 
 async def test():
-    async with websockets.connect("ws://127.0.0.1:18789/ws") as ws:
+    async with websockets.connect("ws://127.0.0.1:18666/ws") as ws:
         msg = {"type": "message", "payload": {"content": "你好"}}
         await ws.send(json.dumps(msg))
         # 应收到多条 stream 类型消息，最后一条 message 类型

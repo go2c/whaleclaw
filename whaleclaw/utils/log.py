@@ -4,8 +4,24 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Protocol
 
 import structlog
+
+
+class Logger(Protocol):
+    """Minimal logger protocol for basedpyright compatibility.
+
+    structlog.stdlib.BoundLogger methods return Any, which basedpyright
+    treats as Unknown.  This protocol gives callers a concrete type.
+    """
+
+    def debug(self, event: str | None = None, **kw: object) -> None: ...
+    def info(self, event: str | None = None, **kw: object) -> None: ...
+    def warning(self, event: str | None = None, **kw: object) -> None: ...
+    def error(self, event: str | None = None, **kw: object) -> None: ...
+    def critical(self, event: str | None = None, **kw: object) -> None: ...
+    def exception(self, event: str | None = None, **kw: object) -> None: ...
 
 
 def setup_logging(*, verbose: bool = False) -> None:
@@ -27,7 +43,7 @@ def setup_logging(*, verbose: bool = False) -> None:
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.TimeStamper(fmt="iso", utc=False),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
     ]
@@ -54,6 +70,6 @@ def setup_logging(*, verbose: bool = False) -> None:
         handler.setFormatter(formatter)
 
 
-def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
+def get_logger(name: str | None = None) -> Logger:
     """Return a bound structlog logger."""
-    return structlog.get_logger(name)  # type: ignore[return-value]
+    return structlog.stdlib.get_logger(name)  # type: ignore[return-value]
