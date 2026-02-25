@@ -97,5 +97,5 @@ WhaleClaw 不是对 OpenClaw 的否定，而是针对“长期运行成本与本
 }
 
 
-mac 一键包 链接：https://pan.quark.cn/s/901b031c8b47
-win 一键包 链接：https://pan.quark.cn/s/425bc7996fa4
+windos版 链接：https://pan.quark.cn/s/9f5bcd0d854e
+mac版 链接：https://pan.quark.cn/s/27b9b18c7125
