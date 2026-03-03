@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from whaleclaw.agent.loop import _parse_fallback_tool_calls, run_agent
+import whaleclaw.agent.loop as loop_mod
+from whaleclaw.agent.loop import _is_image_generation_request, _parse_fallback_tool_calls, run_agent
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.providers.base import AgentResponse, ToolCall
+from whaleclaw.sessions.manager import Session
+from whaleclaw.skills.parser import Skill, SkillParamGuard, SkillParamItem
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 from whaleclaw.tools.registry import ToolRegistry
 
@@ -215,6 +220,61 @@ class _BashProbeTool(Tool):
         if command:
             return ToolResult(success=True, output=f"ok:{command}")
         return ToolResult(success=False, output="", error="bad command")
+
+
+class _BashAlwaysFailTool(Tool):
+    """Dummy bash tool that always fails."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="bash",
+            description="Always fails.",
+            parameters=[ToolParameter(name="command", type="string", description="command")],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:  # noqa: ARG002
+        return ToolResult(success=False, output="", error="bash failed")
+
+
+class _PptEditNoopTool(Tool):
+    """Dummy ppt_edit tool used for tool-selection assertions."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="ppt_edit",
+            description="noop ppt edit.",
+            parameters=[
+                ToolParameter(name="path", type="string", description="path"),
+                ToolParameter(name="slide_index", type="integer", description="index"),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:  # noqa: ARG002
+        return ToolResult(success=True, output="ok")
+
+
+class _PptEditBusinessNoHitTool(Tool):
+    """Dummy ppt_edit business style tool that reports zero hit."""
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="ppt_edit",
+            description="business no hit",
+            parameters=[
+                ToolParameter(name="path", type="string", description="path"),
+                ToolParameter(name="slide_index", type="integer", description="index"),
+                ToolParameter(name="action", type="string", description="action"),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:  # noqa: ARG002
+        return ToolResult(
+            success=True,
+            output="已应用 /tmp/a.pptx 第 1 页商务风格，重设深色条 0 处",
+        )
 
 
 class _NameMemoryManager:
@@ -508,6 +568,13 @@ async def test_run_agent_retries_when_tool_args_invalid_then_succeeds() -> None:
     assert call_count == 3
 
 
+def test_is_image_generation_request_matches_expected_queries() -> None:
+    assert _is_image_generation_request("请帮我文生图，主题是赛博朋克街景") is True
+    assert _is_image_generation_request("这张图做图生图，风格改成宫崎骏") is True
+    assert _is_image_generation_request("帮我改这个 ppt 第三页文案") is False
+    assert _is_image_generation_request("帮我测试一下 API key 是否可用") is False
+
+
 @pytest.mark.asyncio
 async def test_run_agent_circuit_breaker_blocks_repeated_browser_failures() -> None:
     browser_tool_response = AgentResponse(
@@ -558,6 +625,178 @@ async def test_run_agent_circuit_breaker_blocks_repeated_browser_failures() -> N
     assert result == "改用 bash 处理"
     assert call_count == 3
     assert any("browser 工具连续失败，已自动熔断" in p for p in prompts_seen)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_circuit_breaker_blocks_repeated_bash_failures() -> None:
+    bash_tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_bash",
+                name="bash",
+                arguments={"command": "python3 /tmp/a.py"},
+            )
+        ],
+    )
+    final_response = AgentResponse(
+        content="改用 ppt_edit 处理",
+        model="test-model",
+    )
+
+    call_count = 0
+    prompts_seen: list[str] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        prompts_seen.append("\n".join(m.content for m in messages if hasattr(m, "content")))
+        if call_count <= 3:
+            return bash_tool_response
+        return final_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BashAlwaysFailTool())
+
+    result = await run_agent(
+        message="给第二页配图",
+        session_id="test-bash-circuit",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "改用 ppt_edit 处理"
+    assert call_count == 4
+    assert any("同一 bash 命令模板已连续失败 3 次" in p for p in prompts_seen)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_includes_ppt_edit_for_followup_office_message() -> None:
+    captured_tool_names: list[str] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],  # noqa: ARG001
+        *,
+        tools: Any = None,
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        if isinstance(tools, list):
+            for t in tools:
+                if hasattr(t, "name"):
+                    name = str(getattr(t, "name", "")).strip()
+                    if name:
+                        captured_tool_names.append(name)
+                    continue
+                if isinstance(t, dict):
+                    name = str(t.get("name", "")).strip()
+                    if not name and isinstance(t.get("function"), dict):
+                        name = str(t["function"].get("name", "")).strip()
+                    if name:
+                        captured_tool_names.append(name)
+        return AgentResponse(content="收到", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BashProbeTool())
+    registry.register(_PptEditNoopTool())
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-followup-office",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="anthropic/claude-sonnet-4-20250514",
+        created_at=now,
+        updated_at=now,
+        metadata={"last_pptx_path": "/tmp/贵州2日游.pptx"},
+    )
+
+    result = await run_agent(
+        message="第一页的黑色条不好看，换种格式",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert result == "收到"
+    assert "ppt_edit" in captured_tool_names
+
+
+@pytest.mark.asyncio
+async def test_run_agent_requires_dark_bar_target_hit_for_ppt_edit() -> None:
+    first = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_ppt",
+                name="ppt_edit",
+                arguments={
+                    "path": "/tmp/a.pptx",
+                    "slide_index": 1,
+                    "action": "apply_business_style",
+                },
+            )
+        ],
+    )
+    second = AgentResponse(content="继续处理", model="test-model")
+    call_count = 0
+    prompts_seen: list[str] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        prompts_seen.append("\n".join(m.content for m in messages if hasattr(m, "content")))
+        if call_count == 1:
+            return first
+        return second
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_PptEditBusinessNoHitTool())
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-dark-bar",
+        channel="feishu",
+        peer_id="u1",
+        messages=[],
+        model="anthropic/claude-sonnet-4-20250514",
+        created_at=now,
+        updated_at=now,
+        metadata={"last_pptx_path": "/tmp/a.pptx"},
+    )
+
+    result = await run_agent(
+        message="第一页封面的黑色横条不好看，换一种方式",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+
+    assert result == "继续处理"
+    assert any("未命中用户指定对象：黑色横条仍未被替换" in p for p in prompts_seen)
 
 
 @pytest.mark.asyncio
@@ -1102,3 +1341,429 @@ async def test_run_agent_keeps_short_external_memory_without_compress() -> None:
     )
     assert "压缩后经验" not in ext_msg.content
     assert "原始经验文本" in ext_msg.content
+
+
+@pytest.mark.asyncio
+async def test_run_agent_skill_lock_requires_explicit_done_confirmation() -> None:
+    call_count = 0
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],  # noqa: ARG001
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return AgentResponse(
+                content="",
+                model="test-model",
+                tool_calls=[ToolCall(id="tc_bash", name="bash", arguments={"command": "echo ok"})],
+            )
+        return AgentResponse(content="已出图", model="test-model")
+
+    registry = ToolRegistry()
+    registry.register(_BashProbeTool())
+    router = _make_router(chat_fn=fake_chat)
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-1",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={},
+    )
+
+    first = await run_agent(
+        message="/use nano-banana-image-t8 一只熊猫在上海街头跳舞",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+        session=session,
+    )
+    assert "已出图" in first
+    assert "任务完成" in first
+    assert session.metadata.get("locked_skill_ids") == ["nano-banana-image-t8"]
+    assert session.metadata.get("skill_lock_waiting_done") is True
+    assert call_count == 2
+
+    router2 = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    second = await run_agent(
+        message="任务完成",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router2,
+        registry=registry,
+        session=session,
+    )
+    assert second == "已确认任务完成，已解除本轮技能锁定。"
+    assert "locked_skill_ids" not in session.metadata
+    assert "skill_lock_waiting_done" not in session.metadata
+    router2.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_applies_locked_skill_set_to_system_prompt() -> None:
+    seen_messages: list[Any] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        seen_messages.extend(messages)
+        return AgentResponse(content="继续处理", model="test-model")
+
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-2",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={"locked_skill_ids": ["skill-a", "skill-b"]},
+    )
+    router = _make_router(chat_fn=fake_chat)
+    await run_agent(
+        message="继续改一下",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    joined = "\n".join(
+        str(m.content) for m in seen_messages if getattr(m, "role", "") == "system"
+    )
+    assert "当前会话已锁定技能：skill-a, skill-b" in joined
+
+
+@pytest.mark.asyncio
+async def test_run_agent_auto_locks_when_user_explicitly_mentions_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana", "文生图"],
+        instructions="x",
+        lock_session=True,
+        source_path=Path("/tmp/SKILL.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    router = _make_router(response=AgentResponse(content="收到", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-3",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={},
+    )
+    result = await run_agent(
+        message="使用nanobanana的技能，文生图",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "nano-banana-image-t8" in result
+    assert "技能" in result
+    assert "收到" in result
+    assert session.metadata.get("locked_skill_ids") == ["nano-banana-image-t8"]
+    assert session.metadata.get("skill_lock_waiting_done") is False
+
+
+@pytest.mark.asyncio
+async def test_run_agent_auto_locks_even_for_one_shot_skill_in_task_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = Skill(
+        id="ppt-generator",
+        name="PPT Generator",
+        triggers=["ppt"],
+        instructions="x",
+        lock_session=False,
+        source_path=Path("/tmp/SKILL2.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+
+    router = _make_router(response=AgentResponse(content="收到", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-4",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={},
+    )
+
+    result = await run_agent(
+        message="使用ppt-generator技能，帮我制作个PPT",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "ppt-generator" in result
+    assert "技能" in result
+    assert "收到" in result
+    assert session.metadata.get("locked_skill_ids") == ["ppt-generator"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_rejects_skill_switch_without_user_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_a = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        source_path=Path("/tmp/a.md"),
+    )
+    skill_b = Skill(
+        id="ppt-generator",
+        name="PPT Generator",
+        triggers=["ppt"],
+        instructions="x",
+        lock_session=False,
+        source_path=Path("/tmp/b.md"),
+    )
+
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill_b] if "ppt" in user_message.lower() else [skill_a],  # noqa: ARG005,E501
+    )
+
+    router = _make_router(response=AgentResponse(content="收到", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-5",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={"locked_skill_ids": ["nano-banana-image-t8"]},
+    )
+
+    result = await run_agent(
+        message="我在想是不是该用ppt-generator技能做个PPT",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "同意切换技能" in result
+    assert session.metadata.get("locked_skill_ids") == ["nano-banana-image-t8"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_allows_skill_switch_with_user_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_a = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        source_path=Path("/tmp/a2.md"),
+    )
+    skill_b = Skill(
+        id="ppt-generator",
+        name="PPT Generator",
+        triggers=["ppt"],
+        instructions="x",
+        lock_session=False,
+        source_path=Path("/tmp/b2.md"),
+    )
+
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill_b] if "ppt" in user_message.lower() else [skill_a],  # noqa: ARG005,E501
+    )
+
+    router = _make_router(response=AgentResponse(content="收到", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-6",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={"locked_skill_ids": ["nano-banana-image-t8"]},
+    )
+
+    result = await run_agent(
+        message="同意切换技能，改用ppt-generator技能做个PPT",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "切换" in result
+    assert "ppt-generator" in result
+    assert "收到" in result
+    assert session.metadata.get("locked_skill_ids") == ["ppt-generator"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_allows_skill_switch_by_direct_switch_phrase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_a = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        source_path=Path("/tmp/a3.md"),
+    )
+    skill_b = Skill(
+        id="ppt-generator",
+        name="PPT Generator",
+        triggers=["ppt"],
+        instructions="x",
+        lock_session=False,
+        source_path=Path("/tmp/b3.md"),
+    )
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill_b] if "ppt" in user_message.lower() else [skill_a],  # noqa: ARG005,E501
+    )
+
+    router = _make_router(response=AgentResponse(content="收到", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-skill-lock-7",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={"locked_skill_ids": ["nano-banana-image-t8"]},
+    )
+
+    result = await run_agent(
+        message="换成ppt-generator技能做个PPT",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "切换" in result
+    assert "ppt-generator" in result
+    assert "收到" in result
+    assert session.metadata.get("locked_skill_ids") == ["ppt-generator"]
+
+
+@pytest.mark.asyncio
+async def test_nano_banana_guard_lists_missing_params_before_execution() -> None:
+    skill = Skill(
+        id="nano-banana-image-t8",
+        name="Nano Banana 生图联调",
+        triggers=["nanobanana"],
+        instructions="x",
+        lock_session=True,
+        param_guard=SkillParamGuard(
+            enabled=True,
+            params=[
+                SkillParamItem(
+                    key="api_key",
+                    label="API Key",
+                    type="api_key",
+                    required=True,
+                    prompt="请提供 API Key",
+                ),
+                SkillParamItem(
+                    key="prompt",
+                    label="提示词",
+                    type="text",
+                    required=True,
+                    aliases=["提示词", "prompt"],
+                    prompt="请提供提示词",
+                ),
+                SkillParamItem(
+                    key="ratio",
+                    label="尺寸/比例",
+                    type="ratio",
+                    required=False,
+                    aliases=["比例", "尺寸", "size"],
+                    prompt="可选填写比例或尺寸",
+                ),
+            ],
+        ),
+        source_path=Path("/tmp/nano_guard.md"),
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        loop_mod._assembler,  # noqa: SLF001
+        "route_skills",
+        lambda user_message, forced_skill_ids=None: [skill],  # noqa: ARG005
+    )
+    router = _make_router(response=AgentResponse(content="不应调用", model="test-model"))
+    now = datetime.now(UTC)
+    session = Session(
+        id="s-nano-guard-1",
+        channel="webchat",
+        peer_id="u1",
+        messages=[],
+        model="openai/gpt-5.2",
+        created_at=now,
+        updated_at=now,
+        metadata={"locked_skill_ids": ["nano-banana-image-t8"]},
+    )
+
+    result = await run_agent(
+        message="使用nano banana制作文生图",
+        session_id=session.id,
+        config=WhaleclawConfig(),
+        router=router,
+        session=session,
+    )
+
+    assert "API Key" in result
+    assert "提示词" in result
+    assert "尺寸/比例" in result
+    router.chat.assert_not_called()
+    monkeypatch.undo()

@@ -57,20 +57,20 @@ class ToolRegistry:
             )
         return schemas
 
-    def to_prompt_fallback(self) -> str:
+    def to_prompt_fallback(self, include_names: set[str] | None = None) -> str:
         """Generate a text description for providers without native tools support."""
         if not self._tools:
             return ""
         lines: list[str] = []
         for tool in self._tools.values():
             defn = tool.definition
+            if include_names is not None and defn.name not in include_names:
+                continue
             params_parts: list[str] = []
             for p in defn.parameters:
                 req = "" if p.required else ", optional"
                 enum_hint = f", enum={p.enum}" if p.enum else ""
-                params_parts.append(
-                    f"    - {p.name} ({p.type}{req}{enum_hint}): {p.description}"
-                )
+                params_parts.append(f"    - {p.name} ({p.type}{req}{enum_hint}): {p.description}")
             lines.append(f"### {defn.name}\n{defn.description}")
             if params_parts:
                 lines.append("参数:\n" + "\n".join(params_parts))

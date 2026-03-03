@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -12,6 +13,8 @@ from whaleclaw.utils.log import get_logger
 log = get_logger(__name__)
 
 _BASE = "https://open.feishu.cn/open-apis"
+_HTTP_RETRY_ATTEMPTS = 3
+_HTTP_RETRY_BACKOFF_SECONDS = 0.4
 
 
 class FeishuClient:
@@ -24,15 +27,46 @@ class FeishuClient:
         self._tenant_access_token: str | None = None
         self._token_expires_at: float = 0
 
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        last_exc: Exception | None = None
+        for attempt in range(1, _HTTP_RETRY_ATTEMPTS + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    resp = await client.request(method, url, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                log.warning(
+                    "feishu.http_retry",
+                    method=method,
+                    url=url,
+                    attempt=attempt,
+                    max_attempts=_HTTP_RETRY_ATTEMPTS,
+                    error=repr(exc),
+                )
+                if attempt < _HTTP_RETRY_ATTEMPTS:
+                    await asyncio.sleep(_HTTP_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                    continue
+                break
+
+        msg = f"飞书接口请求失败: {method} {url}"
+        raise RuntimeError(msg) from last_exc
+
     async def _ensure_token(self) -> str:
         if self._tenant_access_token and time.time() < self._token_expires_at:
             return self._tenant_access_token
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{_BASE}/auth/v3/tenant_access_token/internal",
-                json={"app_id": self._app_id, "app_secret": self._app_secret},
-            )
-            data = resp.json()
+        resp = await self._request_with_retry(
+            "POST",
+            f"{_BASE}/auth/v3/tenant_access_token/internal",
+            json={"app_id": self._app_id, "app_secret": self._app_secret},
+        )
+        data = resp.json()
         if data.get("code") != 0:
             msg = f"获取 tenant_access_token 失败: {data}"
             raise RuntimeError(msg)
@@ -49,8 +83,12 @@ class FeishuClient:
             "Authorization": f"Bearer {token}",
             **(kwargs.pop("headers", None) or {}),
         }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.request(method, f"{_BASE}{path}", headers=headers, **kwargs)
+        resp = await self._request_with_retry(
+            method,
+            f"{_BASE}{path}",
+            headers=headers,
+            **kwargs,
+        )
         data: dict[str, Any] = resp.json()
         if data.get("code", 0) != 0:
             log.warning("feishu.api_error", path=path, code=data.get("code"), msg=data.get("msg"))
@@ -98,13 +136,13 @@ class FeishuClient:
         self, image: bytes, image_type: str = "message"
     ) -> str:
         token = await self._ensure_token()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{_BASE}/im/v1/images",
-                headers={"Authorization": f"Bearer {token}"},
-                data={"image_type": image_type},
-                files={"image": ("image.png", image, "image/png")},
-            )
+        resp = await self._request_with_retry(
+            "POST",
+            f"{_BASE}/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": image_type},
+            files={"image": ("image.png", image, "image/png")},
+        )
         data = resp.json()
         return data.get("data", {}).get("image_key", "")
 
@@ -112,13 +150,13 @@ class FeishuClient:
         self, file: bytes, filename: str, file_type: str
     ) -> str:
         token = await self._ensure_token()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{_BASE}/im/v1/files",
-                headers={"Authorization": f"Bearer {token}"},
-                data={"file_type": file_type, "file_name": filename},
-                files={"file": (filename, file, "application/octet-stream")},
-            )
+        resp = await self._request_with_retry(
+            "POST",
+            f"{_BASE}/im/v1/files",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_type": file_type, "file_name": filename},
+            files={"file": (filename, file, "application/octet-stream")},
+        )
         data = resp.json()
         return data.get("data", {}).get("file_key", "")
 
@@ -126,12 +164,12 @@ class FeishuClient:
         self, message_id: str, file_key: str, *, resource_type: str = "file"
     ) -> bytes:
         token = await self._ensure_token()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.get(
-                f"{_BASE}/im/v1/messages/{message_id}/resources/{file_key}",
-                headers={"Authorization": f"Bearer {token}"},
-                params={"type": resource_type},
-            )
+        resp = await self._request_with_retry(
+            "GET",
+            f"{_BASE}/im/v1/messages/{message_id}/resources/{file_key}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"type": resource_type},
+        )
         return resp.content
 
     # ── User API ────────────────────────────────────────────

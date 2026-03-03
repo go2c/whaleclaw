@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from whaleclaw.tools import bash as bash_mod
 from whaleclaw.tools.bash import BashTool
 
 
@@ -59,3 +62,16 @@ async def test_only_control_chars_becomes_empty(tool: BashTool) -> None:
     result = await tool.execute(command="\x10\x18\x00")
     assert not result.success
     assert result.error == "命令为空"
+
+
+def test_prefer_project_python_rewrites_bare_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_python = tmp_path / "python3.12"
+    fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(bash_mod, "_PROJECT_PYTHON", fake_python)
+
+    rewritten = bash_mod._prefer_project_python("python3 /tmp/a.py && python -V")
+    expected = f"{fake_python} /tmp/a.py && {fake_python} -V"
+    assert rewritten == expected

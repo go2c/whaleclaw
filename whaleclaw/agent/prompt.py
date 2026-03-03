@@ -17,6 +17,7 @@ from enum import StrEnum
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.providers.base import CacheControl, Message
 from whaleclaw.skills.manager import SkillManager
+from whaleclaw.skills.parser import Skill
 
 
 class PromptLayer(StrEnum):
@@ -39,9 +40,16 @@ _STATIC_PROMPT_TEMPLATE = """\
 - 下载或生成的图片用 markdown 显示：![描述](文件绝对路径)
 - 生成的其他文件告诉用户绝对路径
 - **严禁编造文件路径**：只使用工具返回的真实路径，绝不自己猜测或虚构文件名
-- 运行 Python 脚本时使用 python3 命令（不要用 python3 -c，脚本长度会被截断）
+- 运行 Python 脚本时优先使用 ./python/bin/python3.12
+  （不要用 python -c 或 python3 -c，脚本长度会被截断）
 - 需要生成文件（PPT/Excel/PDF等）时：先用 file_write 写 .py 脚本到 /tmp/，再用 bash 执行
+- 修改已有 Office 文件时先判断复杂度：纯文本改动优先局部编辑（ppt_edit/docx_edit/xlsx_edit）；
+  若用户要求插图/音视频/版式重排/风格升级，先做简短执行规划，
+  再组合 browser、bash、file_write 与编辑工具完成
+- 除非用户明确要求重做，否则不要整份重建
 - 如果你的技能不够好，可以用 skill(action="search", query="关键词") 搜索 GitHub 上更好的技能并安装
+- 用户明确点名某个技能（skill id/技能名）时，必须优先按该技能说明执行；
+  不要绕过技能直接用通用 bash/python 方案
 - **禁止自我否定已完成的工作**：如果你之前已经成功调用工具生成了文件，
   不要说"我之前没有真正执行"或"我一直在空谈"。工具调用成功就是成功，直接告诉用户文件路径即可
 - 用户说"改一下"时，只修改用户指出的问题，不要推翻重做整个任务"""
@@ -93,6 +101,8 @@ class PromptAssembler:
         token_budget: int | None = None,
         tool_fallback_text: str = "",
         assistant_name: str = _DEFAULT_ASSISTANT_NAME,
+        forced_skill_id: str | None = None,
+        forced_skill_ids: list[str] | None = None,
     ) -> list[Message]:
         """Assemble system prompt messages.
 
@@ -105,7 +115,12 @@ class PromptAssembler:
         """
         parts: list[str] = [self._build_static(config, assistant_name)]
 
-        dynamic = self._build_dynamic(user_message, _DYNAMIC_BUDGET)
+        dynamic = self._build_dynamic(
+            user_message,
+            _DYNAMIC_BUDGET,
+            forced_skill_id,
+            forced_skill_ids,
+        )
         if dynamic:
             parts.append(dynamic)
 
@@ -120,9 +135,7 @@ class PromptAssembler:
             ),
         ]
         if len(parts) > 1:
-            messages.append(
-                Message(role="system", content="\n\n".join(parts[1:]))
-            )
+            messages.append(Message(role="system", content="\n\n".join(parts[1:])))
 
         return messages
 
@@ -131,12 +144,45 @@ class PromptAssembler:
         safe_name = assistant_name.strip() or _DEFAULT_ASSISTANT_NAME
         return _STATIC_PROMPT_TEMPLATE.format(assistant_name=safe_name)
 
-    def _build_dynamic(self, user_message: str, budget: int) -> str:
+    def _build_dynamic(
+        self,
+        user_message: str,
+        budget: int,
+        forced_skill_id: str | None = None,
+        forced_skill_ids: list[str] | None = None,
+    ) -> str:
         """Dynamic layer — skills routed by user message keywords."""
-        skills = self._skill_manager.get_routed_skills(user_message)
+        skills = self._skill_manager.get_routed_skills(
+            user_message,
+            forced_skill_id=forced_skill_id,
+            forced_skill_ids=forced_skill_ids,
+        )
         if not skills:
             return ""
         return self._skill_manager.format_for_prompt(skills, budget)
+
+    def route_skill_ids(
+        self,
+        user_message: str,
+        *,
+        forced_skill_ids: list[str] | None = None,
+    ) -> list[str]:
+        skills = self._skill_manager.get_routed_skills(
+            user_message,
+            forced_skill_ids=forced_skill_ids,
+        )
+        return [s.id for s in skills]
+
+    def route_skills(
+        self,
+        user_message: str,
+        *,
+        forced_skill_ids: list[str] | None = None,
+    ) -> list[Skill]:
+        return self._skill_manager.get_routed_skills(
+            user_message,
+            forced_skill_ids=forced_skill_ids,
+        )
 
     def estimate_tokens(self, text: str) -> int:
         """Quick token estimate: ~1.5 chars/token for CJK, ~4 chars/token for Latin."""

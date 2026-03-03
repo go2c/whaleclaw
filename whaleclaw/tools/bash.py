@@ -20,6 +20,8 @@ _DANGEROUS_PATTERNS = [
 _MAX_OUTPUT = 50_000
 
 _PROJECT_PYTHON_BIN = Path(__file__).resolve().parents[2] / "python" / "bin"
+_PROJECT_PYTHON = _PROJECT_PYTHON_BIN / "python3.12"
+_PYTHON_CMD_RE = re.compile(r"(?<![\w./-])(python3|python)(?=\s|$)")
 
 
 def _strip_control_chars(text: str) -> str:
@@ -28,6 +30,13 @@ def _strip_control_chars(text: str) -> str:
         ch for ch in text
         if ch in ("\n", "\t", "\r") or (ord(ch) >= 32 and ord(ch) != 127)
     )
+
+
+def _prefer_project_python(command: str) -> str:
+    """Rewrite bare python/python3 to project-embedded python when available."""
+    if not _PROJECT_PYTHON.is_file():
+        return command
+    return _PYTHON_CMD_RE.sub(str(_PROJECT_PYTHON), command)
 
 
 class BashTool(Tool):
@@ -53,7 +62,7 @@ class BashTool(Tool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         raw_command: str = kwargs.get("command", "")
-        command = _strip_control_chars(raw_command)
+        command = _prefer_project_python(_strip_control_chars(raw_command))
         timeout: int = int(kwargs.get("timeout", 30))
 
         if not command.strip():

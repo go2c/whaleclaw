@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from whaleclaw.config.loader import _deep_merge, _env_overrides, load_config, reset_config
+from whaleclaw.config.loader import (
+    _deep_merge,
+    _env_overrides,
+    load_config,
+    reset_config,
+    set_default_agent_model,
+)
 from whaleclaw.types import ConfigError
 
 
@@ -61,3 +67,28 @@ class TestLoadConfig:
         reset_config()
         cfg = load_config()
         assert cfg.gateway.port == 7777
+
+
+class TestSetDefaultAgentModel:
+    def test_create_and_write(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "whaleclaw.json"
+        set_default_agent_model("openai/gpt-5.2", config_path=cfg_file)
+        data = json.loads(cfg_file.read_text(encoding="utf-8"))
+        assert data["agent"]["model"] == "openai/gpt-5.2"
+
+    def test_update_existing_agent_model(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "whaleclaw.json"
+        cfg_file.write_text(
+            json.dumps({"agent": {"model": "qwen/qwen3-plus"}, "gateway": {"port": 18666}}),
+            encoding="utf-8",
+        )
+        set_default_agent_model("zhipu/glm-5", config_path=cfg_file)
+        data = json.loads(cfg_file.read_text(encoding="utf-8"))
+        assert data["agent"]["model"] == "zhipu/glm-5"
+        assert data["gateway"]["port"] == 18666
+
+    def test_reject_non_object_agent(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "whaleclaw.json"
+        cfg_file.write_text(json.dumps({"agent": "bad"}), encoding="utf-8")
+        with pytest.raises(ConfigError, match="agent 必须是对象"):
+            set_default_agent_model("openai/gpt-5.2", config_path=cfg_file)

@@ -20,7 +20,7 @@ class A2AClient:
     def _build_envelope(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Build GEP-A2A envelope with required fields."""
         return {
-            "protocol": "GEP-A2A",
+            "protocol": "gep-a2a",
             "protocol_version": "1.0.0",
             "message_type": message_type,
             "message_id": str(uuid.uuid4()),

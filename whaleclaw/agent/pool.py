@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
+from whaleclaw.config.paths import WORKSPACE_DIR
+
 
 class AgentInstance(BaseModel):
     """Single agent instance with workspace and config."""
@@ -28,7 +30,7 @@ class AgentPool:
         tools: list[str] | None = None,
     ) -> AgentInstance:
         if agent_id not in self._instances:
-            ws = workspace or "~/.whaleclaw/workspace"
+            ws = workspace or str(WORKSPACE_DIR)
             self._instances[agent_id] = AgentInstance(
                 id=agent_id,
                 workspace=ws,

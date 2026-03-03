@@ -6,11 +6,13 @@ import json
 import secrets
 from pathlib import Path
 
+from whaleclaw.config.paths import EVOMAP_DIR
+
 
 class EvoMapIdentity:
     """Manage WhaleClaw node identity in EvoMap network."""
 
-    IDENTITY_PATH = Path("~/.whaleclaw/evomap/identity.json").expanduser()
+    IDENTITY_PATH = EVOMAP_DIR / "identity.json"
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or self.IDENTITY_PATH

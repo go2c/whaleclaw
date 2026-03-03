@@ -81,6 +81,10 @@ createApp({
     const memoryStyleEnabled = ref(true);
     const memoryStyleLoading = ref(false);
     const memoryStyleSaving = ref(false);
+    const memoryStyleLastRefresh = ref('');
+    const memoryStyleRefreshNote = ref('');
+    const evomapEnabled = ref(false);
+    const evomapLoading = ref(false);
 
     const currentModel = ref('');
     const thinkingLevel = ref('off');
@@ -92,10 +96,36 @@ createApp({
     const activeTab = ref('chat');
     const skills = ref([]);
     const tools = ref([]);
+    const skillSourceTab = ref('local');
     const skillInstallSource = ref('');
     const skillInstalling = ref(false);
     const skillDetail = ref(null);
+    const pendingUninstallSkillId = ref('');
+    const clawhubDetail = ref(null);
     const toolDetail = ref(null);
+    const clawhubConfigLoading = ref(false);
+    const clawhubConfigSaving = ref(false);
+    const clawhubCliInstalling = ref(false);
+    const clawhubLoggingIn = ref(false);
+    const clawhubLoggingOut = ref(false);
+    const clawhubAuthLoading = ref(false);
+    const clawhubLoggedIn = ref(false);
+    const clawhubAuthMessage = ref('');
+    const clawhubEnabled = ref(false);
+    const clawhubRegistryUrl = ref('https://clawhub.ai');
+    const clawhubCliAvailable = ref(false);
+    const clawhubQuery = ref('');
+    const clawhubSearching = ref(false);
+    const clawhubResults = ref([]);
+    const clawhubSearched = ref(false);
+    const clawhubPage = ref(1);
+    const clawhubPageSize = 8;
+    const clawhubInstalling = ref({});
+    const clawhubPublishing = ref({});
+    const publishDialog = ref(null);
+    const publishSlugInput = ref('');
+    const publishVersionInput = ref('0.1.0');
+    const uiAlertMessage = ref('');
 
     const activeSession = computed(() =>
       sessions.value.find((s) => s.id === activeSessionId.value)
@@ -146,6 +176,14 @@ createApp({
         throw new Error(data.error || data.detail || `请求失败 (${res.status})`);
       }
       return data;
+    }
+
+    function showUiAlert(message) {
+      uiAlertMessage.value = String(message || '操作失败');
+    }
+
+    function closeUiAlert() {
+      uiAlertMessage.value = '';
     }
 
     /* ── Auth ── */
@@ -252,6 +290,249 @@ createApp({
       } catch { /* ignore */ }
     }
 
+    async function loadClawhubConfig() {
+      clawhubConfigLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/clawhub');
+        clawhubEnabled.value = data.enabled === true;
+        clawhubRegistryUrl.value = data.registry_url || 'https://clawhub.ai';
+        clawhubCliAvailable.value = data.cli_available === true;
+        await loadClawhubAuthStatus();
+      } catch { /* ignore */ }
+      finally {
+        clawhubConfigLoading.value = false;
+      }
+    }
+
+    async function installClawhubCli() {
+      clawhubCliInstalling.value = true;
+      try {
+        await apiFetch('/api/clawhub/install-cli', { method: 'POST' });
+        await loadClawhubConfig();
+      } catch (e) {
+        showUiAlert('安装 CLI 失败: ' + (e.message || e));
+      } finally {
+        clawhubCliInstalling.value = false;
+      }
+    }
+
+    async function saveClawhubConfig() {
+      clawhubConfigSaving.value = true;
+      try {
+        const body = {
+          enabled: clawhubEnabled.value === true,
+          registry_url: clawhubRegistryUrl.value.trim() || 'https://clawhub.ai',
+        };
+        const data = await apiFetch('/api/plugins/clawhub', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        clawhubEnabled.value = data.enabled === true;
+        clawhubRegistryUrl.value = data.registry_url || clawhubRegistryUrl.value;
+        clawhubCliAvailable.value = data.cli_available === true;
+        await loadClawhubAuthStatus();
+      } catch (e) {
+        showUiAlert('ClawHub 配置保存失败: ' + (e.message || e));
+      } finally {
+        clawhubConfigSaving.value = false;
+      }
+    }
+
+    async function onClawhubEnabledChange(checked) {
+      clawhubEnabled.value = checked === true;
+      await saveClawhubConfig();
+    }
+
+    async function onClawhubRegistryBlur() {
+      await saveClawhubConfig();
+    }
+
+    async function loadClawhubAuthStatus() {
+      clawhubAuthLoading.value = true;
+      try {
+        const data = await apiFetch('/api/clawhub/auth-status');
+        clawhubLoggedIn.value = data.logged_in === true;
+        clawhubAuthMessage.value = data.message || '';
+      } catch {
+        clawhubLoggedIn.value = false;
+        clawhubAuthMessage.value = '';
+      } finally {
+        clawhubAuthLoading.value = false;
+      }
+    }
+
+    async function doClawhubLogin() {
+      if (!clawhubCliAvailable.value) {
+        showUiAlert('请先安装 CLI，再登录');
+        return;
+      }
+      clawhubLoggingIn.value = true;
+      try {
+        const data = await apiFetch('/api/clawhub/login', { method: 'POST' });
+        if (!data.ok) {
+          showUiAlert(data.message || '登录未完成');
+        }
+        await loadClawhubAuthStatus();
+      } catch (e) {
+        showUiAlert('登录失败: ' + (e.message || e));
+      } finally {
+        clawhubLoggingIn.value = false;
+      }
+    }
+
+    async function doClawhubRelogin() {
+      const raw = (clawhubRegistryUrl.value || 'https://clawhub.ai').trim();
+      const base = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+      const loginUrl = `${base.replace(/\/+$/, '')}/login`;
+      window.open(loginUrl, '_blank', 'noopener,noreferrer');
+      await loadClawhubAuthStatus();
+    }
+
+    async function doClawhubLogout() {
+      if (!clawhubCliAvailable.value) {
+        showUiAlert('请先安装 CLI');
+        return;
+      }
+      clawhubLoggingOut.value = true;
+      try {
+        const data = await apiFetch('/api/clawhub/logout', { method: 'POST' });
+        if (!data.ok) showUiAlert(data.message || '退出登录未完成');
+        await loadClawhubAuthStatus();
+      } catch (e) {
+        showUiAlert('退出登录失败: ' + (e.message || e));
+      } finally {
+        clawhubLoggingOut.value = false;
+      }
+    }
+
+    async function searchClawhub() {
+      const q = clawhubQuery.value.trim();
+      if (!q) return;
+      clawhubSearched.value = true;
+      clawhubSearching.value = true;
+      try {
+        const data = await apiFetch(`/api/clawhub/search?q=${encodeURIComponent(q)}&limit=24`);
+        clawhubResults.value = data.items || [];
+        clawhubPage.value = 1;
+      } catch (e) {
+        clawhubResults.value = [];
+        showUiAlert('执行失败，请重试');
+      } finally {
+        clawhubSearching.value = false;
+      }
+    }
+
+    async function installClawhubSkill(slug, version = '', repoUrl = '') {
+      if (!slug) return;
+      clawhubInstalling.value[slug] = true;
+      try {
+        await apiFetch('/api/clawhub/install', {
+          method: 'POST',
+          body: JSON.stringify({ slug, version, repo_url: repoUrl }),
+        });
+        await loadSkills();
+      } catch (e) {
+        showUiAlert('ClawHub 安装失败: ' + (e.message || e));
+      } finally {
+        clawhubInstalling.value[slug] = false;
+      }
+    }
+
+    function openPublishDialog(skillId) {
+      const sid = String(skillId || '').trim();
+      if (!sid) return;
+      publishDialog.value = { skillId: sid };
+      publishSlugInput.value = sid;
+      publishVersionInput.value = '0.1.0';
+    }
+
+    function closePublishDialog() {
+      publishDialog.value = null;
+      publishSlugInput.value = '';
+      publishVersionInput.value = '0.1.0';
+    }
+
+    async function publishInstalledSkill(skillId, publishSlug = '', publishVersion = '') {
+      const sid = String(skillId || '').trim();
+      if (!sid) return;
+      clawhubPublishing.value[sid] = true;
+      try {
+        await loadClawhubConfig();
+        await loadClawhubAuthStatus();
+        if (!clawhubEnabled.value) {
+          showUiAlert('请先在 ClawHub 标签启用 ClawHub');
+          return;
+        }
+        if (!clawhubCliAvailable.value) {
+          showUiAlert('请先安装 ClawHub CLI');
+          return;
+        }
+        if (!clawhubLoggedIn.value) {
+          showUiAlert('请先登录 ClawHub');
+          return;
+        }
+        await apiFetch('/api/clawhub/publish-installed', {
+          method: 'POST',
+          body: JSON.stringify({
+            skill_id: sid,
+            publish_slug: String(publishSlug || '').trim(),
+            publish_version: String(publishVersion || '').trim(),
+          }),
+        });
+        showUiAlert(`发布成功: ${sid}`);
+      } catch (e) {
+        showUiAlert('发布失败: ' + (e.message || e));
+      } finally {
+        clawhubPublishing.value[sid] = false;
+      }
+    }
+
+    async function confirmPublishDialog() {
+      if (!publishDialog.value || !publishDialog.value.skillId) return;
+      const skillId = publishDialog.value.skillId;
+      const slug = publishSlugInput.value.trim();
+      const version = publishVersionInput.value.trim();
+      if (!slug) {
+        showUiAlert('slug 不能为空');
+        return;
+      }
+      if (!version) {
+        showUiAlert('版本号不能为空（例如 0.1.0）');
+        return;
+      }
+      closePublishDialog();
+      await publishInstalledSkill(skillId, slug, version);
+    }
+
+    function openClawhubDetail(item) {
+      if (!item) return;
+      clawhubDetail.value = {
+        ...item,
+        detail_url: item.detail_url || `${(clawhubRegistryUrl.value || 'https://clawhub.ai').replace(/\/$/, '')}/skills/${item.slug}`,
+      };
+    }
+
+    const clawhubTotalPages = computed(() =>
+      Math.max(1, Math.ceil(clawhubResults.value.length / clawhubPageSize))
+    );
+
+    const pagedClawhubResults = computed(() => {
+      const page = Math.min(Math.max(1, clawhubPage.value), clawhubTotalPages.value);
+      const start = (page - 1) * clawhubPageSize;
+      return clawhubResults.value.slice(start, start + clawhubPageSize);
+    });
+
+    const clawhubPageButtons = computed(() => {
+      const total = clawhubTotalPages.value;
+      if (total <= 1) return [1];
+      const page = Math.min(Math.max(1, clawhubPage.value), total);
+      const start = Math.max(1, page - 2);
+      const end = Math.min(total, start + 4);
+      const btns = [];
+      for (let p = start; p <= end; p += 1) btns.push(p);
+      return btns;
+    });
+
     async function loadTools() {
       try {
         tools.value = await apiFetch('/api/tools');
@@ -259,21 +540,42 @@ createApp({
     }
 
     /* ── Global Memory Style ── */
-    async function loadMemoryStyle() {
+    function _formatClock(d) {
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    }
+
+    async function loadMemoryStyle(showFeedback = false) {
       memoryStyleLoading.value = true;
       try {
         const data = await apiFetch('/api/memory/style');
         memoryStyleEnabled.value = data.enabled !== false;
         memoryStyle.value = data.style_directive || '';
-      } catch { /* ignore */ }
+        memoryStyleLastRefresh.value = _formatClock(new Date());
+        if (showFeedback) {
+          memoryStyleRefreshNote.value = memoryStyle.value.trim()
+            ? '已刷新（已读取当前全局风格）'
+            : '已刷新（当前尚未生成全局风格）';
+        }
+      } catch (e) {
+        if (showFeedback) {
+          memoryStyleRefreshNote.value = '刷新失败：' + (e.message || e);
+        }
+      }
       finally {
         memoryStyleLoading.value = false;
       }
     }
 
+    async function onMemoryStyleRefresh() {
+      await loadMemoryStyle(true);
+    }
+
     async function saveMemoryStyle() {
       if (!memoryStyle.value.trim()) {
-        alert('风格指令不能为空');
+        showUiAlert('风格指令不能为空');
         return;
       }
       memoryStyleSaving.value = true;
@@ -283,7 +585,7 @@ createApp({
           body: JSON.stringify({ style_directive: memoryStyle.value.trim() }),
         });
       } catch (e) {
-        alert('保存失败: ' + (e.message || e));
+        showUiAlert('保存失败: ' + (e.message || e));
       } finally {
         memoryStyleSaving.value = false;
       }
@@ -296,9 +598,38 @@ createApp({
         await apiFetch('/api/memory/style', { method: 'DELETE' });
         memoryStyle.value = '';
       } catch (e) {
-        alert('清除失败: ' + (e.message || e));
+        showUiAlert('清除失败: ' + (e.message || e));
       } finally {
         memoryStyleSaving.value = false;
+      }
+    }
+
+    /* ── EvoMap Toggle ── */
+    async function loadEvomapSetting() {
+      evomapLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/evomap');
+        evomapEnabled.value = data.enabled === true;
+      } catch { /* ignore */ }
+      finally {
+        evomapLoading.value = false;
+      }
+    }
+
+    async function setEvomapEnabled(enabled) {
+      if (evomapLoading.value) return;
+      evomapLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/evomap', {
+          method: 'POST',
+          body: JSON.stringify({ enabled }),
+        });
+        evomapEnabled.value = data.enabled === true;
+        await loadTools();
+      } catch (e) {
+        showUiAlert('EvoMap 开关更新失败: ' + (e.message || e));
+      } finally {
+        evomapLoading.value = false;
       }
     }
 
@@ -316,6 +647,32 @@ createApp({
       }
       return Object.values(groups);
     });
+
+    function normalizeSkillKey(v) {
+      return String(v || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '');
+    }
+
+    const installedSkillKeySet = computed(() => {
+      const out = new Set();
+      for (const s of skills.value) {
+        if (!s || s.source !== 'user') continue;
+        out.add(normalizeSkillKey(s.id));
+        out.add(normalizeSkillKey(s.name));
+      }
+      return out;
+    });
+
+    function isClawhubSkillInstalled(item) {
+      if (!item) return false;
+      const slugKey = normalizeSkillKey(item.slug);
+      const nameKey = normalizeSkillKey(item.name);
+      return (
+        (slugKey && installedSkillKeySet.value.has(slugKey)) ||
+        (nameKey && installedSkillKeySet.value.has(nameKey))
+      );
+    }
 
     const _TOOL_CATEGORY_LABELS = {
       system: '系统',
@@ -351,28 +708,46 @@ createApp({
         skillInstallSource.value = '';
         await loadSkills();
       } catch (e) {
-        alert('安装失败: ' + (e.message || e));
+        showUiAlert('安装失败: ' + (e.message || e));
       } finally {
         skillInstalling.value = false;
       }
     }
 
+    function requestUninstallSkill(skillId) {
+      pendingUninstallSkillId.value = String(skillId || '').trim();
+    }
+
+    function cancelUninstallSkill() {
+      pendingUninstallSkillId.value = '';
+    }
+
     async function uninstallSkill(skillId) {
-      if (!confirm(`确定卸载技能「${skillId}」?`)) return;
       try {
-        await apiFetch(`/api/skills/${skillId}`, { method: 'DELETE' });
+        await apiFetch(`/api/skills/${encodeURIComponent(skillId)}`, { method: 'DELETE' });
+        pendingUninstallSkillId.value = '';
         await loadSkills();
       } catch (e) {
-        alert('卸载失败: ' + (e.message || e));
+        showUiAlert('卸载失败: ' + (e.message || e));
       }
     }
 
     async function showSkillDetail(skillId) {
       try {
-        const data = await apiFetch(`/api/skills/${skillId}`);
+        const data = await apiFetch(`/api/skills/${encodeURIComponent(skillId)}`);
         skillDetail.value = data;
       } catch (e) {
-        skillDetail.value = null;
+        try {
+          const fallback = await apiFetch(`/api/skills/${encodeURIComponent(skillId)}/raw`);
+          skillDetail.value = {
+            id: fallback.id || skillId,
+            name: fallback.name || skillId,
+            raw_markdown: fallback.raw_markdown || '',
+          };
+        } catch (e2) {
+          skillDetail.value = null;
+          showUiAlert('加载技能详情失败: ' + ((e2 && e2.message) || (e && e.message) || e2 || e));
+        }
       }
     }
 
@@ -380,6 +755,29 @@ createApp({
       if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
       if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
       return String(n);
+    }
+
+    function formatCount(n) {
+      if (n === null || n === undefined || n === '') return '—';
+      const v = Number(n);
+      if (!Number.isFinite(v) || v < 0) return '—';
+      if (v === 0) return '0';
+      if (v >= 1_000_000) return (v / 1_000_000).toFixed(1) + 'M';
+      if (v >= 1_000) return (v / 1_000).toFixed(1) + 'k';
+      return String(v);
+    }
+
+    function hasClawhubStats(item) {
+      if (!item) return false;
+      return ['stars', 'downloads', 'current_installs', 'all_time_installs'].some((k) => {
+        const v = item[k];
+        return !(v === null || v === undefined || v === '');
+      });
+    }
+
+    function formatClawhubStats(item) {
+      if (!hasClawhubStats(item)) return '统计数据暂不可用';
+      return `⭐${formatCount(item.stars)} · 📦${formatCount(item.downloads)} · ${formatCount(item.current_installs)} 当前安装 · ${formatCount(item.all_time_installs)} 总安装`;
     }
 
     /* ── Sessions ── */
@@ -769,7 +1167,7 @@ createApp({
 
       /* Convert file paths to file cards (non-image files only) */
       html = html.replace(
-        /(\/(?:tmp|home|Users|var|opt|etc)\/[^\s<"']*\.(\w{2,5}))(?=[\s<"']|$)/gi,
+        /(\/(?:tmp|home|Users|var|opt|etc)\/[^\n<"']+?\.(\w{2,5}))(?=[\s<"']|$)/gi,
         (m, filePath, ext) => {
           if (_IMAGE_EXTS.has(ext.toLowerCase())) return m;
           if (m.includes('file-card')) return m;
@@ -787,6 +1185,37 @@ createApp({
 
       nextTick(_loadFileCardMeta);
       return html;
+    }
+
+    function renderSkillMarkdown(text) {
+      if (!text) return '';
+      // Skill detail should not trigger file-card conversion/window.open side effects.
+      let html = md.render(text);
+      if (token.value) {
+        html = html.replace(
+          /((?:src|href)=["'])(\/api\/[^"']+)(["'])/gi,
+          (m, pre, url, post) => `${pre}${_appendToken(url)}${post}`
+        );
+      }
+      return html;
+    }
+
+    function _escapeHtml(text) {
+      return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function safeRenderSkillMarkdown(text) {
+      try {
+        return renderSkillMarkdown(text);
+      } catch (e) {
+        console.error('skill_markdown_render_failed', e);
+        return `<pre style="white-space:pre-wrap;word-break:break-word">${_escapeHtml(text || '')}</pre>`;
+      }
     }
 
     const messagesEl = ref(null);
@@ -818,8 +1247,10 @@ createApp({
         await createSession();
       }
       loadSkills();
+      loadClawhubConfig();
       loadTools();
       loadMemoryStyle();
+      loadEvomapSetting();
     }
 
     onMounted(async () => {
@@ -865,15 +1296,31 @@ createApp({
       inputText, isStreaming, showSettings, showSidebar, pendingImages,
       currentModel, thinkingLevel, availableModels, defaultModel, groupedModels, messagesEl,
       sessionTokens, totalTokens, formatTokens,
+      formatCount, formatClawhubStats,
       activeTab, skills, tools, groupedSkills, groupedTools,
-      skillInstallSource, skillInstalling, skillDetail, installSkill, uninstallSkill, showSkillDetail,
+      skillSourceTab,
+      skillInstallSource, skillInstalling, skillDetail, pendingUninstallSkillId,
+      installSkill, uninstallSkill, requestUninstallSkill, cancelUninstallSkill, showSkillDetail,
+      clawhubConfigLoading, clawhubConfigSaving,
+      clawhubCliInstalling, installClawhubCli,
+      clawhubLoggingIn, clawhubLoggingOut, clawhubAuthLoading, clawhubLoggedIn, clawhubAuthMessage, doClawhubLogin, doClawhubRelogin, doClawhubLogout, loadClawhubAuthStatus, onClawhubRegistryBlur,
+      clawhubEnabled, clawhubRegistryUrl, clawhubCliAvailable,
+      clawhubQuery, clawhubSearching, clawhubResults, clawhubSearched, clawhubInstalling, clawhubPublishing,
+      clawhubPage, clawhubPageSize, clawhubTotalPages, pagedClawhubResults, clawhubPageButtons,
+      clawhubDetail, openClawhubDetail,
+      isClawhubSkillInstalled,
+      loadClawhubConfig, saveClawhubConfig, onClawhubEnabledChange, searchClawhub, installClawhubSkill, publishInstalledSkill,
+      publishDialog, publishSlugInput, publishVersionInput, openPublishDialog, closePublishDialog, confirmPublishDialog,
       toolDetail,
-      memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving,
-      loadMemoryStyle, saveMemoryStyle, clearMemoryStyle,
+      memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
+      loadMemoryStyle, onMemoryStyleRefresh, saveMemoryStyle, clearMemoryStyle,
+      evomapEnabled, evomapLoading, loadEvomapSetting, setEvomapEnabled,
       createSession, deleteSession, switchSession,
       sendMessage, handleKeydown, switchModel, loadModels,
       toggleTheme, formatTime, renderMarkdown,
+      renderSkillMarkdown, safeRenderSkillMarkdown,
       addImageFiles, removeImage, onPaste, onDrop, onDragOver, triggerFileInput,
+      uiAlertMessage, closeUiAlert,
     };
   },
 
@@ -934,7 +1381,7 @@ createApp({
         </div>
         <div class="sidebar-tab-bar">
           <button class="sidebar-tab" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">💬 聊天</button>
-          <button class="sidebar-tab" :class="{ active: activeTab === 'skills' }" @click="activeTab = 'skills'; loadSkills()">🧩 技能</button>
+          <button class="sidebar-tab" :class="{ active: activeTab === 'skills' }" @click="activeTab = 'skills'; loadSkills(); loadClawhubConfig()">🧩 技能</button>
           <button class="sidebar-tab" :class="{ active: activeTab === 'tools' }" @click="activeTab = 'tools'; loadTools()">🔧 工具</button>
         </div>
       </aside>
@@ -1049,44 +1496,139 @@ createApp({
         <!-- Skills Tab -->
         <template v-if="activeTab === 'skills'">
           <div class="tab-content">
-            <div class="panel-toolbar">
-              <input
-                v-model="skillInstallSource"
-                class="panel-search"
-                placeholder="输入 GitHub 地址或本地路径安装技能…"
-                @keydown.enter="installSkill"
-              />
-              <button class="btn-pill" :disabled="skillInstalling || !skillInstallSource.trim()" @click="installSkill">
-                {{ skillInstalling ? '安装中…' : '+ 安装' }}
-              </button>
+            <div class="skill-subtabs">
+              <button class="skill-subtab" :class="{ active: skillSourceTab === 'local' }" @click="skillSourceTab = 'local'">本地技能</button>
+              <button class="skill-subtab" :class="{ active: skillSourceTab === 'clawhub' }" @click="skillSourceTab = 'clawhub'; loadClawhubConfig()">ClawHub</button>
             </div>
-            <div class="tab-content-body">
-              <div v-if="!skills.length" class="tab-empty">暂无技能</div>
-              <details v-for="group in groupedSkills" :key="group.label" class="panel-group" open>
-                <summary class="panel-group-header">
-                  <span>{{ group.label }}</span>
-                  <span class="panel-group-count">{{ group.items.length }}</span>
-                </summary>
-                <div class="panel-grid skills-grid">
-                  <div v-for="s in group.items" :key="s.id" class="panel-card skill-card" @click="showSkillDetail(s.id)">
-                    <div class="panel-card-main">
-                      <div class="panel-card-title">🧩 {{ s.name }}</div>
-                      <div v-if="s.trigger_description" class="panel-card-desc">{{ s.trigger_description }}</div>
-                      <div class="chip-row">
-                        <span class="chip" :class="s.source === 'user' ? 'chip-accent' : 'chip-ok'">{{ s.source === 'user' ? '已安装' : '内置' }}</span>
-                        <span class="chip" v-for="t in (s.triggers || []).slice(0, 3)" :key="t">{{ t }}</span>
+            <template v-if="skillSourceTab === 'local'">
+              <div class="panel-toolbar">
+                <input
+                  v-model="skillInstallSource"
+                  class="panel-search"
+                  placeholder="输入 GitHub 地址或本地路径安装技能…"
+                  @keydown.enter="installSkill"
+                />
+                <button class="btn-pill" :disabled="skillInstalling || !skillInstallSource.trim()" @click="installSkill">
+                  {{ skillInstalling ? '安装中…' : '+ 安装' }}
+                </button>
+              </div>
+              <div class="tab-content-body">
+                <div v-if="!skills.length" class="tab-empty">暂无技能</div>
+                <details v-for="group in groupedSkills" :key="group.label" class="panel-group" open>
+                  <summary class="panel-group-header">
+                    <span>{{ group.label }}</span>
+                    <span class="panel-group-count">{{ group.items.length }}</span>
+                  </summary>
+                  <div class="panel-grid skills-grid">
+                    <div v-for="s in group.items" :key="s.id" class="panel-card skill-card" @click.prevent="showSkillDetail(s.id)">
+                      <div class="panel-card-main">
+                        <div class="panel-card-title">🧩 {{ s.name }}</div>
+                        <div v-if="s.trigger_description" class="panel-card-desc">{{ s.trigger_description }}</div>
+                        <div class="chip-row">
+                          <span class="chip" :class="s.source === 'user' ? 'chip-accent' : 'chip-ok'">{{ s.source === 'user' ? '已安装' : '内置' }}</span>
+                          <span class="chip" v-for="t in (s.triggers || []).slice(0, 3)" :key="t">{{ t }}</span>
+                        </div>
+                        <div v-if="s.tools && s.tools.length" class="panel-card-tools">
+                          <code v-for="t in s.tools" :key="t" class="tool-code">{{ t }}</code>
+                        </div>
                       </div>
-                      <div v-if="s.tools && s.tools.length" class="panel-card-tools">
-                        <code v-for="t in s.tools" :key="t" class="tool-code">{{ t }}</code>
+                      <div class="panel-card-action skill-card-action">
+                        <button v-if="s.source === 'user'" class="btn-danger-sm" @click.stop="requestUninstallSkill(s.id)" title="卸载">✕</button>
+                        <button
+                          v-if="s.source === 'user'"
+                          class="btn-outline"
+                          :disabled="clawhubPublishing[s.id]"
+                          @click.stop="openPublishDialog(s.id)"
+                          title="发布到clawhub"
+                        >{{ clawhubPublishing[s.id] ? '发布中…' : '发布到clawhub' }}</button>
                       </div>
-                    </div>
-                    <div class="panel-card-action">
-                      <button v-if="s.source === 'user'" class="btn-danger-sm" @click.stop="uninstallSkill(s.id)" title="卸载">✕</button>
                     </div>
                   </div>
+                </details>
+              </div>
+            </template>
+            <template v-else>
+              <div class="panel-toolbar clawhub-toolbar">
+                <label class="switch">
+                  <input type="checkbox" :checked="clawhubEnabled" :disabled="clawhubConfigSaving || clawhubConfigLoading" @change="onClawhubEnabledChange($event.target.checked)">
+                  <span class="switch-slider"></span>
+                </label>
+                <span class="clawhub-enable-text">启用 ClawHub</span>
+                <span class="chip" :class="clawhubCliAvailable ? 'chip-ok' : ''">{{ clawhubCliAvailable ? 'CLI 已安装' : 'CLI 未安装' }}</span>
+                <span class="chip" :class="clawhubLoggedIn ? 'chip-accent' : ''">{{ clawhubLoggedIn ? '已登录' : '未登录' }}</span>
+                <button
+                  class="btn-outline"
+                  :disabled="clawhubCliInstalling || clawhubCliAvailable"
+                  @click="installClawhubCli"
+                >{{ clawhubCliAvailable ? 'CLI 已安装' : (clawhubCliInstalling ? '安装 CLI 中…' : '安装 CLI') }}</button>
+                <button
+                  class="btn-outline"
+                  :disabled="clawhubLoggingIn || !clawhubCliAvailable || clawhubLoggedIn"
+                  @click="doClawhubLogin"
+                >{{ clawhubLoggedIn ? '已登录' : (clawhubLoggingIn ? '登录中…' : '登录 ClawHub') }}</button>
+                <button class="btn-outline" :disabled="clawhubLoggingOut || !clawhubCliAvailable || !clawhubLoggedIn" @click="doClawhubLogout">{{ clawhubLoggingOut ? '退出中…' : '退出登录' }}</button>
+                <span class="clawhub-auth-msg">若查询失败，请退出后重新登录！</span>
+              </div>
+              <div class="panel-toolbar clawhub-config-row">
+                <input
+                  v-model="clawhubRegistryUrl"
+                  class="panel-search"
+                  placeholder="ClawHub 源地址 (默认: https://clawhub.ai)"
+                  @blur="onClawhubRegistryBlur"
+                />
+                <span class="clawhub-auth-msg">{{ clawhubAuthMessage || '登录后可使用账号态能力（如 whoami/list/update/publish）' }}</span>
+              </div>
+              <div class="panel-toolbar">
+                <input
+                  v-model="clawhubQuery"
+                  class="panel-search"
+                  placeholder="搜索 ClawHub 技能，例如: browser, ppt, feishu..."
+                  @keydown.enter="searchClawhub"
+                />
+                <button class="btn-pill" :disabled="clawhubSearching || clawhubConfigSaving || !clawhubEnabled || !clawhubQuery.trim()" @click="searchClawhub">
+                  {{ clawhubSearching ? '搜索中…' : '搜索' }}
+                </button>
+              </div>
+              <div class="tab-content-body">
+                <div v-if="!clawhubEnabled" class="tab-empty">请先启用 ClawHub</div>
+                <div v-else-if="clawhubSearching" class="tab-empty">搜索中，请耐心等待30秒！</div>
+                <div v-else-if="!clawhubResults.length" class="tab-empty">{{ clawhubSearched ? '未找到记录（0 条）' : '输入关键词后点击搜索，请耐心等待，最多获取24条记录。' }}</div>
+                <div v-else class="clawhub-results-wrap">
+                  <div class="panel-grid skills-grid clawhub-results-grid">
+                    <div v-for="item in pagedClawhubResults" :key="item.slug" class="panel-card skill-card" @click="openClawhubDetail(item)">
+                      <div class="panel-card-main">
+                        <div class="panel-card-title">🛍 {{ item.name || item.slug }}</div>
+                        <div class="panel-card-desc">{{ item.summary || '暂无描述' }}</div>
+                        <div class="clawhub-stats">
+                          {{ formatClawhubStats(item) }}
+                        </div>
+                        <div class="chip-row">
+                          <span class="chip chip-accent">{{ item.slug }}</span>
+                          <span v-if="item.version" class="chip">v{{ item.version }}</span>
+                        </div>
+                      </div>
+                      <div class="panel-card-action">
+                        <button class="btn-pill btn-pill-sm" :disabled="clawhubInstalling[item.slug] || isClawhubSkillInstalled(item)" @click.stop="installClawhubSkill(item.slug, item.version || '', item.repo_url || '')">
+                          {{ isClawhubSkillInstalled(item) ? '已安装' : (clawhubInstalling[item.slug] ? '安装中…' : '安装') }}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-if="clawhubResults.length >= clawhubPageSize" class="pager">
+                    <button class="pager-btn" :disabled="clawhubPage <= 1" @click="clawhubPage = Math.max(1, clawhubPage - 1)">上一页</button>
+                    <button
+                      v-for="p in clawhubPageButtons"
+                      :key="'cp' + p"
+                      class="pager-btn"
+                      :class="{ active: p === clawhubPage }"
+                      @click="clawhubPage = p"
+                    >{{ p }}</button>
+                    <button class="pager-btn" :disabled="clawhubPage >= clawhubTotalPages" @click="clawhubPage = Math.min(clawhubTotalPages, clawhubPage + 1)">下一页</button>
+                    <span class="pager-total">共 {{ clawhubResults.length }} 条</span>
+                  </div>
                 </div>
-              </details>
-            </div>
+              </div>
+            </template>
           </div>
         </template>
 
@@ -1149,12 +1691,32 @@ createApp({
           </select>
         </div>
         <div class="setting-group">
+          <div class="setting-row">
+            <div>
+              <label style="margin-bottom:2px">EvoMap 插件</label>
+              <p class="setting-hint" style="margin:0">控制 EvoMap 工具与经验检索开关（即时生效）</p>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                :checked="evomapEnabled"
+                :disabled="evomapLoading"
+                @change="setEvomapEnabled($event.target.checked)"
+              >
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="setting-group">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
             <label style="margin:0">全局回复风格（自动生成，可手动覆盖）</label>
-            <button class="btn-mini" @click="loadMemoryStyle" :disabled="memoryStyleLoading">刷新</button>
+            <button class="btn-mini" @click="onMemoryStyleRefresh" :disabled="memoryStyleLoading">{{ memoryStyleLoading ? '刷新中…' : '刷新' }}</button>
           </div>
+          <p class="setting-hint" v-if="memoryStyleLastRefresh" style="margin-top:0">上次刷新：{{ memoryStyleLastRefresh }}</p>
+          <p class="setting-hint" v-if="memoryStyleRefreshNote" style="margin-top:0">{{ memoryStyleRefreshNote }}</p>
           <p class="setting-hint" v-if="memoryStyleEnabled">系统会根据多轮对话自动提炼并填入；你也可以在这里手动修正。每轮默认应用，用户本轮明确要求优先。</p>
-          <p class="setting-hint" v-else>全局风格功能已关闭（config: agent.memory.global_style_enabled=false）。</p>
+          <p class="setting-hint">“刷新”只会重新读取已保存的全局风格，不会立刻触发新生成。</p>
+          <p class="setting-hint" v-if="!memoryStyleEnabled">全局风格功能已关闭（config: agent.memory.global_style_enabled=false）。</p>
           <textarea
             class="setting-textarea"
             v-model="memoryStyle"
@@ -1180,13 +1742,93 @@ createApp({
       </div>
 
       <!-- Skill Detail Modal -->
+      <div v-if="uiAlertMessage" class="detail-overlay" @click.self="closeUiAlert()">
+        <div class="detail-modal confirm-modal">
+          <div class="detail-modal-header">
+            <h2>提示</h2>
+            <button class="btn-icon" @click="closeUiAlert()" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body">
+            <p>{{ uiAlertMessage }}</p>
+            <div class="confirm-actions">
+              <button class="btn-pill" @click="closeUiAlert()">确定</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Skill Detail Modal -->
       <div v-if="skillDetail" class="detail-overlay" @click.self="skillDetail = null">
         <div class="detail-modal">
           <div class="detail-modal-header">
             <h2>🧩 {{ skillDetail.name }}</h2>
             <button class="btn-icon" @click="skillDetail = null" title="关闭">✕</button>
           </div>
-          <div class="detail-modal-body markdown-body" v-html="renderMarkdown(skillDetail.raw_markdown || '')"></div>
+          <div class="detail-modal-body markdown-body" v-html="safeRenderSkillMarkdown(skillDetail.raw_markdown || '')"></div>
+        </div>
+      </div>
+
+      <!-- Uninstall Confirm Modal -->
+      <div v-if="pendingUninstallSkillId" class="detail-overlay" @click.self="cancelUninstallSkill()">
+        <div class="detail-modal confirm-modal">
+          <div class="detail-modal-header">
+            <h2>确认卸载</h2>
+            <button class="btn-icon" @click="cancelUninstallSkill()" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body">
+            <p>确定卸载技能「{{ pendingUninstallSkillId }}」？</p>
+            <div class="confirm-actions">
+              <button class="btn-outline" @click="cancelUninstallSkill()">取消</button>
+              <button class="btn-pill" @click="uninstallSkill(pendingUninstallSkillId)">确定</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Publish Modal -->
+      <div v-if="publishDialog" class="detail-overlay" @click.self="closePublishDialog()">
+        <div class="detail-modal confirm-modal">
+          <div class="detail-modal-header">
+            <h2>发布到clawhub</h2>
+            <button class="btn-icon" @click="closePublishDialog()" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body">
+            <label class="setting-hint" style="display:block;margin-bottom:6px">slug（可修改）</label>
+            <input v-model="publishSlugInput" class="panel-search" placeholder="例如: flywhale-pdf-skill" />
+            <label class="setting-hint" style="display:block;margin:10px 0 6px">版本号（semver）</label>
+            <input v-model="publishVersionInput" class="panel-search" placeholder="例如: 0.1.0" />
+            <div class="confirm-actions">
+              <button class="btn-outline" @click="closePublishDialog()">取消</button>
+              <button class="btn-pill" @click="confirmPublishDialog()">确认发布</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ClawHub Detail Modal -->
+      <div v-if="clawhubDetail" class="detail-overlay" @click.self="clawhubDetail = null">
+        <div class="detail-modal">
+          <div class="detail-modal-header">
+            <h2>🛍 {{ clawhubDetail.name || clawhubDetail.slug }}</h2>
+            <button class="btn-icon" @click="clawhubDetail = null" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body">
+            <p class="tool-detail-desc">{{ clawhubDetail.summary || '暂无介绍' }}</p>
+            <div class="clawhub-stats">
+              {{ formatClawhubStats(clawhubDetail) }}
+            </div>
+            <div class="chip-row" style="margin-bottom:10px">
+              <span class="chip chip-accent">{{ clawhubDetail.slug }}</span>
+              <span v-if="clawhubDetail.version" class="chip">v{{ clawhubDetail.version }}</span>
+            </div>
+            <div class="clawhub-links">
+              <a class="btn-outline" :href="clawhubDetail.detail_url" target="_blank" rel="noopener noreferrer">打开技能页</a>
+              <a v-if="clawhubDetail.repo_url" class="btn-outline" :href="clawhubDetail.repo_url" target="_blank" rel="noopener noreferrer">打开源码仓库</a>
+              <button class="btn-pill btn-pill-sm" :disabled="clawhubInstalling[clawhubDetail.slug] || isClawhubSkillInstalled(clawhubDetail)" @click="installClawhubSkill(clawhubDetail.slug, clawhubDetail.version || '', clawhubDetail.repo_url || '')">
+                {{ isClawhubSkillInstalled(clawhubDetail) ? '已安装' : (clawhubInstalling[clawhubDetail.slug] ? '安装中…' : '安装此技能') }}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 

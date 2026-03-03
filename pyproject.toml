@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "httpx>=0.28",
+    "click>=8.2,<9",
     "typer>=0.15",
     "rich>=13.9",
     "structlog>=24.4",
@@ -33,7 +34,7 @@ dev = [
 ]
 
 [project.scripts]
-whaleclaw = "whaleclaw.cli.main:app"
+whaleclaw = "whaleclaw.cli.main:main"
 
 [project.entry-points."whaleclaw.plugins"]
 evomap = "whaleclaw.plugins.evomap.plugin:plugin"

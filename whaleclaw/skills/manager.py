@@ -59,9 +59,24 @@ class SkillManager:
         self,
         user_message: str,
         max_skills: int = 2,
+        forced_skill_id: str | None = None,
+        forced_skill_ids: list[str] | None = None,
     ) -> list[Skill]:
         """Route user message to matched skills."""
         available = self.discover()
+        if forced_skill_ids:
+            id_to_skill = {s.id: s for s in available}
+            forced: list[Skill] = []
+            for sid in forced_skill_ids:
+                skill = id_to_skill.get(sid)
+                if skill is not None:
+                    forced.append(skill)
+            if forced:
+                return forced
+        if forced_skill_id:
+            forced = next((s for s in available if s.id == forced_skill_id), None)
+            if forced is not None:
+                return [forced]
         return self._router.route(user_message, available, max_skills=max_skills)
 
     def format_for_prompt(self, skills: list[Skill], budget: int) -> str:
@@ -119,8 +134,7 @@ class SkillManager:
             return self._install_from_github_shorthand(source)
 
         raise ValueError(
-            f"无法识别的技能来源: {source}\n"
-            "支持: GitHub (user/repo/path), URL, 或本地目录路径"
+            f"无法识别的技能来源: {source}\n支持: GitHub (user/repo/path), URL, 或本地目录路径"
         )
 
     def _install_from_local(self, src: Path) -> Skill:
@@ -136,9 +150,7 @@ class SkillManager:
     def _install_from_github_url(self, url: str) -> Skill:
         """Clone repo and extract skill from GitHub URL."""
         url = url.rstrip("/")
-        parts = url.replace("https://github.com/", "").replace(
-            "http://github.com/", ""
-        )
+        parts = url.replace("https://github.com/", "").replace("http://github.com/", "")
         segments = parts.split("/")
         if len(segments) < 2:
             raise ValueError(f"无效的 GitHub URL: {url}")
@@ -182,9 +194,7 @@ class SkillManager:
                 return env
         return env
 
-    def _clone_and_install(
-        self, user: str, repo: str, sub_path: str
-    ) -> Skill:
+    def _clone_and_install(self, user: str, repo: str, sub_path: str) -> Skill:
         """Clone GitHub repo to temp dir, copy skill into user skills."""
         clone_url = f"https://github.com/{user}/{repo}.git"
 
@@ -198,9 +208,7 @@ class SkillManager:
                 env=self._git_env(),
             )
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"git clone 失败: {result.stderr.strip()}"
-                )
+                raise RuntimeError(f"git clone 失败: {result.stderr.strip()}")
 
             src = tmp_dir / "repo"
             if sub_path:
@@ -212,9 +220,7 @@ class SkillManager:
                 if candidates:
                     src = candidates[0].parent
                 else:
-                    raise FileNotFoundError(
-                        f"在 {user}/{repo}/{sub_path} 中未找到 SKILL.md"
-                    )
+                    raise FileNotFoundError(f"在 {user}/{repo}/{sub_path} 中未找到 SKILL.md")
 
             return self._install_from_local(src)
 

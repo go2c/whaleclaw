@@ -4,9 +4,42 @@
 # ═══════════════════════════════════════════════
 cd "$(dirname "$0")"
 
-CONFIG_DIR="$HOME/.whaleclaw"
-CONFIG_FILE="$CONFIG_DIR/whaleclaw.json"
 PYTHON="./python/bin/python3.12"
+PROJECT_META_FILE=".whaleclaw.project.json"
+DEFAULT_CONFIG_DIR="$HOME/.whaleclaw"
+CONFIG_DIR="$DEFAULT_CONFIG_DIR"
+
+if [ -f "$PROJECT_META_FILE" ] && [ -f "$PYTHON" ]; then
+    saved_home=$("$PYTHON" -c "
+import json, pathlib
+p = pathlib.Path('$PROJECT_META_FILE')
+try:
+    data = json.loads(p.read_text(encoding='utf-8'))
+except Exception:
+    data = {}
+home = data.get('whaleclaw_home') if isinstance(data, dict) else ''
+print(home or '')
+" 2>/dev/null)
+    if [ -n "$saved_home" ]; then
+        CONFIG_DIR="$saved_home"
+    fi
+fi
+
+export WHALECLAW_HOME="$CONFIG_DIR"
+CONFIG_FILE="$CONFIG_DIR/whaleclaw.json"
+
+save_project_home_binding() {
+    local home_dir="$1"
+    "$PYTHON" << PYEOF
+import json, pathlib
+p = pathlib.Path('$PROJECT_META_FILE')
+p.write_text(
+    json.dumps({"whaleclaw_home": '$home_dir'}, indent=2, ensure_ascii=False),
+    encoding="utf-8",
+)
+print("  ✅ 当前项目已绑定根目录: " + '$home_dir')
+PYEOF
+}
 
 # 自动检测本地代理（用于访问海外 API）
 if [ -z "$https_proxy" ]; then
@@ -78,7 +111,7 @@ read_status() {
     "$PYTHON" << 'PYEOF'
 import json, pathlib, os
 
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 gw = cfg.get('gateway', {})
 ag = cfg.get('agent', {})
@@ -168,6 +201,7 @@ show_menu() {
     echo "  ═══════════════════════════════════════════════════"
     echo ""
     echo "  📁 配置文件: $CONFIG_FILE"
+    echo "  🗂️  根目录:   $CONFIG_DIR"
     echo ""
     echo "  ┌─────────────── 当前状态 ───────────────┐"
     echo "  │  端口:     ${PORT}"
@@ -226,7 +260,7 @@ model = '''$v_model'''
 api_key = _raw_key
 _is_oauth = False
 if provider == 'openai':
-    _cp = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+    _cp = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
     if _cp.exists():
         _cc = json.loads(_cp.read_text())
         _oc = _cc.get('models', {}).get('openai', {})
@@ -369,7 +403,7 @@ _save_model_entry() {
     "$PYTHON" << PYEOF
 import json, pathlib, os
 
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 prov = cfg.setdefault('models', {}).setdefault('$s_provider', {})
 models = prov.setdefault('configured_models', [])
@@ -486,7 +520,7 @@ configure_provider() {
     local saved_key
     saved_key=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 print(cfg.get('models', {}).get('$pname', {}).get('api_key', '') or '')
 " 2>/dev/null)
@@ -517,7 +551,7 @@ print(cfg.get('models', {}).get('$pname', {}).get('api_key', '') or '')
     # 保存 API Key + Base URL
     "$PYTHON" << PYEOF
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 prov = cfg.setdefault('models', {}).setdefault('$pname', {})
 prov['api_key'] = '''$apikey'''
@@ -531,7 +565,7 @@ PYEOF
     echo "  ─── 已配置的模型 ────────────────"
     "$PYTHON" << PYEOF
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 models = cfg.get('models', {}).get('$pname', {}).get('configured_models', [])
 if models:
@@ -562,7 +596,7 @@ _provider_model_menu() {
         local _mode
         _mode=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 if p.exists():
     cfg = json.loads(p.read_text())
     print(cfg.get('models', {}).get('openai', {}).get('auth_mode', 'api_key'))
@@ -697,7 +731,7 @@ _configure_single_model() {
         if echo "$set_default" | grep -qi '^y'; then
             "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 cfg.setdefault('agent', {})['model'] = '$pname/$mid'
 cfg['agent']['thinking_level'] = '$thinking'
@@ -757,7 +791,7 @@ _batch_verify_provider() {
         if echo "$set_def" | grep -qi '^y'; then
             "$PYTHON" << PYEOF
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 models = cfg.get('models', {}).get('$pname', {}).get('configured_models', [])
 for m in models:
@@ -837,7 +871,7 @@ configure_summarizer() {
             local existing_key
             existing_key=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 print(cfg.get('models', {}).get('$new_provider', {}).get('api_key', '') or '')
 " 2>/dev/null)
@@ -845,7 +879,7 @@ print(cfg.get('models', {}).get('$new_provider', {}).get('api_key', '') or '')
             local existing_url
             existing_url=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 print(cfg.get('models', {}).get('$new_provider', {}).get('base_url', '') or '')
 " 2>/dev/null)
@@ -881,7 +915,7 @@ print(cfg.get('models', {}).get('$new_provider', {}).get('base_url', '') or '')
             # ── Step 4: 保存 API Key + Base URL ──
             "$PYTHON" << PYEOF
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 prov = cfg.setdefault('models', {}).setdefault('$new_provider', {})
 prov['api_key'] = '''$apikey'''
@@ -909,7 +943,7 @@ PYEOF
             # ── Step 6: 保存压缩模型选择 ──
             "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 summ = cfg.setdefault('agent', {}).setdefault('summarizer', {})
 summ['model'] = '$new_model'
@@ -924,7 +958,7 @@ print(f'  ✅ 压缩模型已设置为 $new_model')
             echo ""
             "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 summ = cfg.setdefault('agent', {}).setdefault('summarizer', {})
 current = summ.get('enabled', True)
@@ -972,13 +1006,13 @@ configure_feishu() {
             local saved_aid saved_secret
             saved_aid=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 print(cfg.get('channels', {}).get('feishu', {}).get('app_id', '') or '')
 " 2>/dev/null)
             saved_secret=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 print(cfg.get('channels', {}).get('feishu', {}).get('app_secret', '') or '')
 " 2>/dev/null)
@@ -1015,7 +1049,7 @@ print(cfg.get('channels', {}).get('feishu', {}).get('app_secret', '') or '')
 
             "$PYTHON" << PYEOF
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 feishu = cfg.setdefault('channels', {}).setdefault('feishu', {})
 feishu['app_id'] = '''$saved_aid'''
@@ -1042,7 +1076,7 @@ PYEOF
             esac
             "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 cfg.setdefault('channels', {}).setdefault('feishu', {})['mode'] = '$mode_val'
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -1069,7 +1103,7 @@ print('  ⚠️  需要重启 Gateway 生效')
             esac
             "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 cfg.setdefault('channels', {}).setdefault('feishu', {})['dm_policy'] = '$dm_val'
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -1097,7 +1131,7 @@ configure_openai() {
     local current_mode
     current_mode=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 if p.exists():
     cfg = json.loads(p.read_text())
     print(cfg.get('models', {}).get('openai', {}).get('auth_mode', 'api_key'))
@@ -1109,7 +1143,7 @@ else:
         echo "  当前模式: 🔑 ChatGPT 账号登录 (OAuth)"
         "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 oc = cfg.get('models', {}).get('openai', {})
 aid = oc.get('oauth_account_id', '')
@@ -1141,7 +1175,7 @@ else:
             # 确保 auth_mode 设为 api_key
             "$PYTHON" << 'PYEOF'
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 cfg.setdefault('models', {}).setdefault('openai', {})['auth_mode'] = 'api_key'
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -1153,7 +1187,7 @@ PYEOF
             local oauth_token
             oauth_token=$("$PYTHON" -c "
 import json, pathlib, os, time
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 if p.exists():
     cfg = json.loads(p.read_text())
     oc = cfg.get('models', {}).get('openai', {})
@@ -1197,7 +1231,7 @@ PYEOF
                 # 重新读取 token
                 oauth_token=$("$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 print(cfg.get('models', {}).get('openai', {}).get('oauth_access', '') or '')
 " 2>/dev/null)
@@ -1206,7 +1240,7 @@ print(cfg.get('models', {}).get('openai', {}).get('oauth_access', '') or '')
             if [ -n "$oauth_token" ]; then
                 "$PYTHON" << 'PYEOF'
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 oc = cfg.setdefault('models', {}).setdefault('openai', {})
 oc['auth_mode'] = 'oauth'
@@ -1263,7 +1297,7 @@ configure_custom_provider() {
     # 保存到配置
     "$PYTHON" << PYEOF
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 prov = cfg.setdefault('models', {}).setdefault('$custom_pname', {})
 prov['api_key'] = '''$custom_key'''
@@ -1285,7 +1319,7 @@ PYEOF
         if echo "$set_default" | grep -qi '^y'; then
             "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 cfg.setdefault('agent', {})['model'] = '$custom_pname/$custom_mid'
 cfg['agent']['thinking_level'] = 'off'
@@ -1308,7 +1342,7 @@ delete_models() {
     "$PYTHON" << 'PYEOF'
 import json, pathlib, os
 
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 models_cfg = cfg.get('models', {})
 
@@ -1362,7 +1396,7 @@ PYEOF
         "$PYTHON" << PYEOF
 import json, pathlib, os
 
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 models_cfg = cfg.get('models', {})
 pname = '$del_pname'
@@ -1389,7 +1423,7 @@ PYEOF
     "$PYTHON" << PYEOF
 import json, pathlib, os
 
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 
 tmp = pathlib.Path('/tmp/.whaleclaw_delete_list.json')
@@ -1493,13 +1527,45 @@ while true; do
             if [ -n "$port" ]; then
                 "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 cfg.setdefault('gateway', {})['port'] = $port
 p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 print('  ✅ Gateway 端口已设置为 $port')
 print('  ⚠️  需要重启 Gateway 生效')
 "
+
+                echo ""
+                echo "  当前项目根目录: $CONFIG_DIR"
+                read -p "  是否为当前项目创建独立根目录? [y/N]: " new_home_choice
+                if echo "$new_home_choice" | grep -qi '^y'; then
+                    default_home="$HOME/.whaleclaw-${port}"
+                    read -p "  输入新根目录 (回车使用默认: ${default_home}): " input_home
+                    picked_home="${input_home:-$default_home}"
+                    resolved_home=$("$PYTHON" -c "
+from pathlib import Path
+print(str(Path('$picked_home').expanduser().resolve()))
+")
+                    new_config_file="${resolved_home}/whaleclaw.json"
+
+                    if [ "$resolved_home" = "$CONFIG_DIR" ]; then
+                        echo "  ℹ️  新根目录与当前一致，保持不变。"
+                    else
+                        mkdir -p "$resolved_home"
+                        if [ ! -f "$new_config_file" ]; then
+                            cp "$CONFIG_FILE" "$new_config_file"
+                            echo "  ✅ 已复制当前配置到: $new_config_file"
+                        else
+                            echo "  ℹ️  检测到已有配置文件: $new_config_file"
+                        fi
+
+                        save_project_home_binding "$resolved_home"
+                        CONFIG_DIR="$resolved_home"
+                        CONFIG_FILE="$new_config_file"
+                        export WHALECLAW_HOME="$CONFIG_DIR"
+                        echo "  ✅ 当前项目后续将使用独立根目录"
+                    fi
+                fi
             fi
             echo ""
             read -p "  按回车键继续..."
@@ -1523,7 +1589,7 @@ print('  ⚠️  需要重启 Gateway 生效')
                     else
                         "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 auth = cfg.setdefault('gateway', {}).setdefault('auth', {})
 auth['mode'] = 'password'
@@ -1542,7 +1608,7 @@ print('  ⚠️  需要重启 Gateway 生效')
                     else
                         "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 auth = cfg.setdefault('gateway', {}).setdefault('auth', {})
 auth['mode'] = 'token'
@@ -1557,7 +1623,7 @@ print('  ⚠️  需要重启 Gateway 生效')
                 3)
                     "$PYTHON" -c "
 import json, pathlib, os
-p = pathlib.Path(os.path.expanduser('~/.whaleclaw/whaleclaw.json'))
+p = pathlib.Path(os.environ.get('WHALECLAW_HOME', os.path.expanduser('~/.whaleclaw'))) / 'whaleclaw.json'
 cfg = json.loads(p.read_text())
 auth = cfg.setdefault('gateway', {}).setdefault('auth', {})
 auth['mode'] = 'none'

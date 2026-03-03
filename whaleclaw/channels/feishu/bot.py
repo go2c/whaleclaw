@@ -16,6 +16,8 @@ from whaleclaw.channels.feishu.client import FeishuClient
 from whaleclaw.channels.feishu.config import FeishuConfig
 from whaleclaw.channels.feishu.dedup import MessageDedup
 from whaleclaw.channels.feishu.mention import is_bot_mentioned, strip_bot_mention
+from whaleclaw.config.loader import set_default_agent_model
+from whaleclaw.config.paths import WHALECLAW_HOME
 from whaleclaw.plugins.evomap.bridge import build_memory_hint_from_hook_data
 from whaleclaw.plugins.hooks import HookContext, HookManager, HookPoint
 from whaleclaw.providers.base import ImageContent
@@ -56,8 +58,14 @@ _FILE_EXTS = {
     ".mkv",
     ".webm",
 }
+_BOLD_PATH_RE = re.compile(
+    r"\*\*(/[^*\s]+\.(?:"
+    + "|".join(ext.lstrip(".") for ext in sorted(_FILE_EXTS))
+    + r"))\*\*",
+    re.MULTILINE,
+)
 _BARE_PATH_RE = re.compile(
-    r"(?:^|[\s`])(/[\w./-]+\.(?:"
+    r"(?:^|[\s`])(/[^`\s]+\.(?:"
     + "|".join(ext.lstrip(".") for ext in sorted(_FILE_EXTS))
     + r"))(?:[\s`]|$)",
     re.MULTILINE,
@@ -71,6 +79,7 @@ if TYPE_CHECKING:
     from whaleclaw.tools.registry import ToolRegistry
 
 log = get_logger(__name__)
+_FEISHU_MEDIA_DIR = WHALECLAW_HOME / "media" / "feishu"
 
 
 def _format_exception_text(exc: Exception) -> str:
@@ -147,9 +156,15 @@ class FeishuBot:
 
         text = self.extract_text(message)
         images = await self._extract_images(message) if msg_type == "image" else []
-        if not text and not images:
+        file_path = await self._extract_file(message) if msg_type == "file" else None
+        if not text and not images and not file_path:
             return
-        if not text and images:
+        if file_path:
+            if text:
+                text = f"{text}\n\n📎 用户发送了文件:\n{file_path}"
+            else:
+                text = f"(用户发送了文件)\n{file_path}"
+        elif not text and images:
             text = "(用户发送了一张图片)"
 
         if chat_type == "group":
@@ -183,6 +198,7 @@ class FeishuBot:
             text_len=len(text),
             text_preview=(" ".join(text.split())[:80]),
             images=len(images),
+            has_file=bool(file_path),
         )
 
         await self._client.reply_message(
@@ -317,12 +333,17 @@ class FeishuBot:
                 await self._send_file_to_peer(peer_id, fp)
             await broadcast_all(make_message(session.id, f"🤖 **飞书回复**:\n{reply}"))
         except Exception as exc:
-            log.exception("feishu.reply_failed")
-            await self._client.reply_message(
-                reply_to_msg_id,
-                "text",
-                json.dumps({"text": reply or f"回复发送失败: {exc}"}, ensure_ascii=False),
-            )
+            error_text = _format_exception_text(exc)
+            log.exception("feishu.reply_failed", error=error_text)
+            with suppress(Exception):
+                await self._client.reply_message(
+                    reply_to_msg_id,
+                    "text",
+                    json.dumps(
+                        {"text": reply or f"回复发送失败: {error_text}"},
+                        ensure_ascii=False,
+                    ),
+                )
 
     async def _handle_command(self, text: str, session: Any) -> str | None:
         """Handle Feishu slash commands for model switching."""
@@ -373,6 +394,18 @@ class FeishuBot:
                 return f"模型不可用: {target}\n发送 /models 查看可选模型。"
 
             await self._session_manager.update_model(session, target)
+            if self._whaleclaw_config is not None:
+                self._whaleclaw_config.agent.model = target
+            try:
+                set_default_agent_model(target)
+            except Exception as exc:
+                err = _format_exception_text(exc)
+                log.warning(
+                    "feishu.default_model_persist_failed",
+                    model=target,
+                    error=err,
+                )
+                return f"已切换模型到: {target}\n默认模型保存失败: {err}"
             return f"已切换模型到: {target}"
 
         return None
@@ -433,6 +466,14 @@ class FeishuBot:
                 seen_paths.add(path)
                 file_paths.append(local)
                 file_replacements.append((match.group(0), f"📎 {name}"))
+
+        for match in _BOLD_PATH_RE.finditer(reply):
+            path = match.group(1)
+            local = Path(path)
+            if local.is_file() and local.suffix.lower() in _FILE_EXTS and path not in seen_paths:
+                seen_paths.add(path)
+                file_paths.append(local)
+                file_replacements.append((match.group(0), f"📎 {local.name}"))
 
         for match in _BARE_PATH_RE.finditer(reply):
             path = match.group(1)
@@ -530,6 +571,37 @@ class FeishuBot:
         if not data:
             return []
         return [ImageContent(mime="image/png", data=base64.b64encode(data).decode("ascii"))]
+
+    async def _extract_file(self, message: dict[str, Any]) -> str | None:
+        """Download incoming Feishu file message and return local absolute path."""
+        msg_id = message.get("message_id", "")
+        content_str = message.get("content", "{}")
+        try:
+            content = json.loads(content_str)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        file_key = str(content.get("file_key", "")).strip()
+        raw_name = str(content.get("file_name", "")).strip()
+        if not file_key:
+            return None
+
+        filename = Path(raw_name).name if raw_name else f"{file_key}.bin"
+        dest = _FEISHU_MEDIA_DIR / f"{msg_id[:8]}_{filename}"
+        _FEISHU_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            data = await self._client.download_resource(msg_id, file_key, resource_type="file")
+        except Exception:
+            log.exception("feishu.file_download_failed", message_id=msg_id, file_key=file_key)
+            return None
+        if not data:
+            return None
+        try:
+            dest.write_bytes(data)
+        except OSError:
+            log.exception("feishu.file_save_failed", path=str(dest))
+            return None
+        return str(dest.resolve())
 
     async def _send_pairing_prompt(
         self, open_id: str, msg_id: str

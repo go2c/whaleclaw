@@ -11,7 +11,10 @@ path regardless of whether the provider supports native ``tools`` API:
 
 import asyncio
 import json
+import os
 import re
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from whaleclaw.agent.context import OnToolCall, OnToolResult
@@ -28,6 +31,7 @@ from whaleclaw.sessions.compressor import ContextCompressor
 from whaleclaw.sessions.context_window import RECENT_PROTECTED, ContextWindow
 from whaleclaw.sessions.manager import Session, SessionManager
 from whaleclaw.sessions.store import SessionStore
+from whaleclaw.skills.parser import Skill, SkillParamItem
 from whaleclaw.tools.base import ToolDefinition, ToolResult
 from whaleclaw.tools.registry import ToolRegistry
 from whaleclaw.types import StreamCallback
@@ -52,15 +56,41 @@ _EXTRA_MEMORY_COMPRESS_TIMEOUT_SECONDS = 8
 _DEFAULT_ASSISTANT_NAME = "WhaleClaw"
 
 _IMG_MD_RE = re.compile(r"!\[([^\]]*)\]\((/[^)]+)\)")
+_EVOMAP_LINE_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.+?)\s*$")
+_OFFICE_PATH_RE = re.compile(r"(/[^\n\"']+\.(?:pptx|docx|xlsx))", re.IGNORECASE)
+_EVOMAP_CHOICE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(?:选|选择)?\s*([ABCabc])\s*$"),
+    re.compile(r"^\s*(?:选|选择)?\s*([123])\s*$"),
+)
 _ASSISTANT_NAME_RESET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"恢复默认名字"),
     re.compile(r"改回\s*whaleclaw", re.IGNORECASE),
     re.compile(r"还是叫\s*whaleclaw", re.IGNORECASE),
 )
 _ASSISTANT_NAME_SET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:以后|从现在起|今后|之后|开始)\s*(?:你|机器人|助手)?\s*(?:就)?(?:叫|改叫|改名叫)\s*([^\s，。！？!?、,]{1,24})"),
+    re.compile(
+        r"(?:以后|从现在起|今后|之后|开始)\s*(?:你|机器人|助手)?\s*(?:就)?(?:叫|改叫|改名叫)\s*([^\s，。！？!?、,]{1,24})"
+    ),
     re.compile(r"(?:把你|你)\s*(?:改名|改名为|名字改成|名字改为)\s*([^\s，。！？!?、,]{1,24})"),
     re.compile(r"^\s*(?:你|助手|机器人)\s*(?:就)?叫\s*([^\s，。！？!?、,]{1,24})\s*$"),
+)
+_USE_CMD_RE = re.compile(r"^\s*/use\s+([^\s]+)\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_USE_CLEAR_IDS = {"clear", "none", "off", "default", "reset"}
+_TASK_DONE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*任务完成\s*$"),
+    re.compile(r"^\s*完成了?\s*$"),
+    re.compile(r"^\s*结束了?\s*$"),
+    re.compile(r"^\s*可以了?\s*$"),
+    re.compile(r"^\s*ok\s*$", re.IGNORECASE),
+)
+_SKILL_SWITCH_CONSENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:同意|可以|确认|允许).{0,8}(?:切换|换).{0,8}(?:技能|skill)?", re.IGNORECASE),
+    re.compile(r"(?:切换|换).{0,8}(?:技能|skill).{0,8}(?:吧|可以|行|好的|ok)", re.IGNORECASE),
+    re.compile(r"(?:换成|改用|切到).{0,24}(?:技能|skill)", re.IGNORECASE),
+)
+_SKILL_ACTIVATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:使用|调用|启动|启用|走|用).{0,24}(?:技能|skill)", re.IGNORECASE),
+    re.compile(r"(?:技能|skill).{0,16}(?:文生图|图生图|处理|执行|联调)", re.IGNORECASE),
 )
 
 _TOOL_HINTS: dict[str, str] = {
@@ -70,6 +100,9 @@ _TOOL_HINTS: dict[str, str] = {
     "file_write": "生成文件",
     "file_read": "读取文件",
     "file_edit": "编辑文件",
+    "ppt_edit": "修改现有PPT",
+    "docx_edit": "修改现有Word",
+    "xlsx_edit": "修改现有Excel",
     "memory_search": "检索长期记忆",
     "memory_add": "写入长期记忆",
     "memory_list": "查看长期记忆",
@@ -94,6 +127,12 @@ _TOOL_POLICY_KEYWORDS: dict[tuple[str, ...], set[str]] = {
         "sessions_send",
     },
     ("桌面", "截图", "截屏", "screen", "screenshot"): {"desktop_capture"},
+    ("改ppt", "修改ppt", "第一页", "第一面", "幻灯片", "slide", "pptx"): {"ppt_edit"},
+    ("改word", "修改word", "docx", "文档", "段落"): {"docx_edit"},
+    ("改excel", "修改excel", "xlsx", "表格", "单元格"): {"xlsx_edit"},
+    ("evomap", "evo map", "进化市场", "协作经验", "方案库"): {"evomap_fetch"},
+    ("赏金", "bounty", "任务认领", "claim task", "认领任务"): {"evomap_bounty"},
+    ("发布经验", "发布到evomap", "publish evomap", "贡献方案"): {"evomap_publish"},
 }
 
 
@@ -143,6 +182,238 @@ def _normalize_for_match(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def _parse_use_command(text: str) -> tuple[list[str], str] | None:
+    m = _USE_CMD_RE.match(text)
+    if not m:
+        return None
+    token = m.group(1).strip().lower()
+    skill_ids = [x.strip() for x in token.split(",") if x.strip()]
+    remainder = m.group(2).strip()
+    return (skill_ids, remainder)
+
+
+def _is_task_done_confirmation(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _TASK_DONE_PATTERNS)
+
+
+def _build_skill_lock_system_message(skill_ids: list[str]) -> Message:
+    joined = ", ".join(skill_ids)
+    return Message(
+        role="system",
+        content=(
+            f"当前会话已锁定技能：{joined}。\n"
+            "执行时仅允许在这些技能范围内规划与调用，不要偏移到无关方案。\n"
+            "若需切换到其它技能，必须先征得用户明确同意。\n"
+            "若用户明确回复“任务完成”，再解除该锁定。"
+        ),
+    )
+
+
+def _looks_like_skill_activation_message(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    if t.lower().startswith("/use "):
+        return True
+    return any(p.search(t) for p in _SKILL_ACTIVATION_PATTERNS)
+
+
+def _is_skill_switch_consent(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _SKILL_SWITCH_CONSENT_PATTERNS)
+
+
+def _normalize_skill_ids(skills: list[Skill]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in skills:
+        sid = s.id.strip().lower()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def _skill_announcement(skill_ids: list[str], previous_skill_ids: list[str]) -> str:
+    joined = "、".join(skill_ids)
+    if not previous_skill_ids:
+        return f"我将使用 {joined} 技能继续完成任务。"
+    if previous_skill_ids != skill_ids:
+        return f"已按你的要求切换为 {joined} 技能，我继续处理。"
+    return f"我会继续使用 {joined} 技能推进当前任务。"
+
+
+def _skill_token_mentioned(token: str, text: str) -> bool:
+    lower = text.lower()
+    msg_norm = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", lower)
+
+    base = token.strip().lower().replace("_", "-")
+    if not base:
+        return False
+
+    candidates: set[str] = {base, base.replace("-", "")}
+    parts = [p for p in base.split("-") if p]
+    if len(parts) >= 2:
+        short = "-".join(parts[:2])
+        candidates.add(short)
+        candidates.add(short.replace("-", ""))
+
+    for token in candidates:
+        if len(token) < 4:
+            continue
+        if token in lower or token in msg_norm:
+            return True
+    return False
+
+
+def _skill_explicitly_mentioned(skill: Skill, text: str) -> bool:
+    return _skill_token_mentioned(skill.id, text) or _skill_token_mentioned(skill.name, text)
+
+
+def _extract_ratio_or_size(text: str) -> str:
+    ratio = re.search(r"\b(\d{1,2}\s*:\s*\d{1,2})\b", text)
+    if ratio:
+        return ratio.group(1).replace(" ", "")
+    size = re.search(r"\b(\d{3,5}\s*x\s*\d{3,5})\b", text, re.IGNORECASE)
+    if size:
+        return size.group(1).replace(" ", "").lower()
+    return ""
+
+
+def _extract_value_by_aliases(text: str, aliases: list[str]) -> str:
+    for alias in aliases:
+        pattern = rf"{re.escape(alias)}\s*(?:是|为|:|：)\s*(.+)$"
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
+
+
+def _has_param_secret_source(param: SkillParamItem) -> bool:
+    for env_name in param.env_vars:
+        val = os.getenv(env_name, "").strip()
+        if val:
+            return True
+    if param.saved_file:
+        p = Path(param.saved_file).expanduser()
+        try:
+            return p.is_file() and bool(p.read_text(encoding="utf-8").strip())
+        except Exception:
+            return False
+    return False
+
+
+def _capture_param_value(
+    param: SkillParamItem,
+    text: str,
+    images: list[ImageContent] | None,
+    previous: object,
+) -> object:
+    ptype = param.type.strip().lower()
+    aliases = [param.key, *param.aliases]
+    if ptype == "images":
+        prev_count = int(previous) if isinstance(previous, int) else 0
+        return max(prev_count, len(images or []))
+    if ptype in {"ratio", "size"}:
+        val = _extract_ratio_or_size(text) or _extract_value_by_aliases(text, aliases)
+        return val or previous
+    if ptype == "api_key":
+        if re.search(r"\bsk-[A-Za-z0-9_-]{12,}\b", text):
+            return "__present__"
+        alias_val = _extract_value_by_aliases(text, aliases)
+        if alias_val and "sk-" in alias_val.lower():
+            return "__present__"
+        if _has_param_secret_source(param):
+            return "__present__"
+        return previous
+    alias_val = _extract_value_by_aliases(text, aliases)
+    if alias_val:
+        return alias_val
+    if ptype == "text":
+        t = text.strip()
+        if t and len(t) >= 6 and not t.startswith("/use ") and "技能" not in t:
+            if any(x in t for x in ("api key", "apikey", "尺寸", "比例")):
+                return previous
+            return t
+    return previous
+
+
+def _param_satisfied(param: SkillParamItem, value: object) -> bool:
+    ptype = param.type.strip().lower()
+    if ptype == "images":
+        count = int(value) if isinstance(value, int) else 0
+        return count >= max(1, int(param.min_count))
+    if value is None:
+        return False
+    return bool(str(value).strip())
+
+
+def _format_param_status(param: SkillParamItem, value: object) -> str:
+    label = param.label or param.key
+    ptype = param.type.strip().lower()
+    if ptype == "images":
+        count = int(value) if isinstance(value, int) else 0
+        need = max(1, int(param.min_count))
+        return f"{label}：已收到 {count} 张（至少 {need} 张）"
+    if _param_satisfied(param, value):
+        if ptype == "api_key":
+            return f"{label}：已就绪"
+        return f"{label}：已收到"
+    return f"{label}：未提供"
+
+
+def _build_skill_param_guard_reply(
+    skill_id: str,
+    params: list[SkillParamItem],
+    state: dict[str, object],
+) -> str:
+    lines = [f"我将使用 {skill_id} 技能继续完成任务。", "", "我先确认参数（缺啥补啥）："]
+    missing_prompts: list[str] = []
+    for idx, p in enumerate(params, start=1):
+        value = state.get(p.key)
+        lines.append(f"{idx}) {_format_param_status(p, value)}")
+        if p.required and not _param_satisfied(p, value):
+            missing_prompts.append(p.prompt.strip() or (p.label or p.key))
+    lines.append("")
+    if missing_prompts:
+        lines.append("请补充：" + "；".join(missing_prompts) + "。")
+    else:
+        lines.append("参数已齐，我现在开始执行。")
+    return "\n".join(lines)
+
+
+def _update_guard_state(
+    params: list[SkillParamItem],
+    state: dict[str, object],
+    message: str,
+    images: list[ImageContent] | None,
+) -> tuple[dict[str, object], bool]:
+    new_state = dict(state)
+    missing_required = False
+    for p in params:
+        prev = new_state.get(p.key)
+        captured = _capture_param_value(p, message, images, prev)
+        new_state[p.key] = captured
+        if p.required and not _param_satisfied(p, captured):
+            missing_required = True
+    return new_state, missing_required
+
+
+def _guarded_skills(skills: list[Skill]) -> list[Skill]:
+    out: list[Skill] = []
+    for s in skills:
+        if s.param_guard is None or not s.param_guard.enabled or not s.param_guard.params:
+            continue
+        out.append(s)
+    return out
+
+
 def _score_tool_relevance(user_message: str, tool: ToolDefinition) -> int:
     query = _normalize_for_match(user_message)
     if not query:
@@ -159,11 +430,14 @@ def _score_tool_relevance(user_message: str, tool: ToolDefinition) -> int:
         if kw and kw in corpus:
             score += 1
 
-    if (
-        ("图片" in query or "photo" in query or "image" in query)
-        and tool.name in {"browser", "desktop_capture"}
-    ):
+    if ("图片" in query or "photo" in query or "image" in query) and tool.name in {
+        "browser",
+        "desktop_capture",
+    }:
         score += 2
+
+    if ("evomap" in query or "evo map" in query) and tool.name.startswith("evomap_"):
+        score += 4
 
     return score
 
@@ -198,6 +472,36 @@ def _select_native_tool_names(registry: ToolRegistry, user_message: str) -> set[
             break
 
     return selected
+
+
+def _is_evomap_enabled(config: WhaleclawConfig) -> bool:
+    plugins_cfg = getattr(config, "plugins", {})
+    if not isinstance(plugins_cfg, dict):
+        return False
+    evomap_cfg = plugins_cfg.get("evomap", {})
+    if not isinstance(evomap_cfg, dict):
+        return False
+    return bool(evomap_cfg.get("enabled", False))
+
+
+def _is_evomap_status_question(text: str) -> bool:
+    q = text.lower().strip()
+    if not q:
+        return False
+    if "evomap" not in q and "evo map" not in q:
+        return False
+    status_hints = (
+        "开着",
+        "开启",
+        "启用",
+        "打开",
+        "关闭",
+        "状态",
+        "on",
+        "off",
+        "enabled",
+    )
+    return any(h in q for h in status_hints)
 
 
 def _build_memory_system_message(recalled: str) -> Message:
@@ -262,12 +566,7 @@ async def _compress_external_memory_with_llm(
         "请将输入经验压缩到给定 token 上限内，保留可执行做法与约束。"
         "禁止新增事实。输出纯文本。"
     )
-    user_prompt = (
-        f"目标上限约 {max_tokens} tokens。\n"
-        "输入如下：\n"
-        f"{text}\n\n"
-        "请输出压缩结果。"
-    )
+    user_prompt = f"目标上限约 {max_tokens} tokens。\n输入如下：\n{text}\n\n请输出压缩结果。"
     try:
         resp = await router.chat(
             model_id,
@@ -296,11 +595,667 @@ def _is_creation_task_message(text: str) -> bool:
     if not low:
         return False
     keys = (
-        "ppt", "幻灯片", "演示文稿", "文档", "报告", "方案", "写", "生成", "制作", "整理",
-        "设计", "润色", "总结", "改写", "脚本", "代码", "html", "页面", "海报", "计划",
-        "create", "generate", "draft", "design", "write", "build", "compose",
+        "ppt",
+        "幻灯片",
+        "演示文稿",
+        "文档",
+        "报告",
+        "方案",
+        "写",
+        "生成",
+        "制作",
+        "整理",
+        "设计",
+        "润色",
+        "总结",
+        "改写",
+        "脚本",
+        "代码",
+        "html",
+        "页面",
+        "海报",
+        "计划",
+        "create",
+        "generate",
+        "draft",
+        "design",
+        "write",
+        "build",
+        "compose",
     )
     return any(k in low for k in keys)
+
+
+async def _llm_judge_task_phase(
+    router: "ModelRouter",
+    model_id: str,
+    *,
+    session: Session | None,
+    message: str,
+) -> str:
+    """Use the main model to classify task phase: NEW_TASK or EDITING."""
+    system = Message(
+        role="system",
+        content=(
+            "你是任务阶段分类器，只输出一个标签：NEW_TASK 或 EDITING。\n"
+            "NEW_TASK=开始一个全新主要任务/新主题/新产物。\n"
+            "EDITING=在已有任务上修改/补充/继续/讨论细节。\n"
+            "只输出标签，不要解释。"
+        ),
+    )
+    context: list[Message] = [system]
+    if session is not None and session.messages:
+        recent: list[Message] = []
+        for msg in session.messages[-6:]:
+            if msg.role not in {"user", "assistant"}:
+                continue
+            recent.append(
+                Message(role=msg.role, content=_preview_text(msg.content or "", limit=400))
+            )
+        context.extend(recent)
+    context.append(
+        Message(role="user", content=f"当前用户消息：{_preview_text(message, limit=600)}")
+    )
+    try:
+        resp = await router.chat(model_id, context, tools=None, on_stream=None)
+    except Exception:
+        return "EDITING"
+    raw = (resp.content or "").strip().upper()
+    if "NEW_TASK" in raw:
+        return "NEW_TASK"
+    if "EDITING" in raw:
+        return "EDITING"
+    return "EDITING"
+
+
+def _is_tasky_message_for_evomap(text: str) -> bool:
+    low = _normalize_for_match(text)
+    if not low:
+        return False
+    keys = (
+        "做",
+        "制作",
+        "生成",
+        "写",
+        "整理",
+        "设计",
+        "计划",
+        "PPT",
+        "ppt",
+        "幻灯片",
+        "演示文稿",
+        "报告",
+        "文档",
+        "方案",
+        "简历",
+        "海报",
+        "脚本",
+        "代码",
+        "页面",
+        "表格",
+        "excel",
+        "xlsx",
+        "word",
+        "docx",
+        "evomap",
+        "evo map",
+        "方案库",
+        "协作经验",
+    )
+    return any(k in low for k in keys)
+
+
+def _infer_task_kind(text: str) -> str:
+    low = text.lower()
+    if any(k in low for k in ("ppt", "幻灯片", "演示文稿", "slides", "deck")):
+        return "ppt"
+    if any(k in low for k in ("网页", "网站", "html", "web", "landing page", "前端")):
+        return "web"
+    if any(k in low for k in ("检索", "汇总", "调研", "信息", "collect", "research", "summarize")):
+        return "research"
+    return "general"
+
+
+def _extract_topic_terms(text: str, *, limit: int = 2) -> list[str]:
+    low = _normalize_for_match(text)
+    stop = {
+        "做",
+        "制作",
+        "生成",
+        "创建",
+        "一个",
+        "关于",
+        "给我",
+        "帮我",
+        "ppt",
+        "网页",
+        "网站",
+        "html",
+        "web",
+        "方案",
+        "检索",
+        "汇总",
+        "信息",
+        "today",
+        "todays",
+        "today's",
+    }
+    terms: list[str] = []
+    for t in re.findall(r"[\w\u4e00-\u9fff]{2,8}", low):
+        if t in stop:
+            continue
+        if t not in terms:
+            terms.append(t)
+        if len(terms) >= max(1, limit):
+            break
+    return terms
+
+
+def _recommended_evomap_signals(text: str) -> str:
+    kind = _infer_task_kind(text)
+    if kind == "ppt":
+        base = [
+            "ppt",
+            "presentation",
+            "slides",
+            "storyline",
+            "deck structure",
+            "visual layout",
+            "python-pptx",
+        ]
+    elif kind == "web":
+        base = [
+            "web page",
+            "html",
+            "css",
+            "frontend",
+            "responsive layout",
+            "content structure",
+        ]
+    elif kind == "research":
+        base = [
+            "information retrieval",
+            "multi-source collection",
+            "source validation",
+            "structured summary",
+            "fact-check",
+        ]
+    else:
+        base = [
+            "workflow",
+            "execution plan",
+            "quality checklist",
+        ]
+    return ",".join(base + _extract_topic_terms(text, limit=2))
+
+
+def _extra_memory_has_evomap_hint(extra_memory: str) -> bool:
+    text = extra_memory.strip()
+    if not text:
+        return False
+    return "EvoMap 协作经验候选" in text
+
+
+def _is_no_match_evomap_output(result: ToolResult) -> bool:
+    if not result.success:
+        return False
+    out = (result.output or "").strip()
+    if not out:
+        return True
+    hints = ("未找到匹配方案", "暂无可用任务", "无已认领任务")
+    return any(h in out for h in hints)
+
+
+def _build_evomap_first_system_message() -> Message:
+    return Message(
+        role="system",
+        content=(
+            "执行策略：本轮是流程任务，优先复用 EvoMap 成功经验。\n"
+            "1) 必须先调用 evomap_fetch 获取经验候选；\n"
+            "2) 只有当 evomap_fetch 无命中或失败时，才可调用 browser；\n"
+            "3) 若 evomap_fetch 命中，请先按命中方案执行。"
+        ),
+    )
+
+
+def _extract_evomap_choice_index(text: str, options_count: int) -> int | None:
+    if options_count <= 0:
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    for p in _EVOMAP_CHOICE_PATTERNS:
+        m = p.match(raw)
+        if not m:
+            continue
+        token = m.group(1).strip().upper()
+        if token in {"A", "B", "C"}:
+            idx = ord(token) - ord("A")
+        elif token.isdigit():
+            idx = int(token) - 1
+        else:
+            return None
+        if 0 <= idx < options_count:
+            return idx
+    return None
+
+
+def _parse_evomap_fetch_candidates(output: str) -> list[tuple[str, str]]:
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    items: list[tuple[str, str]] = []
+    for ln in lines:
+        m = _EVOMAP_LINE_RE.match(ln)
+        if not m:
+            continue
+        aid = m.group(1).strip()
+        summary = m.group(2).strip()
+        if not aid and not summary:
+            continue
+        items.append((aid, summary))
+    return items
+
+
+def _pick_top_evomap_candidates(
+    user_message: str,
+    candidates: list[tuple[str, str]],
+    *,
+    limit: int = 3,
+) -> list[tuple[str, str]]:
+    query = _normalize_for_match(user_message)
+    terms = {t for t in re.findall(r"[\w\u4e00-\u9fff]{2,}", query)}
+
+    scored: list[tuple[int, tuple[str, str]]] = []
+    for item in candidates:
+        aid, summary = item
+        hay = _normalize_for_match(f"{aid} {summary}")
+        score = 0
+        for t in terms:
+            if t in hay:
+                score += 1
+        scored.append((score, item))
+
+    scored.sort(key=lambda x: (-x[0], x[1][0]))
+    return [item for _score, item in scored[: max(1, limit)]]
+
+
+def _build_evomap_choice_prompt(candidates: list[tuple[str, str]]) -> str:
+    labels = ("A", "B", "C")
+    lines = ["EvoMap 命中了多条可用方案，请先选一个我再执行："]
+    for idx, item in enumerate(candidates[:3]):
+        aid, summary = item
+        label = labels[idx]
+        lines.append(f"{label}. {aid} — {summary}")
+    lines.append("请直接回复：选A / 选B / 选C")
+    return "\n".join(lines)
+
+
+def _is_low_value_bash_probe(tc: ToolCall) -> bool:
+    if tc.name != "bash":
+        return False
+    raw = str(tc.arguments.get("command", "")).strip().lower()
+    if not raw:
+        return False
+    probe_hints = ("ls ", "ls\t", "stat ", "test -f ", "test -e ", "echo ")
+    risky_hints = (
+        "python ",
+        "python3 ",
+        "cp ",
+        "mv ",
+        "rm ",
+        "sed ",
+        "awk ",
+        "perl ",
+        "open ",
+        "soffice ",
+    )
+    if any(h in raw for h in risky_hints):
+        return False
+    return any(h in raw for h in probe_hints)
+
+
+def _is_office_path_probe_command(command: str) -> bool:
+    low = command.strip().lower()
+    if not low:
+        return False
+    probe_tools = (
+        "find ",
+        "mdfind ",
+        "locate ",
+        "fd ",
+        "ls ",
+        "stat ",
+        "test -f ",
+        "test -e ",
+    )
+    office_terms = (
+        "ppt",
+        "pptx",
+        "docx",
+        "xlsx",
+        "word",
+        "excel",
+        "幻灯片",
+        "文档",
+        "表格",
+        ".pptx",
+        ".docx",
+        ".xlsx",
+    )
+    return any(t in low for t in probe_tools) and any(t in low for t in office_terms)
+
+
+def _looks_like_ppt_generation_script(text: str) -> bool:
+    low = text.lower()
+    if not low:
+        return False
+    hints = (
+        "from pptx import presentation",
+        "pptx import presentation",
+        "presentation()",
+        ".save(",
+        ".pptx",
+    )
+    return any(h in low for h in hints)
+
+
+def _looks_like_ppt_generation_command(command: str) -> bool:
+    low = command.lower()
+    if not low:
+        return False
+    if "python" not in low and "python3" not in low:
+        return False
+    return ".pptx" in low or "pptx" in low or "presentation(" in low
+
+
+def _normalize_bash_command_signature(command: str) -> str:
+    """Normalize bash command text for repeated-failure detection."""
+    return re.sub(r"\s+", " ", command.strip())
+
+
+def _capture_latest_pptx(
+    metadata: dict[str, object],
+    *,
+    roots: tuple[Path, ...],
+    window_seconds: int = 180,
+) -> bool:
+    now = time.time()
+    candidates: list[Path] = []
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+        except Exception:
+            continue
+        try:
+            for p in root.rglob("*.pptx"):
+                try:
+                    mtime = p.stat().st_mtime
+                except Exception:
+                    continue
+                if now - mtime <= window_seconds:
+                    candidates.append(p)
+        except Exception:
+            continue
+    if not candidates:
+        return False
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    newest = candidates[0]
+    return _remember_office_path(metadata, str(newest))
+
+
+def _extract_office_paths(text: str) -> list[str]:
+    if not text:
+        return []
+    paths: list[str] = []
+    for m in _OFFICE_PATH_RE.finditer(text):
+        p = m.group(1).strip()
+        if p:
+            paths.append(p)
+    return paths
+
+
+def _remember_office_path(metadata: dict[str, object], path: str) -> bool:
+    p = path.strip()
+    if not p:
+        return False
+    suffix = Path(p).suffix.lower()
+    key_map = {
+        ".pptx": "last_pptx_path",
+        ".docx": "last_docx_path",
+        ".xlsx": "last_xlsx_path",
+    }
+    key = key_map.get(suffix)
+    if key is None:
+        return False
+    if metadata.get(key) == p:
+        return False
+    metadata[key] = p
+    return True
+
+
+def _is_office_edit_request(text: str) -> bool:
+    q = text.lower()
+    if not q:
+        return False
+    edit_hints = ("改", "修改", "调整", "第一页", "第二页", "单元格", "段落")
+    doc_hints = ("ppt", "pptx", "word", "docx", "excel", "xlsx", "幻灯片", "文档", "表格")
+    return any(h in q for h in edit_hints) and any(h in q for h in doc_hints)
+
+
+def _is_image_generation_request(text: str) -> bool:
+    q = text.lower()
+    if not q:
+        return False
+    generation_hints = (
+        "生图",
+        "出图",
+        "文生图",
+        "图生图",
+        "图像生成",
+        "以图生图",
+        "根据这张图生成",
+        "image generation",
+        "generate image",
+        "text-to-image",
+        "image-to-image",
+        "txt2img",
+        "img2img",
+    )
+    return any(h in q for h in generation_hints)
+
+
+def _build_image_generation_system_message() -> Message:
+    return Message(
+        role="system",
+        content=(
+            "检测到这是生图任务（文生图/图生图）。\n"
+            "执行约束：\n"
+            "1) 允许最多 2 次轻量探测（如检查环境变量/关键配置）；\n"
+            "2) 之后必须立即写最小脚本到 /tmp 并执行一次真实请求；\n"
+            "3) 禁止连续使用 ls/stat/test/echo 循环探测；\n"
+            "4) 输出必须包含请求命令、HTTP 状态码、返回摘要与图片绝对路径（或明确失败原因）。"
+        ),
+    )
+
+
+def _is_complex_office_request(text: str) -> bool:
+    q = text.lower()
+    if not q:
+        return False
+    complex_hints = (
+        "插图",
+        "配图",
+        "图片",
+        "海报",
+        "背景图",
+        "图标",
+        "视频",
+        "音频",
+        "音乐",
+        "动效",
+        "动画",
+        "高端",
+        "商务风",
+        "版式",
+        "排版",
+        "重排",
+        "模板",
+        "封面设计",
+        "视觉风格",
+    )
+    return any(h in q for h in complex_hints)
+
+
+def _mentions_specific_dark_bar_target(text: str) -> bool:
+    q = text.lower()
+    if not q:
+        return False
+    target_hints = ("黑色横条", "黑条", "黑色条", "深色横条", "黑色块", "黑底条")
+    return any(h in q for h in target_hints)
+
+
+def _has_any_last_office_path(metadata: dict[str, object]) -> bool:
+    for key in ("last_pptx_path", "last_docx_path", "last_xlsx_path"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _is_followup_edit_message(text: str) -> bool:
+    q = text.lower()
+    if not q:
+        return False
+    hints = ("改一下", "修改", "调整", "第一页", "第一面", "第二页", "单元格", "段落")
+    return any(h in q for h in hints)
+
+
+def _get_default_office_edit_path(
+    tool_name: str,
+    metadata: dict[str, object],
+) -> str | None:
+    key_map = {
+        "ppt_edit": "last_pptx_path",
+        "docx_edit": "last_docx_path",
+        "xlsx_edit": "last_xlsx_path",
+    }
+    key = key_map.get(tool_name)
+    if key is None:
+        return None
+    value = metadata.get(key)
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    return path or None
+
+
+def _build_office_edit_hint_system_message(metadata: dict[str, object]) -> Message | None:
+    hints: list[str] = []
+    for label, key in (
+        ("PPT", "last_pptx_path"),
+        ("Word", "last_docx_path"),
+        ("Excel", "last_xlsx_path"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            hints.append(f"- {label}: {value.strip()}")
+    if not hints:
+        return None
+    return Message(
+        role="system",
+        content=(
+            "检测到用户在要求修改已有 Office 文件。\n"
+            "若只是文案小改，请优先使用对应编辑工具（ppt_edit/docx_edit/xlsx_edit）；"
+            "若涉及插图/音视频/风格升级/复杂排版，"
+            "请先输出简短执行计划，"
+            "再组合 browser、bash、file_write 与编辑工具执行。\n"
+            "必须优先修改用户明确点名的对象（页码/元素/文案），"
+            "不要改成泛化动作（例如只改整页背景）。\n"
+            "不要把复杂请求机械降级为“只能改文字”。\n"
+            "并优先使用以下最近文件路径，不要先用 bash 反复探测：\n" + "\n".join(hints)
+        ),
+    )
+
+
+def _build_office_path_block_message(metadata: dict[str, object]) -> str:
+    hints: list[str] = []
+    for label, key in (
+        ("PPT", "last_pptx_path"),
+        ("Word", "last_docx_path"),
+        ("Excel", "last_xlsx_path"),
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            hints.append(f"{label}: {value.strip()}")
+    if not hints:
+        return "检测到这是 Office 修改请求，请直接使用已有文件路径，不要用 bash 查找。"
+    return (
+        "检测到已有 Office 文件路径，禁止用 bash 探测/查找。\n"
+        "请直接使用以下路径：\n" + "\n".join(f"- {h}" for h in hints)
+    )
+
+
+def _build_complex_office_plan_system_message() -> Message:
+    return Message(
+        role="system",
+        content=(
+            "检测到这是复杂 Office 修改任务（可能包含插图/音视频/风格升级/版式调整）。\n"
+            "执行要求：\n"
+            "1) 先给用户一句话计划（将做哪些步骤）；\n"
+            "2) 再按步骤调用工具，不要只调用一次 ppt_edit 就结束；\n"
+            "3) 如需媒体素材，优先先获取素材文件路径，再写入文档。"
+        ),
+    )
+
+
+def _append_office_system_hints(
+    system_messages: list[Message],
+    session: Session | None,
+    llm_message: str,
+) -> None:
+    if session is None:
+        return
+    is_office_request = _is_office_edit_request(llm_message) or (
+        _is_followup_edit_message(llm_message) and _has_any_last_office_path(session.metadata)
+    )
+    if not is_office_request:
+        return
+    office_hint = _build_office_edit_hint_system_message(session.metadata)
+    if office_hint is not None:
+        system_messages.append(office_hint)
+    if _is_complex_office_request(llm_message):
+        system_messages.append(_build_complex_office_plan_system_message())
+
+
+def _force_include_office_edit_tools(
+    selected: set[str],
+    *,
+    available: set[str],
+    session: Session | None,
+    llm_message: str,
+) -> set[str]:
+    """Keep office edit tools available for follow-up edits with known file paths."""
+    if session is None:
+        return selected
+    if not (
+        _is_office_edit_request(llm_message)
+        or (_is_followup_edit_message(llm_message) and _has_any_last_office_path(session.metadata))
+    ):
+        return selected
+
+    key_by_tool = {
+        "ppt_edit": "last_pptx_path",
+        "docx_edit": "last_docx_path",
+        "xlsx_edit": "last_xlsx_path",
+    }
+    expanded = set(selected)
+    for tool_name, meta_key in key_by_tool.items():
+        if tool_name not in available:
+            continue
+        path_value = session.metadata.get(meta_key)
+        if isinstance(path_value, str) and path_value.strip():
+            expanded.add(tool_name)
+    return expanded
 
 
 def _schedule_memory_organizer_task(
@@ -423,15 +1378,21 @@ def create_default_registry(
     from whaleclaw.tools.bash import BashTool
     from whaleclaw.tools.browser import BrowserTool
     from whaleclaw.tools.desktop_capture import DesktopCaptureTool
+    from whaleclaw.tools.docx_edit import DocxEditTool
     from whaleclaw.tools.file_edit import FileEditTool
     from whaleclaw.tools.file_read import FileReadTool
     from whaleclaw.tools.file_write import FileWriteTool
+    from whaleclaw.tools.ppt_edit import PptEditTool
+    from whaleclaw.tools.xlsx_edit import XlsxEditTool
 
     registry = ToolRegistry()
     registry.register(BashTool())
     registry.register(FileReadTool())
     registry.register(FileWriteTool())
     registry.register(FileEditTool())
+    registry.register(PptEditTool())
+    registry.register(DocxEditTool())
+    registry.register(XlsxEditTool())
     registry.register(BrowserTool())
     registry.register(DesktopCaptureTool())
 
@@ -499,11 +1460,13 @@ def _parse_fallback_tool_calls(text: str) -> list[ToolCall]:
         raw_name = d.get("tool", "")
         raw_args = d.get("arguments", {})
         if isinstance(raw_name, str) and raw_name and isinstance(raw_args, dict):
-            calls.append(ToolCall(
-                id=f"fallback_{len(calls)}",
-                name=raw_name,
-                arguments=raw_args,
-            ))
+            calls.append(
+                ToolCall(
+                    id=f"fallback_{len(calls)}",
+                    name=raw_name,
+                    arguments=raw_args,
+                )
+            )
 
     return calls
 
@@ -536,8 +1499,11 @@ async def _persist_message(
     """Persist a message to session store (best-effort, never raises)."""
     try:
         await manager.add_message(
-            session, role, content,
-            tool_call_id=tool_call_id, tool_name=tool_name,
+            session,
+            role,
+            content,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
         )
     except Exception as exc:
         log.debug("agent.persist_failed", error=str(exc))
@@ -546,6 +1512,13 @@ async def _persist_message(
 async def _execute_tool(
     registry: ToolRegistry,
     tc: ToolCall,
+    *,
+    evomap_enabled: bool,
+    browser_allowed: bool,
+    office_block_bash_probe: bool,
+    office_block_message: str,
+    office_edit_only: bool,
+    office_edit_path: str,
     on_tool_call: OnToolCall | None,
     on_tool_result: OnToolResult | None,
 ) -> tuple[str, ToolResult]:
@@ -554,20 +1527,88 @@ async def _execute_tool(
         await on_tool_call(tc.name, tc.arguments)
 
     import time
+
     t0 = time.monotonic()
 
-    tool = registry.get(tc.name)
-    if tool is None:
+    if tc.name == "browser" and not browser_allowed:
         result = ToolResult(
             success=False,
             output="",
-            error=f"未知工具: {tc.name}",
+            error="请先执行 evomap_fetch；若无命中会自动切换到 browser",
+        )
+    elif tc.name == "file_write" and office_edit_only:
+        content = str(tc.arguments.get("content", ""))
+        if _looks_like_ppt_generation_script(content):
+            result = ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "检测到这是修改已有PPT的请求，禁止重新生成新PPT。\n"
+                    f"请直接使用 ppt_edit 修改：{office_edit_path}"
+                ),
+            )
+        else:
+            tool = registry.get(tc.name)
+            if tool is None:
+                result = ToolResult(
+                    success=False,
+                    output="",
+                    error=f"未知工具: {tc.name}",
+                )
+            else:
+                try:
+                    result = await tool.execute(**tc.arguments)
+                except Exception as exc:
+                    result = ToolResult(success=False, output="", error=str(exc))
+    elif tc.name == "bash" and office_block_bash_probe:
+        raw_command = str(tc.arguments.get("command", ""))
+        if _is_office_path_probe_command(raw_command):
+            result = ToolResult(
+                success=False,
+                output="",
+                error=office_block_message,
+            )
+        elif office_edit_only and _looks_like_ppt_generation_command(raw_command):
+            result = ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "检测到这是修改已有PPT的请求，禁止重新生成新PPT。\n"
+                    f"请直接使用 ppt_edit 修改：{office_edit_path}"
+                ),
+            )
+        else:
+            tool = registry.get(tc.name)
+            if tool is None:
+                result = ToolResult(
+                    success=False,
+                    output="",
+                    error=f"未知工具: {tc.name}",
+                )
+            else:
+                try:
+                    result = await tool.execute(**tc.arguments)
+                except Exception as exc:
+                    result = ToolResult(success=False, output="", error=str(exc))
+    elif tc.name.startswith("evomap_") and not evomap_enabled:
+        result = ToolResult(
+            success=False,
+            output="",
+            error="EvoMap 已关闭，请先在设置中开启",
         )
     else:
-        try:
-            result = await tool.execute(**tc.arguments)
-        except Exception as exc:
-            result = ToolResult(success=False, output="", error=str(exc))
+        tool = registry.get(tc.name)
+        if tool is None:
+            result = ToolResult(
+                success=False,
+                output="",
+                error=f"未知工具: {tc.name}",
+            )
+        else:
+            try:
+                result = await tool.execute(**tc.arguments)
+            except Exception as exc:
+                result = ToolResult(success=False, output="", error=str(exc))
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     log.info(
@@ -652,8 +1693,22 @@ def _first_non_empty_arg(arguments: dict[str, object], names: tuple[str, ...]) -
 def _looks_like_image_request(text: str) -> bool:
     lower = text.lower()
     keywords = (
-        "图", "图片", "照片", "近照", "头像", "搜图", "找图", "壁纸", "海报", "背景", "写真",
-        "image", "photo", "picture", "wallpaper", "poster",
+        "图",
+        "图片",
+        "照片",
+        "近照",
+        "头像",
+        "搜图",
+        "找图",
+        "壁纸",
+        "海报",
+        "背景",
+        "写真",
+        "image",
+        "photo",
+        "picture",
+        "wallpaper",
+        "poster",
     )
     return any(k.lower() in lower for k in keywords)
 
@@ -788,6 +1843,193 @@ async def run_agent(
     if registry is None:
         registry = create_default_registry()
 
+    if _is_evomap_status_question(message):
+        enabled = _is_evomap_enabled(config)
+        switch_text = "已开启" if enabled else "已关闭"
+        return (
+            f"当前 EvoMap 开关{switch_text}（本地配置状态）。"
+            "如果你要我检查远端服务连通性，我可以再单独做一次连通检测。"
+        )
+
+    metadata_dirty = False
+
+    llm_message = message
+    locked_skill_ids: list[str] = []
+    previous_locked_skill_ids: list[str] = []
+    lock_waiting_done = False
+    skill_announce_pending = False
+    if session is not None:
+        raw_locked = session.metadata.get("locked_skill_ids")
+        if isinstance(raw_locked, list):
+            locked_skill_ids = [
+                str(x).strip().lower()
+                for x in raw_locked
+                if isinstance(x, str) and str(x).strip()
+            ]
+        elif isinstance(session.metadata.get("forced_skill_id"), str):
+            legacy_forced = str(session.metadata.get("forced_skill_id", "")).strip().lower()
+            if legacy_forced:
+                locked_skill_ids = [legacy_forced]
+                session.metadata["locked_skill_ids"] = locked_skill_ids
+                session.metadata.pop("forced_skill_id", None)
+                metadata_dirty = True
+        raw_waiting = session.metadata.get("skill_lock_waiting_done")
+        lock_waiting_done = bool(raw_waiting)
+        skill_announce_pending = bool(session.metadata.get("skill_lock_announce_pending"))
+    previous_locked_skill_ids = list(locked_skill_ids)
+
+    use_cmd = _parse_use_command(message)
+    if use_cmd is not None:
+        use_skill_ids, remainder = use_cmd
+        if len(use_skill_ids) == 1 and use_skill_ids[0] in _USE_CLEAR_IDS:
+            locked_skill_ids = []
+            lock_waiting_done = False
+            skill_announce_pending = False
+            if session is not None:
+                session.metadata.pop("locked_skill_ids", None)
+                session.metadata.pop("skill_lock_waiting_done", None)
+                session.metadata.pop("skill_lock_announce_pending", None)
+                session.metadata.pop("skill_param_state", None)
+                metadata_dirty = True
+            if remainder:
+                llm_message = remainder
+        else:
+            locked_skill_ids = use_skill_ids
+            lock_waiting_done = False
+            skill_announce_pending = True
+            if session is not None:
+                session.metadata["locked_skill_ids"] = locked_skill_ids
+                session.metadata["skill_lock_waiting_done"] = False
+                session.metadata["skill_lock_announce_pending"] = True
+                metadata_dirty = True
+            llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
+    elif lock_waiting_done and _is_task_done_confirmation(message):
+        locked_skill_ids = []
+        lock_waiting_done = False
+        if session is not None:
+            session.metadata.pop("locked_skill_ids", None)
+            session.metadata.pop("skill_lock_waiting_done", None)
+            session.metadata.pop("skill_lock_announce_pending", None)
+            session.metadata.pop("skill_param_state", None)
+            if session_manager is not None:
+                await session_manager._store.update_session_field(  # noqa: SLF001
+                    session.id,
+                    metadata=session.metadata,
+                )
+        return "已确认任务完成，已解除本轮技能锁定。"
+    elif lock_waiting_done:
+        lock_waiting_done = False
+        if session is not None:
+            session.metadata["skill_lock_waiting_done"] = False
+            metadata_dirty = True
+
+    routed_skills = _assembler.route_skills(llm_message)
+    routed_skill_ids = _normalize_skill_ids(routed_skills)
+
+    # 会话默认“粘住已命中技能”：一旦命中即锁定，直到用户确认任务完成。
+    if not locked_skill_ids and routed_skill_ids:
+        locked_skill_ids = routed_skill_ids
+        lock_waiting_done = False
+        skill_announce_pending = True
+        if session is not None:
+            session.metadata["locked_skill_ids"] = locked_skill_ids
+            session.metadata["skill_lock_waiting_done"] = False
+            session.metadata["skill_lock_announce_pending"] = True
+            metadata_dirty = True
+
+    # 已锁定时禁止自动漂移到其它技能；只有用户明确同意切换才允许切。
+    if locked_skill_ids and routed_skill_ids and routed_skill_ids != locked_skill_ids:
+        if _is_skill_switch_consent(message):
+            locked_skill_ids = routed_skill_ids
+            lock_waiting_done = False
+            skill_announce_pending = True
+            if session is not None:
+                session.metadata["locked_skill_ids"] = locked_skill_ids
+                session.metadata["skill_lock_waiting_done"] = False
+                session.metadata["skill_lock_announce_pending"] = True
+                metadata_dirty = True
+        else:
+            locked = ", ".join(locked_skill_ids)
+            target = ", ".join(routed_skill_ids)
+            return (
+                f"当前任务仍锁定在技能：{locked}。\n"
+                f"检测到你可能想切到：{target}。\n"
+                "请先确认：回复“同意切换技能”，我再切换继续。"
+            )
+
+    # 通用参数采集守卫：技能声明了 param_guard 时，缺参先问清单，不执行工具。
+    if locked_skill_ids and not lock_waiting_done and session is not None:
+        locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)
+        guards = _guarded_skills(locked_skills)
+        if guards:
+            state_map_raw = session.metadata.get("skill_param_state")
+            state_map = state_map_raw.copy() if isinstance(state_map_raw, dict) else {}
+            missing_any = False
+            for skill in guards:
+                guard = skill.param_guard
+                if guard is None:
+                    continue
+                skill_state_raw = state_map.get(skill.id, {})
+                skill_state = skill_state_raw.copy() if isinstance(skill_state_raw, dict) else {}
+                updated, missing = _update_guard_state(
+                    guard.params, skill_state, llm_message, images
+                )
+                state_map[skill.id] = updated
+                missing_any = missing_any or missing
+            session.metadata["skill_param_state"] = state_map
+            metadata_dirty = True
+            if missing_any:
+                if session_manager is not None:
+                    await session_manager._store.update_session_field(  # noqa: SLF001
+                        session.id,
+                        metadata=session.metadata,
+                    )
+                blocks = [
+                    _build_skill_param_guard_reply(
+                        s.id, s.param_guard.params, state_map.get(s.id, {})
+                    )
+                    for s in guards
+                    if s.param_guard is not None
+                ]
+                return "\n\n".join(blocks)
+
+    if session is not None:
+        pending_raw = session.metadata.get("evomap_pending_choices")
+        if isinstance(pending_raw, dict):
+            options_raw = pending_raw.get("options")
+            options: list[dict[str, str]] = []
+            if isinstance(options_raw, list):
+                for item in options_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    aid = str(item.get("asset_id", "")).strip()
+                    summary = str(item.get("summary", "")).strip()
+                    if not summary and not aid:
+                        continue
+                    options.append({"asset_id": aid, "summary": summary})
+            choice_idx = _extract_evomap_choice_index(message, len(options))
+            if choice_idx is not None and options:
+                selected = options[choice_idx]
+                selected_hint = (
+                    f"【EvoMap 已选方案】\n- {selected['asset_id']}: {selected['summary']}"
+                )
+                extra_memory = (
+                    f"{selected_hint}\n{extra_memory}" if extra_memory.strip() else selected_hint
+                )
+                origin_message = str(pending_raw.get("origin_message", "")).strip()
+                if origin_message:
+                    llm_message = (
+                        f"{origin_message}\n"
+                        f"用户已选择方案：{selected['summary']}。\n"
+                        "请按该方案执行。"
+                    )
+                session.metadata.pop("evomap_pending_choices", None)
+                if session_manager is not None:
+                    await session_manager._store.update_session_field(  # noqa: SLF001
+                        session.id,
+                        metadata=session.metadata,
+                    )
+
     assistant_name = _DEFAULT_ASSISTANT_NAME
     if memory_manager is not None:
         try:
@@ -836,11 +2078,55 @@ async def run_agent(
 
     native_tools = router.supports_native_tools(model_id)
     selected_tool_names: set[str] | None = None
+    evomap_enabled = _is_evomap_enabled(config)
+    evomap_phase = "editing"
+    if session is not None:
+        raw_phase = session.metadata.get("evomap_phase")
+        if isinstance(raw_phase, str) and raw_phase.strip():
+            evomap_phase = raw_phase.strip().lower()
+    if _is_tasky_message_for_evomap(llm_message):
+        # First-turn task requests are treated as NEW_TASK directly to avoid
+        # an extra classifier LLM call before normal planning/execution.
+        if session is None or not session.messages:
+            phase = "NEW_TASK"
+        else:
+            phase = await _llm_judge_task_phase(
+                router,
+                model_id,
+                session=session,
+                message=llm_message,
+            )
+    else:
+        phase = "EDITING"
+    if session is not None and session_manager is not None:
+        desired = "start" if phase == "NEW_TASK" else "editing"
+        if desired != evomap_phase:
+            session.metadata["evomap_phase"] = desired
+            await session_manager._store.update_session_field(  # noqa: SLF001
+                session.id,
+                metadata=session.metadata,
+            )
+    evomap_allowed_for_turn = evomap_enabled and phase == "NEW_TASK"
+    available_tool_names = {d.name for d in registry.list_tools()}
+    evo_first_mode = evomap_allowed_for_turn and "evomap_fetch" in available_tool_names
+    evomap_hint_hit = _extra_memory_has_evomap_hint(extra_memory)
+
     if native_tools:
-        selected_tool_names = _select_native_tool_names(registry, message)
+        selected_tool_names = _select_native_tool_names(registry, llm_message)
+        selected_tool_names = _force_include_office_edit_tools(
+            selected_tool_names,
+            available=available_tool_names,
+            session=session,
+            llm_message=llm_message,
+        )
+        if not evomap_allowed_for_turn:
+            selected_tool_names = {
+                name for name in selected_tool_names if not name.startswith("evomap_")
+            }
+        elif evo_first_mode:
+            selected_tool_names.add("evomap_fetch")
         tool_schemas = registry.to_llm_schemas(include_names=selected_tool_names)
-        all_tool_names = {d.name for d in registry.list_tools()}
-        dropped_names = sorted(all_tool_names - selected_tool_names)
+        dropped_names = sorted(available_tool_names - selected_tool_names)
         log.info(
             "agent.tools_selected",
             session_id=session_id,
@@ -851,11 +2137,34 @@ async def run_agent(
         )
     else:
         tool_schemas = None
-    fallback_text = "" if native_tools else registry.to_prompt_fallback()
+    fallback_names: set[str] | None = None
+    if not native_tools and not evomap_allowed_for_turn:
+        fallback_names = {d.name for d in registry.list_tools() if not d.name.startswith("evomap_")}
+    fallback_text = (
+        "" if native_tools else registry.to_prompt_fallback(include_names=fallback_names)
+    )
 
     system_messages = _assembler.build(
-        config, message, tool_fallback_text=fallback_text, assistant_name=assistant_name
+        config,
+        llm_message,
+        tool_fallback_text=fallback_text,
+        assistant_name=assistant_name,
+        forced_skill_ids=locked_skill_ids or None,
     )
+    if locked_skill_ids:
+        system_messages.append(_build_skill_lock_system_message(locked_skill_ids))
+    _append_office_system_hints(system_messages, session, llm_message)
+    image_api_probe_guard_enabled = _is_image_generation_request(llm_message)
+    if image_api_probe_guard_enabled:
+        system_messages.append(_build_image_generation_system_message())
+    if evo_first_mode:
+        system_messages.append(_build_evomap_first_system_message())
+        if session is not None and session_manager is not None:
+            session.metadata["evomap_phase"] = "editing"
+            await session_manager._store.update_session_field(  # noqa: SLF001
+                session.id,
+                metadata=session.metadata,
+            )
     import time as _time
 
     _t_pre_llm_start = _time.monotonic()
@@ -881,8 +2190,8 @@ async def run_agent(
         except Exception as exc:
             log.debug("agent.memory_style_load_failed", error=str(exc), session_id=session_id)
         try:
-            should_recall, include_raw = memory_manager.recall_policy(message)
-            if not should_recall and _is_creation_task_message(message):
+            should_recall, include_raw = memory_manager.recall_policy(llm_message)
+            if not should_recall and _is_creation_task_message(llm_message):
                 should_recall = True
                 include_raw = False
             recalled = ""
@@ -895,7 +2204,7 @@ async def run_agent(
                 raw_block = ""
                 if include_raw:
                     raw_block = await memory_manager.recall(
-                        message,
+                        llm_message,
                         max_tokens=memory_cfg.recall_raw_max_tokens,
                         limit=memory_cfg.recall_limit,
                         include_profile=False,
@@ -949,7 +2258,7 @@ async def run_agent(
     conversation: list[Message] = []
     if session:
         conversation = list(session.messages)
-    conversation.append(Message(role="user", content=message, images=images))
+    conversation.append(Message(role="user", content=llm_message, images=images))
     conversation_message_count = len(conversation)
 
     if (
@@ -981,7 +2290,7 @@ async def run_agent(
     )
 
     model_short: str = model_id.split("/", 1)[-1] if "/" in model_id else model_id
-    trigger_preview = trigger_text_preview.strip() or _preview_text(message)
+    trigger_preview = trigger_text_preview.strip() or _preview_text(llm_message)
 
     log.info(
         "agent.run",
@@ -999,6 +2308,7 @@ async def run_agent(
     total_output = 0
     announced_plan = False
     db_summaries = []
+    pending_office_paths: list[str] = []
     if session_store and summarizer_cfg.enabled:
         try:
             db_summaries = await session_store.get_summaries(session_id)
@@ -1012,18 +2322,51 @@ async def run_agent(
     invalid_tool_rounds = 0
     empty_reply_rounds = 0
     browser_fail_streak = 0
+    bash_fail_streak = 0
+    same_failed_bash_streak = 0
+    last_failed_bash_signature = ""
     blocked_tools: set[str] = set()
+    office_block_bash_probe = False
+    office_loop_guard_enabled = False
+    office_block_message = ""
+    office_edit_only = False
+    office_edit_path = ""
+    if session is not None:
+        is_office_request = _is_office_edit_request(llm_message) or (
+            _is_followup_edit_message(llm_message) and _has_any_last_office_path(session.metadata)
+        )
+        office_loop_guard_enabled = is_office_request
+        if is_office_request and _has_any_last_office_path(session.metadata):
+            office_block_bash_probe = True
+            office_block_message = _build_office_path_block_message(session.metadata)
+            last_pptx = session.metadata.get("last_pptx_path")
+            if isinstance(last_pptx, str) and last_pptx.strip():
+                office_edit_only = True
+                office_edit_path = last_pptx.strip()
+    low_value_bash_probe_streak = 0
+    max_tool_rounds = max(1, int(agent_cfg.max_tool_rounds))
 
     round_idx = -1
+    successful_tool_calls = 0
+    browser_locked_by_evomap = evo_first_mode and not evomap_hint_hit
     while total_output < _MAX_OUTPUT_TOKENS:
         round_idx += 1
+        if round_idx >= max_tool_rounds:
+            final_text_parts.append(
+                f"工具调用轮次已达上限（{max_tool_rounds} 轮），"
+                "为避免长时间卡住已暂停。请让我改用更直接的编辑方式继续。"
+            )
+            break
         if db_summaries:
             all_messages = _context_window.trim_with_summaries(
-                [*system_messages, *conversation], model_short, db_summaries,
+                [*system_messages, *conversation],
+                model_short,
+                db_summaries,
             )
         else:
             all_messages = _context_window.trim(
-                [*system_messages, *conversation], model_short,
+                [*system_messages, *conversation],
+                model_short,
             )
 
         _llm_t0 = _time.monotonic()
@@ -1088,9 +2431,7 @@ async def run_agent(
                 repaired_calls.append(repaired)
             tool_calls = repaired_calls
             blocked_reasons = [
-                f"{tc.name} 已熔断，禁止继续调用"
-                for tc in tool_calls
-                if tc.name in blocked_tools
+                f"{tc.name} 已熔断，禁止继续调用" for tc in tool_calls if tc.name in blocked_tools
             ]
             if blocked_reasons:
                 invalid_tool_rounds += 1
@@ -1106,14 +2447,12 @@ async def run_agent(
                         content=(
                             "[系统提示] 该工具已被熔断："
                             f"{'; '.join(blocked_reasons)}。"
-                            "请改用其他工具（例如 bash）完成任务。"
+                            "请改用其他可用工具完成任务。"
                         ),
                     )
                 )
                 if invalid_tool_rounds >= 2:
-                    final_text_parts.append(
-                        "工具调用连续无效，已停止自动重试。请明确参数后重试。"
-                    )
+                    final_text_parts.append("工具调用连续无效，已停止自动重试。请明确参数后重试。")
                     break
                 continue
             invalid_reasons = [
@@ -1177,9 +2516,7 @@ async def run_agent(
                     )
                 )
                 continue
-            final_text_parts.append(
-                "我这边没收到模型有效回复。请再发一次需求，我会继续处理。"
-            )
+            final_text_parts.append("我这边没收到模型有效回复。请再发一次需求，我会继续处理。")
             break
 
         if not tool_calls:
@@ -1190,7 +2527,7 @@ async def run_agent(
             has_text = content.strip() if content else ""
             if not has_text:
                 tool_names = [tc.name for tc in tool_calls]
-                plan = _make_plan_hint(tool_names, message)
+                plan = _make_plan_hint(tool_names, llm_message)
                 await on_stream(plan)
 
         log.info(
@@ -1216,16 +2553,96 @@ async def run_agent(
 
         if session_manager and session:
             await _persist_message(session_manager, session, "assistant", assistant_persist)
+            if assistant_content:
+                for office_path in _extract_office_paths(assistant_content):
+                    if _remember_office_path(session.metadata, office_path):
+                        metadata_dirty = True
 
         for _tname in ("reminder", "cron"):
             _tool = registry.get(_tname)
             if _tool is not None and hasattr(_tool, "current_session_id"):
                 _tool.current_session_id = session_id  # type: ignore[union-attr]
 
+        stop_for_evomap_choice = False
+        stop_for_evomap_failure = False
+        stop_for_probe_loop = False
         for tc in tool_calls:
+            if tc.name == "file_write" and isinstance(tc.arguments.get("content"), str):
+                for office_path in _extract_office_paths(str(tc.arguments.get("content", ""))):
+                    if office_path not in pending_office_paths:
+                        pending_office_paths.append(office_path)
+            if session is not None and tc.name in {"ppt_edit", "docx_edit", "xlsx_edit"}:
+                has_path = isinstance(tc.arguments.get("path"), str) and bool(
+                    str(tc.arguments.get("path", "")).strip()
+                )
+                if not has_path:
+                    default_path = _get_default_office_edit_path(tc.name, session.metadata)
+                    if default_path:
+                        fixed_args = dict(tc.arguments)
+                        fixed_args["path"] = default_path
+                        tc = ToolCall(id=tc.id, name=tc.name, arguments=fixed_args)
+                        log.info(
+                            "agent.office_path_autofill",
+                            tool=tc.name,
+                            path=default_path,
+                            session_id=session_id,
+                        )
+
             tc_id, result = await _execute_tool(
-                registry, tc, on_tool_call, on_tool_result
+                registry,
+                tc,
+                evomap_enabled=evomap_allowed_for_turn,
+                browser_allowed=not browser_locked_by_evomap,
+                office_block_bash_probe=office_block_bash_probe,
+                office_block_message=office_block_message,
+                office_edit_only=office_edit_only,
+                office_edit_path=office_edit_path,
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
             )
+            if (
+                tc.name == "ppt_edit"
+                and result.success
+                and _mentions_specific_dark_bar_target(llm_message)
+            ):
+                action = str(tc.arguments.get("action", "replace_text")).strip().lower()
+                if action == "apply_business_style" and "重设深色条 0 处" in (result.output or ""):
+                    result = ToolResult(
+                        success=False,
+                        output=result.output,
+                        error="未命中用户指定对象：黑色横条仍未被替换，请继续定向修改该元素",
+                    )
+                elif action == "set_background":
+                    result = ToolResult(
+                        success=False,
+                        output=result.output,
+                        error="用户要求修改黑色横条，仅设置背景不算完成，请继续定向修改该横条",
+                    )
+            if tc.name == "evomap_fetch":
+                if not result.success:
+                    final_text_parts.append(
+                        "EvoMap 方案检索失败，降级执行。\n"
+                        "information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503\n"
+                        "如果你同意我继续，请回复：同意。"
+                    )
+                    stop_for_evomap_failure = True
+                    break
+                candidates = _parse_evomap_fetch_candidates(result.output or "")
+                if len(candidates) > 3 and session is not None:
+                    top3 = _pick_top_evomap_candidates(llm_message, candidates, limit=3)
+                    session.metadata["evomap_pending_choices"] = {
+                        "origin_message": llm_message,
+                        "options": [{"asset_id": aid, "summary": summary} for aid, summary in top3],
+                    }
+                    if session_manager is not None:
+                        await session_manager._store.update_session_field(  # noqa: SLF001
+                            session.id,
+                            metadata=session.metadata,
+                        )
+                    final_text_parts.append(_build_evomap_choice_prompt(top3))
+                    stop_for_evomap_choice = True
+                    break
+                browser_locked_by_evomap = not _is_no_match_evomap_output(result)
             if tc.name == "browser":
                 if result.success:
                     browser_fail_streak = 0
@@ -1249,12 +2666,111 @@ async def run_agent(
                                 ),
                             )
                         )
+            if tc.name == "bash":
+                if result.success:
+                    bash_fail_streak = 0
+                    same_failed_bash_streak = 0
+                    last_failed_bash_signature = ""
+                else:
+                    bash_fail_streak += 1
+                    failed_sig = _normalize_bash_command_signature(
+                        str(tc.arguments.get("command", ""))
+                    )
+                    if failed_sig and failed_sig == last_failed_bash_signature:
+                        same_failed_bash_streak += 1
+                    elif failed_sig:
+                        same_failed_bash_streak = 1
+                        last_failed_bash_signature = failed_sig
+                    else:
+                        same_failed_bash_streak = 0
+                        last_failed_bash_signature = ""
+                    if same_failed_bash_streak >= 3 and "bash" not in blocked_tools:
+                        blocked_tools.add("bash")
+                        log.warning(
+                            "agent.tool_circuit_open",
+                            tool="bash",
+                            fail_streak=bash_fail_streak,
+                            same_failed_streak=same_failed_bash_streak,
+                            command_signature=last_failed_bash_signature[:200],
+                            session_id=session_id,
+                        )
+                        conversation.append(
+                            Message(
+                                role="user",
+                                content=(
+                                    "[系统降级] 同一 bash 命令模板已连续失败 3 次，"
+                                    "已自动熔断并切换策略。"
+                                    "后续请不要再调用 bash。"
+                                    "请改用结构化编辑工具（ppt_edit/docx_edit/xlsx_edit）"
+                                    "或文件工具（file_read/file_write/file_edit）继续。"
+                                ),
+                            )
+                        )
+            if (
+                office_loop_guard_enabled or image_api_probe_guard_enabled
+            ) and _is_low_value_bash_probe(tc):
+                low_value_bash_probe_streak += 1
+            else:
+                low_value_bash_probe_streak = 0
+            if image_api_probe_guard_enabled and low_value_bash_probe_streak >= 2:
+                final_text_parts.append(
+                    "检测到连续探测环境但未进入实测，已停止循环以避免卡住。"
+                    "下一步我将直接执行最小生图脚本（/tmp）并返回状态码与图片路径。"
+                )
+                stop_for_probe_loop = True
+                break
+            if office_loop_guard_enabled and low_value_bash_probe_streak >= 3:
+                final_text_parts.append(
+                    "检测到连续的文件探测命令（如 ls/stat/test）且无实质修改，"
+                    "已停止循环以避免卡住。"
+                    "我将改用文档局部编辑工具继续，请直接告诉我要改哪一页/哪一段/哪个单元格。"
+                )
+                stop_for_probe_loop = True
+                break
 
             if result.success and result.output:
+                successful_tool_calls += 1
                 for path_match in re.finditer(
                     r"(/[^\s]+\.(?:jpg|jpeg|png|gif|webp))", result.output
                 ):
                     real_image_paths.append(path_match.group(1))
+            elif result.success:
+                successful_tool_calls += 1
+                if session is not None:
+                    for office_path in _extract_office_paths(result.output):
+                        if _remember_office_path(session.metadata, office_path):
+                            metadata_dirty = True
+            if session is not None and pending_office_paths:
+                for office_path in list(pending_office_paths):
+                    if Path(office_path).expanduser().exists():
+                        if _remember_office_path(session.metadata, office_path):
+                            metadata_dirty = True
+                        pending_office_paths.remove(office_path)
+            if (
+                session is not None
+                and tc.name == "bash"
+                and result.success
+                and _capture_latest_pptx(
+                    session.metadata,
+                    roots=(
+                        Path("/tmp"),
+                        Path("/private/tmp"),
+                        Path.home() / "Downloads",
+                        Path.home() / ".whaleclaw" / "workspace",
+                    ),
+                    window_seconds=240,
+                )
+            ):
+                metadata_dirty = True
+
+            if session is not None and tc.name in {"ppt_edit", "docx_edit", "xlsx_edit"}:
+                arg_path = tc.arguments.get("path")
+                if (
+                    isinstance(arg_path, str)
+                    and arg_path.strip()
+                    and _remember_office_path(session.metadata, arg_path.strip())
+                ):
+                    metadata_dirty = True
 
             tool_output = _format_tool_output(result)
 
@@ -1267,19 +2783,19 @@ async def run_agent(
             else:
                 tool_msg = Message(
                     role="user",
-                    content=(
-                        f"[工具 {tc.name} 执行结果]\n"
-                        f"{tool_output}"
-                    ),
+                    content=(f"[工具 {tc.name} 执行结果]\n{tool_output}"),
                 )
             conversation.append(tool_msg)
 
             if session_manager and session:
                 snippet = tool_output[:500] if len(tool_output) > 500 else tool_output
                 await _persist_message(
-                    session_manager, session, "tool",
+                    session_manager,
+                    session,
+                    "tool",
                     f"[{tc.name}] {snippet}",
-                    tool_call_id=tc_id, tool_name=tc.name,
+                    tool_call_id=tc_id,
+                    tool_name=tc.name,
                 )
 
             log.debug(
@@ -1288,6 +2804,19 @@ async def run_agent(
                 success=result.success,
                 output_len=len(result.output),
             )
+
+        if stop_for_evomap_choice:
+            break
+        if stop_for_evomap_failure:
+            break
+        if stop_for_probe_loop:
+            break
+        if metadata_dirty and session is not None and session_manager is not None:
+            await session_manager._store.update_session_field(  # noqa: SLF001
+                session.id,
+                metadata=session.metadata,
+            )
+            metadata_dirty = False
 
         sig_parts = []
         for tc in tool_calls:
@@ -1305,13 +2834,15 @@ async def run_agent(
                     rounds=round_idx + 1,
                     repeated_tool=tool_calls[0].name,
                 )
-                conversation.append(Message(
-                    role="user",
-                    content=(
-                        "[系统提示] 检测到你在重复执行相同操作且未取得进展。"
-                        "请换一种方式解决问题，或直接向用户说明当前遇到的困难。"
-                    ),
-                ))
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 检测到你在重复执行相同操作且未取得进展。"
+                            "请换一种方式解决问题，或直接向用户说明当前遇到的困难。"
+                        ),
+                    )
+                )
 
         final_text_parts.clear()
     else:
@@ -1324,6 +2855,36 @@ async def run_agent(
 
     final_text = "".join(final_text_parts)
     final_text = _fix_image_paths(final_text, real_image_paths)
+
+    if locked_skill_ids and skill_announce_pending:
+        announce = _skill_announcement(locked_skill_ids, previous_locked_skill_ids)
+        final_text = f"{announce}\n\n{final_text}" if final_text else announce
+        skill_announce_pending = False
+        if session is not None:
+            session.metadata["skill_lock_announce_pending"] = False
+            metadata_dirty = True
+
+    # Locked skill sessions require explicit user confirmation to release.
+    if (
+        locked_skill_ids
+        and session is not None
+        and successful_tool_calls > 0
+        and not lock_waiting_done
+    ):
+        session.metadata["locked_skill_ids"] = locked_skill_ids
+        session.metadata["skill_lock_waiting_done"] = True
+        metadata_dirty = True
+        confirm_tip = (
+            "如果本轮任务已完成，请回复“任务完成”以解除技能锁定；"
+            "若需继续修改，请直接继续说需求。"
+        )
+        final_text = f"{final_text}\n\n{confirm_tip}" if final_text else confirm_tip
+
+    if metadata_dirty and session is not None and session_manager is not None:
+        await session_manager._store.update_session_field(  # noqa: SLF001
+            session.id,
+            metadata=session.metadata,
+        )
 
     # Background: generate L0/L1 summaries for older messages if needed
     if (

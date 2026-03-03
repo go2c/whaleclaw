@@ -16,6 +16,9 @@ from whaleclaw.types import ConfigError
 
 PLUGIN_MANIFEST = "whaleclaw_plugin.json"
 ENTRY_GROUP = "whaleclaw.plugins"
+_BUILTIN_PLUGINS: tuple[tuple[str, str], ...] = (
+    ("evomap", "whaleclaw.plugins.evomap.plugin:plugin"),
+)
 
 
 class PluginMeta(BaseModel):
@@ -63,6 +66,22 @@ class PluginLoader:
                 seen_ids.add(meta.id)
                 result.append(meta)
 
+        for plugin_id, entry in _BUILTIN_PLUGINS:
+            if plugin_id in seen_ids:
+                continue
+            result.append(
+                PluginMeta(
+                    id=plugin_id,
+                    name=plugin_id,
+                    description="",
+                    version="0.0.0",
+                    author="",
+                    entry=entry,
+                    path="",
+                )
+            )
+            seen_ids.add(plugin_id)
+
         self._discovered = {m.id: m for m in result}
         return result
 
@@ -78,9 +97,7 @@ class PluginLoader:
                         meta = self._parse_manifest(manifest, sub)
                         metas.append(meta)
                     except (json.JSONDecodeError, KeyError) as exc:
-                        raise ConfigError(
-                            f"插件清单解析失败: {manifest} — {exc}"
-                        ) from exc
+                        raise ConfigError(f"插件清单解析失败: {manifest} — {exc}") from exc
         return metas
 
     def _parse_manifest(self, path: Path, plugin_dir: Path) -> PluginMeta:
@@ -142,9 +159,7 @@ class PluginLoader:
             mod_part, attr = entry.split(":", 1)
         else:
             mod_part, attr = entry, "plugin"
-        file_path = path / (
-            mod_part if mod_part.endswith(".py") else f"{mod_part}.py"
-        )
+        file_path = path / (mod_part if mod_part.endswith(".py") else f"{mod_part}.py")
 
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))

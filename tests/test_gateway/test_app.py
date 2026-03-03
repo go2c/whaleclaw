@@ -134,3 +134,135 @@ async def test_memory_style_rest_api(tmp_path, monkeypatch) -> None:  # noqa: AN
         resp = await client.delete("/api/memory/style")
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_clawhub_config_and_search_rest_api(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(app_mod, "CONFIG_FILE", tmp_path / "whaleclaw.json")
+    monkeypatch.setattr(app_mod, "WORKSPACE_DIR", tmp_path / "workspace")
+
+    monkeypatch.setattr(app_mod, "is_clawhub_cli_available", lambda: True)
+    monkeypatch.setattr(
+        app_mod,
+        "clawhub_search_skills",
+        lambda **_: [
+            {
+                "slug": "excel-helper",
+                "name": "Excel Helper",
+                "summary": "表格处理",
+                "version": "1.0.0",
+            }
+        ],
+    )
+
+    config = WhaleclawConfig()
+    test_app = create_app(config)
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        test_app.router.lifespan_context(test_app),
+    ):
+        resp = await client.post(
+            "/api/plugins/clawhub",
+            json={"enabled": True, "registry_url": "https://clawhub.ai"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert resp.json()["enabled"] is True
+
+        resp = await client.get("/api/clawhub/search", params={"q": "excel"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["items"]) == 1
+        assert data["items"][0]["slug"] == "excel-helper"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_install_cli_rest_api(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(
+        app_mod,
+        "install_clawhub_cli",
+        lambda: {"path": "/tmp/clawhub", "version": "0.7.0", "output": "ok"},
+    )
+
+    config = WhaleclawConfig()
+    test_app = create_app(config)
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        test_app.router.lifespan_context(test_app),
+    ):
+        resp = await client.post("/api/clawhub/install-cli")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["cli_available"] is True
+        assert data["cli_version"] == "0.7.0"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_auth_status_rest_api(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(
+        app_mod,
+        "get_clawhub_auth_status",
+        lambda **_: {"logged_in": True, "message": "ok"},
+    )
+
+    config = WhaleclawConfig()
+    test_app = create_app(config)
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        test_app.router.lifespan_context(test_app),
+    ):
+        resp = await client.get("/api/clawhub/auth-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["logged_in"] is True
+        assert data["message"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_login_rest_api(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(
+        app_mod,
+        "login_clawhub_cli",
+        lambda **_: {"ok": True, "message": "已登录", "output": "ok"},
+    )
+
+    config = WhaleclawConfig()
+    test_app = create_app(config)
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        test_app.router.lifespan_context(test_app),
+    ):
+        resp = await client.post("/api/clawhub/login")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["message"] == "已登录"

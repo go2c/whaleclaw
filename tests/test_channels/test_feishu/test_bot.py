@@ -146,6 +146,34 @@ def test_prepare_reply_payload_extracts_mp4_bare_path(tmp_path: Path) -> None:
     assert files == [video]
 
 
+def test_prepare_reply_payload_extracts_chinese_pptx_bare_path(tmp_path: Path) -> None:
+    pptx = tmp_path / "贵州2日游.pptx"
+    pptx.write_bytes(b"pptx")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"PPT 文件在这里: {pptx}"
+    )
+
+    assert "📎 贵州2日游.pptx" in text
+    assert images == []
+    assert files == [pptx]
+
+
+def test_prepare_reply_payload_extracts_bold_pptx_path(tmp_path: Path) -> None:
+    pptx = tmp_path / "沙特两日游.pptx"
+    pptx.write_bytes(b"pptx")
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+
+    text, images, files = bot._prepare_reply_payload(  # noqa: SLF001
+        f"PPT 文件路径：\n- **{pptx}**"
+    )
+
+    assert "📎 沙特两日游.pptx" in text
+    assert images == []
+    assert files == [pptx]
+
+
 @pytest.mark.asyncio
 async def test_handle_image_message_passes_images_to_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
@@ -203,7 +231,7 @@ async def test_model_command_lists_configured_models() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_command_switch_by_index() -> None:
+async def test_model_command_switch_by_index(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
     cfg = WhaleclawConfig()
     cfg.models.qwen.api_key = "test-key"
@@ -211,6 +239,12 @@ async def test_model_command_switch_by_index() -> None:
         ProviderModelEntry(id="qwen3.5-plus", verified=True),
         ProviderModelEntry(id="qwen3-max", verified=True),
     ]
+    persisted: list[str] = []
+
+    def _fake_persist(model: str) -> None:
+        persisted.append(model)
+
+    monkeypatch.setattr("whaleclaw.channels.feishu.bot.set_default_agent_model", _fake_persist)
     sm = _StubSessionManager()
     bot._whaleclaw_config = cfg  # noqa: SLF001
     bot._session_manager = sm  # noqa: SLF001
@@ -221,3 +255,5 @@ async def test_model_command_switch_by_index() -> None:
     assert out == "已切换模型到: qwen/qwen3-max"
     assert session.model == "qwen/qwen3-max"
     assert sm.updated_to == "qwen/qwen3-max"
+    assert cfg.agent.model == "qwen/qwen3-max"
+    assert persisted == ["qwen/qwen3-max"]

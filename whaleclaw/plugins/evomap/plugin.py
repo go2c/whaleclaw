@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -194,6 +195,7 @@ class EvoMapPlugin(WhaleclawPlugin):
         self._fetcher: AssetFetcher | None = None
         self._bounty: BountyManager | None = None
         self._cfg: EvoMapConfig | None = None
+        self._startup_task: asyncio.Task[None] | None = None
 
     @property
     def id(self) -> str:
@@ -279,11 +281,27 @@ class EvoMapPlugin(WhaleclawPlugin):
     async def on_start(self) -> None:
         if not self._client or not self._fetcher:
             return
-        try:
-            await self._client.hello()
-            await self._fetcher.fetch_promoted()
-        except Exception:
-            pass
+        if self._startup_task and not self._startup_task.done():
+            return
+
+        async def _warmup() -> None:
+            try:
+                await self._client.hello()
+                await self._fetcher.fetch_promoted()
+            except Exception:
+                pass
+
+        self._startup_task = asyncio.create_task(_warmup(), name="evomap-startup-warmup")
+
+    async def on_stop(self) -> None:
+        if self._startup_task and not self._startup_task.done():
+            self._startup_task.cancel()
+            try:
+                await self._startup_task
+            except asyncio.CancelledError:
+                pass
+        if self._client:
+            await self._client.close()
 
 
 def plugin() -> EvoMapPlugin:

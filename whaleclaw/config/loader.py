@@ -105,6 +105,33 @@ def get_config() -> WhaleclawConfig:
     return _config
 
 
+def set_default_agent_model(model: str, *, config_path: Path | None = None) -> None:
+    """Persist ``agent.model`` into the user config file."""
+    model_id = model.strip()
+    if not model_id:
+        raise ConfigError("默认模型不能为空")
+
+    user_cfg = config_path or CONFIG_FILE
+    user_cfg.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_cfg: dict[str, object] = _load_json(user_cfg) if user_cfg.exists() else {}
+
+    agent_cfg = raw_cfg.get("agent")
+    if agent_cfg is None:
+        agent_node: dict[str, object] = {}
+        raw_cfg["agent"] = agent_node
+    elif isinstance(agent_cfg, dict):
+        agent_node = agent_cfg
+    else:
+        raise ConfigError("配置文件格式错误: agent 必须是对象")
+
+    agent_node["model"] = model_id
+    user_cfg.write_text(
+        json.dumps(raw_cfg, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def reset_config() -> None:
     """Reset global config (mainly for testing)."""
     global _config  # noqa: PLW0603

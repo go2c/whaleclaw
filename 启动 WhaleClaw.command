@@ -5,6 +5,9 @@
 cd "$(dirname "$0")"
 
 PYTHON="./python/bin/python3.12"
+PROJECT_META_FILE=".whaleclaw.project.json"
+DEFAULT_WHALECLAW_HOME="$HOME/.whaleclaw"
+WHALECLAW_HOME_DIR="$DEFAULT_WHALECLAW_HOME"
 
 # 自动检测本地代理（用于访问海外 API）
 if [ -z "$https_proxy" ]; then
@@ -25,6 +28,24 @@ if [ ! -f "$PYTHON" ]; then
     exit 1
 fi
 
+# 读取当前项目绑定的数据根目录（若存在）
+if [ -f "$PROJECT_META_FILE" ]; then
+    bound_home=$("$PYTHON" -c "
+import json, pathlib
+p = pathlib.Path('$PROJECT_META_FILE')
+try:
+    data = json.loads(p.read_text(encoding='utf-8'))
+except Exception:
+    data = {}
+home = data.get('whaleclaw_home') if isinstance(data, dict) else ''
+print(home or '')
+" 2>/dev/null)
+    if [ -n "$bound_home" ]; then
+        WHALECLAW_HOME_DIR="$bound_home"
+    fi
+fi
+export WHALECLAW_HOME="$WHALECLAW_HOME_DIR"
+
 # 安装依赖（首次运行）
 if ! "$PYTHON" -c "import whaleclaw" 2>/dev/null; then
     echo ""
@@ -35,8 +56,9 @@ fi
 
 # 读取端口和绑定地址（从配置文件）
 eval $("$PYTHON" -c "
-import json, pathlib
-p = pathlib.Path.home() / '.whaleclaw/whaleclaw.json'
+import json, pathlib, os
+home = os.environ.get('WHALECLAW_HOME', str(pathlib.Path.home() / '.whaleclaw'))
+p = pathlib.Path(home).expanduser() / 'whaleclaw.json'
 port, bind = 18666, '127.0.0.1'
 if p.exists():
     cfg = json.loads(p.read_text())
@@ -65,12 +87,23 @@ echo ""
 echo "  🌐 WebChat:  http://${BIND}:${PORT}"
 echo "  📡 API:      http://${BIND}:${PORT}/api/status"
 echo "  🔌 WS:       ws://${BIND}:${PORT}/ws"
+echo "  🗂️  根目录:   ${WHALECLAW_HOME}"
 echo ""
 echo "  按 Ctrl+C 停止服务"
 echo "  ─────────────────────────────────"
 echo ""
 
-# 2 秒后自动打开浏览器
-(sleep 2 && open "http://${BIND}:${PORT}") &
+# 等待服务真正就绪后再自动打开浏览器（避免刚启动时出现 connection refused）
+(
+    for _ in $(seq 1 120); do
+        # 注意：/api/status 可能返回 401/403，-f 会导致 curl 失败
+        if curl -sS "http://${BIND}:${PORT}/api/status" >/dev/null 2>&1; then
+            sleep 2
+            open "http://${BIND}:${PORT}"
+            exit 0
+        fi
+        sleep 0.5
+    done
+) &
 
 exec "$PYTHON" -m whaleclaw gateway run

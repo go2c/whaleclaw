@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-WHALECLAW_HOME = Path.home() / ".whaleclaw"
+
+def _resolve_home() -> Path:
+    raw = os.environ.get("WHALECLAW_HOME", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.home() / ".whaleclaw"
+
+
+WHALECLAW_HOME = _resolve_home()
 CONFIG_FILE = WHALECLAW_HOME / "whaleclaw.json"
 CREDENTIALS_DIR = WHALECLAW_HOME / "credentials"
 SESSIONS_DIR = WHALECLAW_HOME / "sessions"

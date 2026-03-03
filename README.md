@@ -10,12 +10,14 @@ WhaleClaw 是一个运行在本地的 AI Agent 框架，支持 WebChat 与飞书
 
 ## 核心功能
 
-- 多模型路由：支持 Anthropic、OpenAI、DeepSeek、Qwen、GLM、Gemini 等。
-- 多渠道接入：WebChat、飞书（持续扩展）。
-- 工具体系：bash、文件读写编辑、浏览器、会话工具、技能工具等。
-- 会话管理：持久化消息、上下文窗口裁剪、会话级 token 统计。
-- 长期记忆：自动捕获、检索召回、LLM 组织、全局风格沉淀。
-- 可观测性：结构化日志与可追踪的调用链。
+- **多模型路由**：支持 Anthropic、OpenAI、DeepSeek、Qwen、GLM、Gemini、MiniMax 等。
+- **多渠道接入**：WebChat、飞书（含 WebSocket 与 OAuth 能力，持续扩展）。
+- **工具体系**：bash、文件读写编辑、浏览器、桌面截图（macOS）、会话工具、技能工具等。
+- **会话管理**：持久化消息、按轮分组的智能上下文压缩（L2/L1/L0）、会话级 token 统计。
+- **长期记忆**：自动捕获、检索召回、LLM 组织、全局风格（style_directive）沉淀，支持 Web 端查看/编辑。
+- **插件与协作**：EvoMap 插件（资产发布/拉取/赏金），Bridge 将协作建议注入 Agent 记忆。
+- **ClawHub 技能市场**：通过 ClawHub CLI 对接技能注册表（默认 [clawhub.ai](https://clawhub.ai)），支持搜索、一键安装技能，以及将本地已安装技能发布到 ClawHub；WebChat 技能页提供「ClawHub」标签（启用/安装 CLI/登录/搜索/安装/发布）。
+- **可观测性**：结构化日志与可追踪的调用链。
 
 ## 架构概览
 
@@ -86,6 +88,25 @@ WhaleClaw 不是对 OpenClaw 的否定，而是针对“长期运行成本与本
 
 再次感谢 OpenClaw 社区提供的优秀基础与启发。
 
+## 近期更新摘要
+
+基于近期代码变更，主要新增与增强如下：
+
+| 领域 | 更新内容 |
+|------|----------|
+| **会话压缩** | 按轮分组的 L2/L1/L0 分层压缩（`group_compressor`），DB 缓存、后台批处理与 prewarm，主链路低延迟、压缩异步补齐。 |
+| **长期记忆** | 全局风格 `style_directive` 的 get/set/clear，`/api/memory/style` 接口，WebChat 设置页可查看与编辑全局风格。 |
+| **工具** | 新增 **桌面截图**（`desktop_capture`）：macOS 截屏，支持唤醒屏幕、延迟与自定义文件名。 |
+| **EvoMap 插件** | **Bridge**：将 EvoMap 钩子建议转为紧凑记忆提示块，供 Agent 注入「协作经验候选」；fetcher/plugin 增强。 |
+| **ClawHub** | 技能市场集成：ClawHub CLI（安装/登录/登出）、可配置注册表地址、搜索技能、一键安装、将已安装技能发布到 ClawHub；WebChat 技能面板提供 ClawHub 标签页完整操作（`/api/plugins/clawhub`、`/api/clawhub/*`）。 |
+| **飞书** | WebSocket 与 OAuth 支持，Bot 与 client 行为增强。 |
+| **Agent / Gateway** | Prompt 分层与预算、loop 中风格注入与空回复重试；Gateway 路由与 WS 处理更新。 |
+| **其他** | 配置 schema、日志工具、会话 store/context_window、多模型 provider 与对应测试（含 `test_utils`）的修复与补充。 |
+
+桌面端安装包（仅供参考，以仓库 Release 为准）：Windows [夸克](https://pan.quark.cn/s/9f5bcd0d854e) \| macOS [夸克](https://pan.quark.cn/s/27b9b18c7125)。
+
+---
+
 注：飞书机器人权限，直接复制粘贴即可
 {
   "scopes": {
@@ -107,6 +128,5 @@ WhaleClaw 不是对 OpenClaw 的否定，而是针对“长期运行成本与本
   }
 }
 
-
 翘脚党请直接下载一键包使用：
-链接：https://pan.quark.cn/s/acdffa9adc21 内含windos和MAC的！！！
+链接：https://pan.quark.cn/s/acdffa9adc21 内含 Windows 和 Mac 版。

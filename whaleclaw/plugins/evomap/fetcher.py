@@ -6,13 +6,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from whaleclaw.config.paths import EVOMAP_DIR
 from whaleclaw.plugins.evomap.client import A2AClient
 
 
 class AssetFetcher:
     """Fetch promoted assets from EvoMap and cache locally."""
 
-    CACHE_DIR = Path("~/.whaleclaw/evomap/assets/").expanduser()
+    CACHE_DIR = EVOMAP_DIR / "assets"
 
     def __init__(self, client: A2AClient, cache_dir: Path | None = None) -> None:
         self._client = client
@@ -43,16 +44,21 @@ class AssetFetcher:
             include_tasks=False,
         )
         assets = resp.get("payload", {}).get("assets", resp.get("assets", []))
-        signals_set = {s.lower() for s in signals}
-        result = []
         for asset in assets:
-            trigger = asset.get("trigger", [])
-            match = any(t.lower() in signals_set for t in trigger)
-            if not match and "signals_match" in asset:
-                match = any(s.lower() in signals_set for s in asset["signals_match"])
-            if match:
-                result.append(asset)
-        return result
+            aid = asset.get("asset_id") or asset.get("assetId")
+            if aid:
+                self._cache_path(str(aid)).write_text(
+                    json.dumps(asset, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        clean = [s.strip().lower() for s in signals if s.strip()]
+        result: list[tuple[int, dict[str, Any]]] = []
+        for asset in assets:
+            score = self._score_asset_match(asset, clean)
+            if score > 0:
+                result.append((score, asset))
+        result.sort(key=lambda x: x[0], reverse=True)
+        return [asset for _score, asset in result]
 
     def search_cached_by_signals(
         self,
@@ -65,7 +71,7 @@ class AssetFetcher:
         if not clean:
             return []
 
-        results: list[dict[str, Any]] = []
+        scored: list[tuple[int, dict[str, Any]]] = []
         for path in sorted(self.CACHE_DIR.glob("*.json"), reverse=True):
             try:
                 asset = json.loads(path.read_text(encoding="utf-8"))
@@ -74,17 +80,21 @@ class AssetFetcher:
             if not isinstance(asset, dict):
                 continue
 
-            trigger = asset.get("trigger", [])
-            trigger_set = {
-                str(t).strip().lower()
-                for t in trigger
-                if str(t).strip()
-            }
-            hay = " ".join(
-                str(asset.get(k, ""))
-                for k in ("title", "summary", "description")
-            ).lower()
-            if any((sig in trigger_set) or (sig in hay) for sig in clean):
+            score = self._score_asset_match(asset, clean)
+            if score > 0:
+                scored.append((score, asset))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [asset for _score, asset in scored[: max(1, limit)]]
+
+    def list_cached_recent(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        """Return recent cached assets without signal filtering."""
+        results: list[dict[str, Any]] = []
+        for path in sorted(self.CACHE_DIR.glob("*.json"), reverse=True):
+            try:
+                asset = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(asset, dict):
                 results.append(asset)
             if len(results) >= max(1, limit):
                 break
@@ -96,3 +106,27 @@ class AssetFetcher:
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _score_asset_match(asset: dict[str, Any], signals: list[str]) -> int:
+        if not signals:
+            return 0
+        trigger = [str(t).strip().lower() for t in asset.get("trigger", []) if str(t).strip()]
+        signals_match = [
+            str(t).strip().lower() for t in asset.get("signals_match", []) if str(t).strip()
+        ]
+        hay = " ".join(str(asset.get(k, "")) for k in ("title", "summary", "description")).lower()
+        score = 0
+        for sig in signals:
+            if sig in trigger or sig in signals_match:
+                score += 3
+                continue
+            if any(sig in t or t in sig for t in trigger):
+                score += 2
+                continue
+            if any(sig in t or t in sig for t in signals_match):
+                score += 2
+                continue
+            if sig in hay:
+                score += 1
+        return score

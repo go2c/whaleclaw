@@ -54,3 +54,26 @@ def test_no_match_returns_empty() -> None:
 
     out = router.route("今天天气怎么样", skills)
     assert out == []
+
+
+def test_explicit_skill_id_mention_activates_skill() -> None:
+    router = SkillRouter()
+    ppt = _make_skill("ppt-generator", ["生成PPT", "演示文稿"])
+    browser = _make_skill("browser-control", ["浏览器", "截图"])
+    skills = [browser, ppt]
+
+    out = router.route("请用 ppt-generator 这个技能生成一份PPT", skills, max_skills=2)
+    assert len(out) >= 1
+    assert out[0].id == "ppt-generator"
+
+
+def test_explicit_skill_name_mention_activates_skill() -> None:
+    router = SkillRouter()
+    ppt = _make_skill("ppt-generator", ["生成PPT", "演示文稿"])
+    ppt.name = "PPT Generator"
+    browser = _make_skill("browser-control", ["浏览器", "截图"])
+    skills = [browser, ppt]
+
+    out = router.route("我想用 PPT Generator 这个 skill 来做汇报", skills, max_skills=2)
+    assert len(out) >= 1
+    assert out[0].id == "ppt-generator"

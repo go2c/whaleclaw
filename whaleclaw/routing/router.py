@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from whaleclaw.channels.base import ChannelMessage
+from whaleclaw.config.paths import WORKSPACE_DIR
 from whaleclaw.routing.rules import RoutingRule, RoutingTarget
 from whaleclaw.security.permissions import SecurityPolicy, ToolPermission
 
@@ -52,7 +53,7 @@ class MessageRouter:
                 target = rule.target
                 break
         session_id = _build_session_id(message, target.agent_id)
-        workspace = target.workspace or "~/.whaleclaw/workspace"
+        workspace = target.workspace or str(WORKSPACE_DIR)
         security_policy = _security_policy_from_target(target)
         return RoutingResult(
             agent_id=target.agent_id,

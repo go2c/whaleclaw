@@ -10,17 +10,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import secrets
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Thread
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from whaleclaw.config.paths import CONFIG_FILE
 from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
@@ -246,8 +245,8 @@ def login() -> OAuthResult:
 
     auth_url = build_authorize_url(state, challenge)
 
-    print(f"\n  正在打开浏览器进行 ChatGPT 授权…")
-    print(f"  如果浏览器未自动打开，请手动访问:")
+    print("\n  正在打开浏览器进行 ChatGPT 授权…")
+    print("  如果浏览器未自动打开，请手动访问:")
     print(f"  {auth_url}\n")
 
     webbrowser.open(auth_url)
@@ -272,13 +271,10 @@ def login() -> OAuthResult:
 def save_oauth_to_config(result: OAuthResult, config_path: Path | None = None) -> None:
     """Save OAuth credentials into the whaleclaw.json config file."""
     if config_path is None:
-        config_path = Path(os.path.expanduser("~/.whaleclaw/whaleclaw.json"))
+        config_path = CONFIG_FILE
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    if config_path.exists():
-        cfg = json.loads(config_path.read_text(encoding="utf-8"))
-    else:
-        cfg = {}
+    cfg = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
 
     openai_cfg = cfg.setdefault("models", {}).setdefault("openai", {})
     openai_cfg["auth_mode"] = "oauth"
@@ -301,7 +297,7 @@ def ensure_valid_token(config_path: Path | None = None) -> OAuthResult | None:
     OAuth credentials are configured.
     """
     if config_path is None:
-        config_path = Path(os.path.expanduser("~/.whaleclaw/whaleclaw.json"))
+        config_path = CONFIG_FILE
 
     if not config_path.exists():
         return None
