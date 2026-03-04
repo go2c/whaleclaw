@@ -1129,6 +1129,102 @@ body {
   gap: 4px;
   margin-top: 4px;
 }
+.multi-agent-toolbar {
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+.mini-select {
+  min-width: 84px;
+  max-width: 96px;
+  padding: 6px 8px;
+}
+.scenario-select {
+  min-width: 220px;
+  max-width: 320px;
+  padding: 6px 8px;
+}
+.mini-input {
+  width: 84px;
+  flex: 0 0 84px;
+  padding: 6px 8px;
+}
+.multi-agent-label {
+  font-size: 14px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.mode-label {
+  font-size: 16px;
+}
+.multi-agent-feishu-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.multi-agent-custom-toolbar {
+  justify-content: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.custom-scenario-input {
+  min-width: 260px;
+  max-width: 420px;
+}
+.multi-agent-custom-list {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.multi-agent-custom-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: var(--bg-secondary);
+}
+.multi-agent-custom-remove {
+  border: none;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  line-height: 1;
+}
+.multi-agent-custom-remove:hover {
+  opacity: 0.85;
+}
+.multi-agent-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (max-width: 1000px) {
+  .multi-agent-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.multi-agent-role-card {
+  align-items: stretch;
+}
+.multi-agent-role-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.multi-agent-role-fields {
+  display: grid;
+  gap: 8px;
+}
+.role-model-select {
+  appearance: auto;
+  line-height: 1.2;
+}
 
 /* ── Chips ── */
 .chip-row {

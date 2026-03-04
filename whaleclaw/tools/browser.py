@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import uuid
-from pathlib import Path
 import re
+import uuid
 from typing import Any
 
 from whaleclaw.config.paths import WHALECLAW_HOME
@@ -159,7 +158,7 @@ class BrowserTool(Tool):
                 "type(selector, text) — type into input; "
                 "get_text(selector?) — extract page/element text; "
                 "evaluate(script) — run JavaScript; "
-                "search_images(query) — Google image search and download first result; "
+                "search_images(query) — image search and download one image per query; "
                 "back — go back; "
                 "close — close browser."
             ),
@@ -210,7 +209,10 @@ class BrowserTool(Tool):
         from whaleclaw.tools.deps import ensure_tool_dep
 
         if not ensure_tool_dep("playwright"):
-            raise RuntimeError("playwright 安装失败，请手动执行: pip install playwright && playwright install chromium")
+            raise RuntimeError(
+                "playwright 安装失败，请手动执行: "
+                "pip install playwright && playwright install chromium"
+            )
 
         from playwright.async_api import async_playwright
 
@@ -448,6 +450,16 @@ def _normalize_image_query(query: str) -> str:
         raise ValueError(f"搜索关键词无效: {q}")
     if len(q) < 2:
         raise ValueError(f"搜索关键词过短: {q}")
+
+    # Enforce one visual intent per search call.
+    # If user passes multiple subjects (e.g. "花、瓶子、苹果"), caller should
+    # split into multiple search_images calls.
+    multi_intent_parts = re.split(r"[、，,;/|+]+", q)
+    non_empty_parts = [p.strip() for p in multi_intent_parts if p.strip()]
+    if len(non_empty_parts) >= 2:
+        raise ValueError(
+            "search_images 一次只支持一个主体关键词，请拆成多次调用"
+        )
 
     has_hint = any(h in q.lower() for h in _IMAGE_INTENT_HINTS)
     if not has_hint:

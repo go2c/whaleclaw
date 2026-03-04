@@ -61,6 +61,151 @@ log = get_logger(__name__)
 _UPLOAD_DIR = WHALECLAW_HOME / "uploads"
 _CRON_DB_PATH = WHALECLAW_HOME / "cron.db"
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
+_MULTI_AGENT_MODES = {"parallel", "serial"}
+_MULTI_AGENT_SCENARIOS = {
+    "product_design",
+    "content_creation",
+    "software_development",
+    "data_analysis_decision",
+    "scientific_research",
+    "intelligent_assistant",
+    "workflow_automation",
+}
+_MULTI_AGENT_DEFAULT_SCENARIO = "software_development"
+
+
+def _default_multi_agent_roles() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "planner",
+            "name": "规划师",
+            "enabled": True,
+            "model": "",
+            "system_prompt": (
+                "你是规划师。先澄清目标与约束，再拆解任务边界。"
+                "输出：目标定义、范围/非范围、里程碑、优先级与验收标准。"
+            ),
+        },
+        {
+            "id": "architect",
+            "name": "架构师",
+            "enabled": True,
+            "model": "",
+            "system_prompt": (
+                "你是架构师。基于规划给出技术方案与关键决策。"
+                "输出：总体架构、模块边界、关键接口、技术选型、风险与降级方案。"
+            ),
+        },
+        {
+            "id": "implementer",
+            "name": "执行者",
+            "enabled": True,
+            "model": "",
+            "system_prompt": (
+                "你是执行者。把方案落地为可执行步骤或代码改动。"
+                "输出：分步实施计划、关键实现细节、命令/代码片段与完成定义。"
+            ),
+        },
+        {
+            "id": "reviewer",
+            "name": "评审者",
+            "enabled": True,
+            "model": "",
+            "system_prompt": (
+                "你是评审者。独立审视可行性与质量风险。"
+                "输出：问题清单、回归点、测试策略、监控指标与上线检查项。"
+            ),
+        },
+    ]
+
+
+def _default_multi_agent_config() -> dict[str, object]:
+    return {
+        "enabled": False,
+        "scenario": _MULTI_AGENT_DEFAULT_SCENARIO,
+        "custom_scenarios": [],
+        "mode": "parallel",
+        "max_rounds": 3,
+        "roles": _default_multi_agent_roles(),
+    }
+
+
+def _normalize_multi_agent_config(raw: object) -> dict[str, object]:
+    defaults = _default_multi_agent_config()
+    if not isinstance(raw, dict):
+        return defaults
+
+    mode_raw = str(raw.get("mode", defaults["mode"])).strip().lower()
+    mode = mode_raw if mode_raw in _MULTI_AGENT_MODES else str(defaults["mode"])
+
+    scenario_raw = str(raw.get("scenario", defaults["scenario"])).strip()
+    scenario = scenario_raw
+    if scenario not in _MULTI_AGENT_SCENARIOS and not scenario.startswith("custom::"):
+        scenario = str(defaults["scenario"])
+
+    custom_scenarios_raw = raw.get("custom_scenarios")
+    custom_scenarios: list[str] = []
+    if isinstance(custom_scenarios_raw, list):
+        for item in custom_scenarios_raw[:20]:
+            name = str(item).strip()
+            if not name or name in custom_scenarios:
+                continue
+            custom_scenarios.append(name[:40])
+
+    max_rounds_raw = raw.get("max_rounds", defaults["max_rounds"])
+    try:
+        max_rounds = int(max_rounds_raw)
+    except Exception:
+        max_rounds = int(defaults["max_rounds"])
+    max_rounds = max(1, min(max_rounds, 10))
+
+    roles_raw = raw.get("roles")
+    roles: list[dict[str, object]] = []
+    if isinstance(roles_raw, list):
+        for idx, item in enumerate(roles_raw[:20], start=1):
+            if not isinstance(item, dict):
+                continue
+            rid = str(item.get("id", f"role_{idx}")).strip().lower()
+            rid = "".join(ch for ch in rid if ch.isalnum() or ch in {"_", "-"})
+            if not rid:
+                rid = f"role_{idx}"
+            name = str(item.get("name", f"角色{idx}")).strip() or f"角色{idx}"
+            model = str(item.get("model", "")).strip()
+            prompt = str(item.get("system_prompt", "")).strip()
+            roles.append(
+                {
+                    "id": rid[:64],
+                    "name": name[:50],
+                    "enabled": bool(item.get("enabled", True)),
+                    "model": model[:100],
+                    "system_prompt": prompt[:3000],
+                }
+            )
+    if not roles:
+        roles = _default_multi_agent_roles()
+
+    return {
+        "enabled": bool(raw.get("enabled", defaults["enabled"])),
+        "scenario": scenario,
+        "custom_scenarios": custom_scenarios,
+        "mode": mode,
+        "max_rounds": max_rounds,
+        "roles": roles,
+    }
+
+
+def _is_multi_agent_effective_for_metadata(
+    config: WhaleclawConfig,
+    metadata: object,
+) -> bool:
+    global_enabled = False
+    if isinstance(config.plugins, dict):
+        raw = config.plugins.get("multi_agent", {})
+        if isinstance(raw, dict):
+            global_enabled = bool(raw.get("enabled", False))
+    if isinstance(metadata, dict) and isinstance(metadata.get("multi_agent_enabled"), bool):
+        return bool(metadata["multi_agent_enabled"])
+    return global_enabled
 
 
 def _read_json_config(path: Path) -> dict[str, object]:
@@ -195,6 +340,13 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                         loaded = await manager.get(s.id)
                         sessions_done = int(state["compression_sessions_done"])
                         if not loaded:
+                            state["compression_sessions_done"] = sessions_done + 1
+                            continue
+                        if _is_multi_agent_effective_for_metadata(config, loaded.metadata):
+                            await group_compressor.set_session_suspended(
+                                session_id=loaded.id,
+                                suspended=True,
+                            )
                             state["compression_sessions_done"] = sessions_done + 1
                             continue
                         if not loaded.messages:
@@ -950,6 +1102,44 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         return result
 
     # ── Plugins REST ──────────────────────────────────────
+
+    @app.get("/api/plugins/multi-agent")
+    async def get_multi_agent_config() -> JSONResponse:
+        plugins_cfg = config.plugins if isinstance(config.plugins, dict) else {}
+        raw = plugins_cfg.get("multi_agent", {})
+        current = _normalize_multi_agent_config(raw)
+        return JSONResponse(current)
+
+    @app.post("/api/plugins/multi-agent")
+    async def set_multi_agent_config(body: dict[str, object]) -> JSONResponse:
+        current = _normalize_multi_agent_config(body)
+
+        if not isinstance(config.plugins, dict):
+            config.plugins = {}
+        config.plugins["multi_agent"] = current
+
+        user_cfg = _read_json_config(CONFIG_FILE)
+        plugins_cfg = user_cfg.get("plugins")
+        if not isinstance(plugins_cfg, dict):
+            plugins_cfg = {}
+            user_cfg["plugins"] = plugins_cfg
+        plugins_cfg["multi_agent"] = current
+
+        try:
+            _write_json_config(CONFIG_FILE, user_cfg)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"保存配置失败: {exc}"},
+                status_code=500,
+            )
+
+        return JSONResponse(
+            {
+                "ok": True,
+                **current,
+                "persisted_to": str(CONFIG_FILE),
+            }
+        )
 
     @app.get("/api/plugins/evomap")
     async def get_evomap_config() -> JSONResponse:

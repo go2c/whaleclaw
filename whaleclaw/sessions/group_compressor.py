@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TypedDict
 from uuid import uuid4
@@ -172,6 +173,20 @@ class SessionGroupCompressor:
         self._pending_by_session: dict[str, dict[str, _PendingBuild]] = {}
         self._inflight_keys: set[str] = set()
         self._drain_tasks: dict[str, asyncio.Task[None]] = {}
+        self._suspended_sessions: set[str] = set()
+
+    async def set_session_suspended(self, *, session_id: str, suspended: bool) -> None:
+        """Suspend or resume compression activity for a specific session."""
+        if suspended:
+            self._suspended_sessions.add(session_id)
+            self._pending_by_session.pop(session_id, None)
+            task = self._drain_tasks.get(session_id)
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(Exception):
+                    await task
+        else:
+            self._suspended_sessions.discard(session_id)
 
     async def prewarm_session(
         self,
@@ -181,6 +196,13 @@ class SessionGroupCompressor:
         router: ModelRouter,
         model_id: str,
     ) -> PrewarmStats:
+        if session_id in self._suspended_sessions:
+            return {
+                "total_groups": 0,
+                "processed_groups": 0,
+                "cache_hits": 0,
+                "generated": 0,
+            }
         if not model_id.strip():
             return {
                 "total_groups": 0,
@@ -267,6 +289,8 @@ class SessionGroupCompressor:
         router: ModelRouter,
         model_id: str,
     ) -> list[Message]:
+        if session_id in self._suspended_sessions:
+            return messages
         t0 = time.monotonic()
         groups = _group_by_turn(messages)
         if not groups:
@@ -536,6 +560,8 @@ class SessionGroupCompressor:
         router: ModelRouter,
         model_id: str,
     ) -> bool:
+        if session_id in self._suspended_sessions:
+            return False
         model = model_id.strip()
         if not model:
             return False

@@ -42,6 +42,21 @@ log = get_logger(__name__)
 _active_connections: dict[str, WebSocket] = {}
 
 
+def _is_multi_agent_effective_for_session(
+    config: WhaleclawConfig,
+    session: Session,
+) -> bool:
+    global_enabled = False
+    if isinstance(config.plugins, dict):
+        raw = config.plugins.get("multi_agent", {})
+        if isinstance(raw, dict):
+            global_enabled = bool(raw.get("enabled", False))
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    if isinstance(metadata.get("multi_agent_enabled"), bool):
+        return bool(metadata["multi_agent_enabled"])
+    return global_enabled
+
+
 async def push_to_session(session_id: str, msg: WSMessage) -> bool:
     """Push a message to a connected WebSocket by session ID.
 
@@ -184,7 +199,11 @@ async def websocket_handler(
             )
             _active_connections[session.id] = websocket
 
-            if compression_ready_fn is not None and not compression_ready_fn():
+            if (
+                compression_ready_fn is not None
+                and not compression_ready_fn()
+                and not _is_multi_agent_effective_for_session(config, session)
+            ):
                 await _safe_send(
                     websocket,
                     make_status(session.id, "会话压缩中，请稍后再试…"),
@@ -232,6 +251,7 @@ async def websocket_handler(
                 await session_manager.add_message(session, "user", content or "(图片)")
 
             sid = session.id
+            current_session = session
 
             async def on_stream(chunk: str, _sid: str = sid) -> None:
                 if ws_alive:
@@ -255,6 +275,18 @@ async def websocket_handler(
                         websocket,
                         make_tool_result(_sid, name, result.output, result.success),
                     )
+
+            async def on_round_result_cb(
+                round_no: int,
+                content_text: str,
+                _sid: str = sid,
+                _session: Session = current_session,
+            ) -> None:
+                if not ws_alive:
+                    return
+                round_msg = f"第 {round_no} 轮交付\n\n{content_text}".strip()
+                await session_manager.add_message(_session, "assistant", round_msg)
+                await _safe_send(websocket, make_message(_sid, round_msg))
 
             try:
                 extra_memory = ""
@@ -284,6 +316,7 @@ async def websocket_handler(
                     registry=registry,
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result_cb,
+                    on_round_result=on_round_result_cb,
                     images=images or None,
                     session_manager=session_manager,
                     session_store=_store,
@@ -293,8 +326,9 @@ async def websocket_handler(
                     trigger_text_preview=content or "(用户发送了图片)",
                     group_compressor=group_compressor,
                 )
-                await session_manager.add_message(session, "assistant", reply)
-                await _safe_send(websocket, make_message(session.id, reply))
+                if reply.strip():
+                    await session_manager.add_message(session, "assistant", reply)
+                    await _safe_send(websocket, make_message(session.id, reply))
             except Exception as exc:
                 if hook_manager is not None:
                     with suppress(Exception):

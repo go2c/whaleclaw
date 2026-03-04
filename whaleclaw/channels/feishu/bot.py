@@ -361,6 +361,10 @@ class FeishuBot:
                 "/models - 查看可切换模型\n"
                 "/model <序号|provider/model> - 切换模型\n"
                 "/model - 查看当前模型\n"
+                "/multi status - 查看多Agent状态\n"
+                "/multi on|off - 会话级启用/禁用多Agent\n"
+                "/multi mode parallel|serial - 设置会话协作模式\n"
+                "/multi rounds <1-10> - 设置会话最大回合\n"
                 "/think 已禁用（按你的配置不启用）"
             )
 
@@ -408,7 +412,123 @@ class FeishuBot:
                 return f"已切换模型到: {target}\n默认模型保存失败: {err}"
             return f"已切换模型到: {target}"
 
+        if cmd == "/multi":
+            if self._session_manager is None:
+                return "多Agent命令不可用：会话管理器未初始化。"
+
+            raw_parts = arg.split() if arg else []
+            action = raw_parts[0].lower() if raw_parts else "status"
+
+            if action in {"status", "st", "s"}:
+                return self._format_multi_agent_status(session)
+
+            metadata = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+
+            if action in {"on", "enable"}:
+                metadata["multi_agent_enabled"] = True
+                await self._session_manager.update_metadata(session, metadata)
+                return "已开启本会话多Agent。发送 /multi status 查看当前状态。"
+
+            if action in {"off", "disable"}:
+                metadata["multi_agent_enabled"] = False
+                await self._session_manager.update_metadata(session, metadata)
+                return "已关闭本会话多Agent。发送 /multi status 查看当前状态。"
+
+            if action == "mode":
+                if len(raw_parts) < 2:
+                    return "用法: /multi mode parallel|serial"
+                mode = raw_parts[1].strip().lower()
+                if mode not in {"parallel", "serial"}:
+                    return "模式无效，仅支持 parallel 或 serial。"
+                metadata["multi_agent_mode"] = mode
+                await self._session_manager.update_metadata(session, metadata)
+                mode_cn = "并行" if mode == "parallel" else "串行"
+                return f"已设置本会话多Agent模式: {mode_cn}（{mode}）。"
+
+            if action in {"round", "rounds"}:
+                if len(raw_parts) < 2:
+                    return "用法: /multi rounds <1-10>"
+                value = raw_parts[1].strip()
+                if not value.isdigit():
+                    return f"回合数无效: {value}，请输入 1-10 的整数。"
+                rounds = int(value)
+                if rounds < 1 or rounds > 10:
+                    return f"回合数超出范围: {rounds}，允许范围为 1-10。"
+                metadata["multi_agent_max_rounds"] = rounds
+                await self._session_manager.update_metadata(session, metadata)
+                return f"已设置本会话多Agent最大回合: {rounds}。"
+
+            return (
+                "用法:\n"
+                "/multi status\n"
+                "/multi on\n"
+                "/multi off\n"
+                "/multi mode parallel|serial\n"
+                "/multi rounds <1-10>"
+            )
+
         return None
+
+    def _format_multi_agent_status(self, session: Any) -> str:
+        """Format global/session/effective multi-agent status for command reply."""
+        global_enabled = False
+        global_mode = "parallel"
+        global_rounds = 1
+        if self._whaleclaw_config is not None and isinstance(self._whaleclaw_config.plugins, dict):
+            raw = self._whaleclaw_config.plugins.get("multi_agent", {})
+            if isinstance(raw, dict):
+                global_enabled = bool(raw.get("enabled", False))
+                mode_raw = str(raw.get("mode", "parallel")).strip().lower()
+                global_mode = mode_raw if mode_raw in {"parallel", "serial"} else "parallel"
+                try:
+                    global_rounds = int(raw.get("max_rounds", 1))
+                except Exception:
+                    global_rounds = 1
+        global_rounds = max(1, min(global_rounds, 10))
+
+        metadata = session.metadata if isinstance(session.metadata, dict) else {}
+        has_enabled_override = isinstance(metadata.get("multi_agent_enabled"), bool)
+        has_mode_override = str(metadata.get("multi_agent_mode", "")).strip().lower() in {
+            "parallel",
+            "serial",
+        }
+        has_rounds_override = isinstance(metadata.get("multi_agent_max_rounds"), int)
+
+        effective_enabled = (
+            bool(metadata.get("multi_agent_enabled"))
+            if has_enabled_override
+            else global_enabled
+        )
+        effective_mode = (
+            str(metadata.get("multi_agent_mode")).strip().lower()
+            if has_mode_override
+            else global_mode
+        )
+        effective_rounds = global_rounds
+        if has_rounds_override:
+            effective_rounds = int(metadata["multi_agent_max_rounds"])
+        effective_rounds = max(1, min(effective_rounds, 10))
+
+        mode_cn = "并行" if effective_mode == "parallel" else "串行"
+        global_line = (
+            f"- 全局: {'开启' if global_enabled else '关闭'}"
+            f" | 模式={global_mode} | 回合={global_rounds}"
+        )
+        session_line = (
+            f"- 会话覆盖: enabled={metadata.get('multi_agent_enabled', '(未设置)')}, "
+            f"mode={metadata.get('multi_agent_mode', '(未设置)')}, "
+            f"rounds={metadata.get('multi_agent_max_rounds', '(未设置)')}"
+        )
+        effective_line = (
+            f"- 当前生效: {'开启' if effective_enabled else '关闭'} | "
+            f"模式={mode_cn}（{effective_mode}） | 回合={effective_rounds}"
+        )
+        return (
+            "多Agent状态:\n"
+            f"{global_line}\n"
+            f"{session_line}\n"
+            f"{effective_line}"
+        )
 
     def _list_selectable_models(self) -> list[str]:
         """Return verified and configured model IDs."""

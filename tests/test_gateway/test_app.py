@@ -103,6 +103,45 @@ async def test_models_oauth_openai_only_shows_gpt52() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_agent_config_keeps_scenario_and_custom_list(  # noqa: ANN001
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(app_mod, "CONFIG_FILE", tmp_path / "whaleclaw.json")
+
+    test_app = create_app(WhaleclawConfig())
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/plugins/multi-agent",
+            json={
+                "enabled": True,
+                "scenario": "custom::%E8%AF%BB%E4%B9%A6%E4%BC%9A%E8%AE%AE",
+                "custom_scenarios": ["读书会议"],
+                "mode": "parallel",
+                "max_rounds": 4,
+                "roles": [],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["scenario"] == "custom::%E8%AF%BB%E4%B9%A6%E4%BC%9A%E8%AE%AE"
+        assert data["custom_scenarios"] == ["读书会议"]
+
+        resp = await client.get("/api/plugins/multi-agent")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["scenario"] == "custom::%E8%AF%BB%E4%B9%A6%E4%BC%9A%E8%AE%AE"
+        assert data["custom_scenarios"] == ["读书会议"]
+
+
+@pytest.mark.asyncio
 async def test_memory_style_rest_api(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     import whaleclaw.gateway.app as app_mod
     import whaleclaw.sessions.store as store_mod

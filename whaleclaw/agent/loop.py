@@ -13,7 +13,9 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -45,6 +47,8 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+OnRoundResult = Callable[[int, str], Awaitable[None]]
+
 _assembler = PromptAssembler()
 _context_window = ContextWindow()
 _compressor = ContextCompressor()
@@ -58,6 +62,9 @@ _DEFAULT_ASSISTANT_NAME = "WhaleClaw"
 _IMG_MD_RE = re.compile(r"!\[([^\]]*)\]\((/[^)]+)\)")
 _EVOMAP_LINE_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.+?)\s*$")
 _OFFICE_PATH_RE = re.compile(r"(/[^\n\"']+\.(?:pptx|docx|xlsx))", re.IGNORECASE)
+_ABS_FILE_PATH_RE = re.compile(r"(/[^\s\"')]+?\.[A-Za-z0-9]{1,8})(?=[\s\"')]|$)")
+_NON_DELIVERY_EXTS = {".py", ".sh", ".bash", ".zsh", ".log", ".tmp"}
+_VERSION_SUFFIX_RE = re.compile(r"_V\d+$", re.IGNORECASE)
 _EVOMAP_CHOICE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*(?:选|选择)?\s*([ABCabc])\s*$"),
     re.compile(r"^\s*(?:选|选择)?\s*([123])\s*$"),
@@ -92,6 +99,38 @@ _SKILL_ACTIVATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:使用|调用|启动|启用|走|用).{0,24}(?:技能|skill)", re.IGNORECASE),
     re.compile(r"(?:技能|skill).{0,16}(?:文生图|图生图|处理|执行|联调)", re.IGNORECASE),
 )
+_MULTI_AGENT_CONFIRM_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^\s*(确认|确认开始|开始执行|开始多agent|开始多\s*agent|执行吧|开始吧)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*/multi\s+go\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_CANCEL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(取消|取消执行|先别执行|暂停|停止)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*/multi\s+cancel\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_ROUNDS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?:改为|改成|设为|设置为|设置|调整为|改到)\s*(\d{1,2})\s*轮",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*(\d{1,2})\s*轮\s*$", re.IGNORECASE),
+    re.compile(r"^\s*/multi\s+rounds\s+(\d{1,2})\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_DISCUSS_DONE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(需求确认|确认需求|需求已确认|信息齐了|进入执行确认)\s*$"),
+    re.compile(r"^\s*/multi\s+ready\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_SCENARIO_LABELS: dict[str, str] = {
+    "product_design": "产品设计",
+    "content_creation": "内容创作",
+    "software_development": "软件开发",
+    "data_analysis_decision": "数据分析决策",
+    "scientific_research": "科研",
+    "intelligent_assistant": "智能助理",
+    "workflow_automation": "自动化工作流",
+}
 
 _TOOL_HINTS: dict[str, str] = {
     "browser": "搜索相关资料",
@@ -1014,6 +1053,77 @@ def _extract_office_paths(text: str) -> list[str]:
     return paths
 
 
+def _extract_round_delivery_section(text: str) -> str:
+    if not text:
+        return ""
+    marker = re.search(
+        r"(?m)^\s*3[\)\.、:：]\s*本轮可直接交付结果",
+        text,
+    )
+    if marker is None:
+        return text
+    tail = text[marker.start() :]
+    next_idx = len(tail)
+    next_marker = re.search(r"(?m)^\s*[4-9][\)\.、:：]\s*", tail)
+    if next_marker is not None and next_marker.start() > 0:
+        next_idx = next_marker.start()
+    return tail[:next_idx].strip()
+
+
+def _extract_delivery_artifact_paths(
+    text: str,
+    *,
+    include_scripts: bool = False,
+) -> list[str]:
+    section = _extract_round_delivery_section(text)
+    if not section:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _ABS_FILE_PATH_RE.finditer(section):
+        p = m.group(1).strip()
+        if not p:
+            continue
+        suffix = Path(p).suffix.lower()
+        if (not include_scripts) and suffix in _NON_DELIVERY_EXTS:
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _with_round_version_suffix(path: str, round_no: int) -> str:
+    raw = str(Path(path).expanduser())
+    p = Path(raw)
+    stem = p.stem
+    base_stem = _VERSION_SUFFIX_RE.sub("", stem)
+    target_name = f"{base_stem}_V{round_no}{p.suffix}"
+    return str(p.with_name(target_name))
+
+
+def _snapshot_round_artifacts(paths: list[str], round_no: int) -> list[str]:
+    snapshots: list[str] = []
+    for src in paths:
+        src_path = Path(src).expanduser()
+        if not src_path.exists() or not src_path.is_file():
+            continue
+        target = Path(_with_round_version_suffix(str(src_path), round_no)).expanduser()
+        try:
+            if target.resolve() != src_path.resolve():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, target)
+            snapshots.append(str(target.resolve()))
+        except Exception:
+            # Fallback to source path when snapshot copy fails.
+            try:
+                snapshots.append(str(src_path.resolve()))
+            except Exception:
+                snapshots.append(str(src_path))
+    return snapshots
+
+
 def _remember_office_path(metadata: dict[str, object], path: str) -> bool:
     p = path.strip()
     if not p:
@@ -1590,6 +1700,19 @@ async def _execute_tool(
                     result = await tool.execute(**tc.arguments)
                 except Exception as exc:
                     result = ToolResult(success=False, output="", error=str(exc))
+            if not result.success and tool is not None:
+                missing_target = _can_auto_create_parent_for_failure(result)
+                if missing_target:
+                    parent = str(Path(missing_target).expanduser().resolve().parent)
+                    try:
+                        _mkdir_res = await tool.execute(
+                            command=f"mkdir -p '{parent}'",
+                            timeout=30,
+                        )
+                        if _mkdir_res.success:
+                            result = await tool.execute(**tc.arguments)
+                    except Exception:
+                        pass
     elif tc.name.startswith("evomap_") and not evomap_enabled:
         result = ToolResult(
             success=False,
@@ -1609,6 +1732,19 @@ async def _execute_tool(
                 result = await tool.execute(**tc.arguments)
             except Exception as exc:
                 result = ToolResult(success=False, output="", error=str(exc))
+        if tc.name == "bash" and not result.success and tool is not None:
+            missing_target = _can_auto_create_parent_for_failure(result)
+            if missing_target:
+                parent = str(Path(missing_target).expanduser().resolve().parent)
+                try:
+                    _mkdir_res = await tool.execute(
+                        command=f"mkdir -p '{parent}'",
+                        timeout=30,
+                    )
+                    if _mkdir_res.success:
+                        result = await tool.execute(**tc.arguments)
+                except Exception:
+                    pass
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     log.info(
@@ -1629,7 +1765,49 @@ def _format_tool_output(result: ToolResult) -> str:
     """Format ToolResult into a string for LLM consumption."""
     if result.success:
         return result.output or "(empty output)"
-    return f"[ERROR] {result.error or 'unknown error'}\n{result.output}".strip()
+    out = f"[ERROR] {result.error or 'unknown error'}\n{result.output}".strip()
+    diagnosis = _diagnose_failure_hint(result)
+    if diagnosis:
+        out += f"\n[DIAGNOSIS] {diagnosis}"
+    return out
+
+
+def _diagnose_failure_hint(result: ToolResult) -> str:
+    text = f"{result.error or ''}\n{result.output or ''}"
+    if "No such file or directory" in text and "FileNotFoundError" in text:
+        return "更可能是目标路径或上级目录不存在，请先创建目录再写文件，不是依赖缺失。"
+    if "ModuleNotFoundError" in text:
+        return "这是依赖缺失，请安装缺失模块后重试。"
+    if "Permission denied" in text:
+        return "这是权限问题，请检查目标路径可写权限。"
+    return ""
+
+
+def _extract_missing_target_path(text: str) -> str:
+    # Example: FileNotFoundError: [Errno 2] No such file or directory: '/Users/a/output/x.pptx'
+    m = re.search(
+        r"No such file or directory:\s*['\"](/[^'\"]+)['\"]",
+        text,
+    )
+    if not m:
+        return ""
+    path = m.group(1).strip()
+    if not path:
+        return ""
+    return path
+
+
+def _can_auto_create_parent_for_failure(result: ToolResult) -> str:
+    text = f"{result.error or ''}\n{result.output or ''}"
+    if "FileNotFoundError" not in text or "No such file or directory" not in text:
+        return ""
+    target = _extract_missing_target_path(text)
+    if not target:
+        return ""
+    suffix = Path(target).suffix.lower()
+    if suffix not in {".pptx", ".docx", ".xlsx", ".pdf", ".html", ".md", ".txt", ".py"}:
+        return ""
+    return target
 
 
 def _validate_tool_call_args(tc: ToolCall, registry: ToolRegistry) -> str | None:
@@ -1804,6 +1982,1083 @@ def _repair_tool_call(tc: ToolCall, user_message: str) -> tuple[ToolCall, str | 
     return ToolCall(id=tc.id, name=tc.name, arguments=args), ",".join(reasons)
 
 
+def _multi_agent_cfg(config: WhaleclawConfig) -> dict[str, object]:
+    plugins = config.plugins if isinstance(config.plugins, dict) else {}
+    raw = plugins.get("multi_agent", {})
+    if not isinstance(raw, dict):
+        return {"enabled": False, "mode": "parallel", "max_rounds": 1, "roles": []}
+
+    enabled = bool(raw.get("enabled", False))
+    mode_raw = str(raw.get("mode", "parallel")).strip().lower()
+    mode = mode_raw if mode_raw in {"parallel", "serial"} else "parallel"
+
+    try:
+        max_rounds = int(raw.get("max_rounds", 1))
+    except Exception:
+        max_rounds = 1
+    max_rounds = max(1, min(max_rounds, 10))
+
+    roles_raw = raw.get("roles")
+    roles: list[dict[str, object]] = []
+    if isinstance(roles_raw, list):
+        for idx, item in enumerate(roles_raw[:20], start=1):
+            if not isinstance(item, dict):
+                continue
+            rid = str(item.get("id", f"role_{idx}")).strip().lower()
+            rid = "".join(ch for ch in rid if ch.isalnum() or ch in {"_", "-"})
+            if not rid:
+                rid = f"role_{idx}"
+            name = str(item.get("name", f"角色{idx}")).strip() or f"角色{idx}"
+            model = str(item.get("model", "")).strip()
+            system_prompt = str(item.get("system_prompt", "")).strip()
+            roles.append(
+                {
+                    "id": rid[:64],
+                    "name": name[:50],
+                    "enabled": bool(item.get("enabled", True)),
+                    "model": model[:100],
+                    "system_prompt": system_prompt[:3000],
+                }
+            )
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "max_rounds": max_rounds,
+        "roles": roles,
+}
+
+
+def _scenario_discuss_focus(scenario: str) -> str:
+    if scenario == "product_design":
+        return (
+            "重点和用户确认：产品目标、目标用户、核心场景、关键流程、约束条件、"
+            "以及交付物类型（如 PRD 文档、流程图图片、原型说明、里程碑计划）。"
+        )
+    if scenario == "content_creation":
+        return (
+            "重点和用户确认：受众人群、内容主题、语气风格、发布渠道、篇幅限制、"
+            "素材来源与交付物类型（文章/脚本/海报文案/配图说明）。"
+        )
+    if scenario == "software_development":
+        return (
+            "重点和用户确认：功能目标、技术栈、运行环境、改动范围、验收标准、"
+            "交付物类型（代码补丁、命令步骤、测试报告、部署说明）。"
+        )
+    if scenario == "data_analysis_decision":
+        return (
+            "重点和用户确认：决策问题、指标口径、数据来源、时间窗口、可信度要求、"
+            "交付物类型（分析报告、图表、结论摘要、决策建议表）。"
+        )
+    if scenario == "scientific_research":
+        return (
+            "重点和用户确认：研究问题、假设、实验条件、对照设计、评估指标、"
+            "交付物类型（研究提纲、实验方案、结果解读、论文结构草稿）。"
+        )
+    if scenario == "intelligent_assistant":
+        return (
+            "重点和用户确认：任务目标、时效要求、可调用工具、执行边界、"
+            "交付物类型（行动计划、提醒清单、消息草稿、执行结果汇总）。"
+        )
+    if scenario == "workflow_automation":
+        return (
+            "重点和用户确认：触发条件、上下游系统、字段映射、失败重试、监控告警、"
+            "交付物类型（流程设计文档、自动化脚本、运行手册、告警规则清单）。"
+        )
+    return "重点和用户确认目标、约束、验收标准与最终交付物类型。"
+
+
+def _scenario_delivery_focus(scenario: str) -> str:
+    if scenario == "product_design":
+        return (
+            "最终答复必须包含：\n"
+            "1) 产品方案摘要\n"
+            "2) 结构化交付物清单（文档/图片/表格）\n"
+            "3) 每个交付物的建议文件名与路径（例如 /tmp/product_prd.md）\n"
+            "4) 执行优先级与里程碑\n"
+            "5) 风险与备选方案"
+        )
+    if scenario == "content_creation":
+        return (
+            "最终答复必须包含：\n"
+            "1) 内容策略与目标受众\n"
+            "2) 成品文案或脚本草案\n"
+            "3) 渠道适配版本（至少 2 个）\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/content_plan.md）\n"
+            "5) 发布节奏与复盘指标"
+        )
+    if scenario == "software_development":
+        return (
+            "最终答复必须包含：\n"
+            "1) 技术方案与实现路径\n"
+            "2) 关键代码改动点或命令步骤\n"
+            "3) 测试与回归计划\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/impl_plan.md）\n"
+            "5) 风险、回滚与上线注意项"
+        )
+    if scenario == "data_analysis_decision":
+        return (
+            "最终答复必须包含：\n"
+            "1) 数据结论与关键洞察\n"
+            "2) 指标口径说明与分析过程摘要\n"
+            "3) 决策选项对比与推荐方案\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/analysis_report.md）\n"
+            "5) 风险假设与后续验证计划"
+        )
+    if scenario == "scientific_research":
+        return (
+            "最终答复必须包含：\n"
+            "1) 研究目标与假设\n"
+            "2) 方法设计与实验步骤\n"
+            "3) 结果解读框架与可信度边界\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/research_plan.md）\n"
+            "5) 下一步实验与论文化建议"
+        )
+    if scenario == "intelligent_assistant":
+        return (
+            "最终答复必须包含：\n"
+            "1) 任务拆解与优先级\n"
+            "2) 可执行动作清单\n"
+            "3) 关键提醒与时间节点\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/assistant_actions.md）\n"
+            "5) 异常处理与后续跟进建议"
+        )
+    if scenario == "workflow_automation":
+        return (
+            "最终答复必须包含：\n"
+            "1) 自动化流程设计（触发-处理-输出）\n"
+            "2) 集成接口与字段映射说明\n"
+            "3) 失败重试与告警策略\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/workflow_spec.md）\n"
+            "5) 上线运行与运维检查清单"
+        )
+    return (
+        "最终答复必须包含：结论、可执行清单、交付物清单（含建议文件名/路径）、"
+        "风险与回滚建议。"
+    )
+
+
+def _resolve_multi_agent_cfg(
+    config: WhaleclawConfig,
+    session: Session | None,
+) -> dict[str, object]:
+    """Build effective multi-agent config with optional session overrides."""
+    cfg = _multi_agent_cfg(config)
+    plugins = config.plugins if isinstance(config.plugins, dict) else {}
+    raw = plugins.get("multi_agent", {})
+    if isinstance(raw, dict):
+        scenario = str(raw.get("scenario", "software_development")).strip()
+        cfg["scenario"] = scenario or "software_development"
+    else:
+        cfg["scenario"] = "software_development"
+    if session is None or not isinstance(session.metadata, dict):
+        return cfg
+
+    metadata = session.metadata
+    if isinstance(metadata.get("multi_agent_enabled"), bool):
+        cfg["enabled"] = bool(metadata["multi_agent_enabled"])
+
+    mode_raw = str(metadata.get("multi_agent_mode", "")).strip().lower()
+    if mode_raw in {"parallel", "serial"}:
+        cfg["mode"] = mode_raw
+
+    rounds_raw = metadata.get("multi_agent_max_rounds")
+    if isinstance(rounds_raw, int):
+        cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+
+    return cfg
+
+
+def _is_multi_agent_confirm(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _MULTI_AGENT_CONFIRM_PATTERNS)
+
+
+def _is_multi_agent_cancel(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _MULTI_AGENT_CANCEL_PATTERNS)
+
+
+def _extract_multi_agent_rounds(text: str) -> int | None:
+    t = text.strip()
+    if not t:
+        return None
+    for p in _MULTI_AGENT_ROUNDS_PATTERNS:
+        m = p.search(t)
+        if not m:
+            continue
+        try:
+            value = int(m.group(1))
+        except Exception:
+            return None
+        if 1 <= value <= 10:
+            return value
+    return None
+
+
+def _attach_rounds_marker(topic: str, rounds: int) -> str:
+    clean = re.sub(r"\[MA_ROUNDS=\d{1,2}\]\s*", "", topic).strip()
+    return f"[MA_ROUNDS={rounds}] {clean}".strip()
+
+
+def _extract_rounds_marker(topic: str) -> tuple[str, int | None]:
+    m = re.search(r"\[MA_ROUNDS=(\d{1,2})\]", topic)
+    if not m:
+        return (topic, None)
+    try:
+        value = int(m.group(1))
+    except Exception:
+        value = None
+    clean = re.sub(r"\[MA_ROUNDS=\d{1,2}\]\s*", "", topic).strip()
+    if value is None or not (1 <= value <= 10):
+        return (clean, None)
+    return (clean, value)
+
+
+def _is_multi_agent_discuss_done(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _MULTI_AGENT_DISCUSS_DONE_PATTERNS)
+
+
+def _format_multi_agent_preflight_text(
+    *,
+    cfg: dict[str, object],
+    topic: str,
+) -> str:
+    roles = [
+        role
+        for role in cast(list[dict[str, object]], cfg["roles"])
+        if bool(role.get("enabled", True))
+    ]
+    mode = cast(str, cfg["mode"])
+    rounds = cast(int, cfg["max_rounds"])
+    mode_cn = "并行" if mode == "parallel" else "串行"
+    lines = [
+        "已进入多Agent准备阶段（尚未开始执行）。",
+        f"- 当前模式: {mode_cn}（{mode}）",
+        f"- 计划回合: {rounds}",
+        f"- 角色数量: {len(roles)}",
+        "",
+        "角色分工:",
+    ]
+    for role in roles:
+        name = str(role.get("name", role.get("id", "角色"))).strip() or "角色"
+        duty = _multi_agent_system_prompt(role)
+        lines.append(f"- {name}: {_compact_role_output(duty, 120)}")
+    lines.extend(
+        [
+            "",
+            "主控建议:",
+            "- 先确认目标、交付形式、截止时间与约束。",
+            "- 若希望更快出结论，可先改为 2 轮；若任务复杂建议 4 轮以上。",
+            "",
+            f"当前议题: {topic.strip() or '(未提供)'}",
+            "",
+            "回复以下任一指令继续:",
+            "- 回复“确认开始”：按当前配置启动多Agent执行",
+            "- 回复“改为N轮”：修改回合后继续等待确认",
+            "- 回复“取消”：退出本次多Agent执行",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def _persist_session_metadata(
+    session: Session | None,
+    session_manager: SessionManager | None,
+) -> bool:
+    if session is None or session_manager is None:
+        return False
+
+
+async def _sync_multi_agent_compression_boundary(
+    session: Session | None,
+    session_manager: SessionManager | None,
+    group_compressor: "SessionGroupCompressor | None" = None,
+    *,
+    ma_enabled: bool,
+) -> None:
+    """Track MA on/off transition and set compression boundary on MA -> single.
+
+    When MA is enabled, mark current session as MA-active.
+    When MA turns off, record a fixed message-index boundary so future
+    group-compression only applies to newly produced messages.
+    """
+    if session is None or not isinstance(session.metadata, dict):
+        return
+    metadata = session.metadata
+    prev_active = bool(metadata.get("multi_agent_active_prev", False))
+    changed = False
+    if ma_enabled:
+        if not prev_active:
+            metadata["multi_agent_active_prev"] = True
+            changed = True
+    else:
+        if prev_active:
+            metadata["multi_agent_active_prev"] = False
+            metadata["compression_resume_message_index"] = len(session.messages)
+            changed = True
+    if group_compressor is not None and session is not None:
+        try:
+            await group_compressor.set_session_suspended(
+                session_id=session.id,
+                suspended=ma_enabled,
+            )
+        except Exception as exc:
+            log.debug(
+                "agent.multi_agent_compressor_toggle_failed",
+                session_id=session.id,
+                error=str(exc),
+                enabled=ma_enabled,
+            )
+    if changed:
+        await _persist_session_metadata(session, session_manager)
+    try:
+        await asyncio.wait_for(
+            session_manager._store.update_session_field(  # noqa: SLF001
+                session.id,
+                metadata=session.metadata,
+            ),
+            timeout=1.5,
+        )
+        return True
+    except Exception as exc:
+        log.warning(
+            "agent.multi_agent_metadata_persist_failed",
+            session_id=session.id,
+            error=str(exc),
+        )
+        return False
+
+
+async def _run_multi_agent_controller_discussion(
+    *,
+    user_message: str,
+    pending_topic: str,
+    cfg: dict[str, object],
+    session_id: str,
+    config: WhaleclawConfig,
+    router: ModelRouter,
+    registry: ToolRegistry,
+    extra_memory: str,
+    trigger_event_id: str,
+    trigger_text_preview: str,
+    include_intro: bool,
+) -> str:
+    roles = [
+        role
+        for role in cast(list[dict[str, object]], cfg["roles"])
+        if bool(role.get("enabled", True))
+    ]
+    mode = cast(str, cfg["mode"])
+    rounds = cast(int, cfg["max_rounds"])
+    scenario = str(cfg.get("scenario", "software_development")).strip()
+    scenario_label = _MULTI_AGENT_SCENARIO_LABELS.get(scenario, scenario or "自定义")
+    discuss_focus = _scenario_discuss_focus(scenario)
+    role_lines = []
+    role_bullets = []
+    for role in roles:
+        name = str(role.get("name", role.get("id", "角色"))).strip() or "角色"
+        duty = _multi_agent_system_prompt(role)
+        role_lines.append(f"- {name}: {duty}")
+        role_bullets.append(f"- {name}")
+    role_block = "\n".join(role_lines) if role_lines else "- （暂无角色）"
+    role_intro = "\n".join(role_bullets) if role_bullets else "- （暂无角色）"
+
+    discuss_prompt = (
+        "你是“多Agent主控协调者”。当前阶段只做需求澄清，不允许启动多角色执行。\n"
+        "请复述你理解的用户目标，再给 2-3 条有价值建议，最后提出最多 3 个澄清问题。\n"
+        "如果信息已经足够执行，也不要直接执行，只需提示用户回复“确认需求”后立即启动多Agent执行。\n"
+        "语气自然，不要像程序状态页。\n\n"
+        f"场景澄清重点：{discuss_focus}\n\n"
+        f"当前配置：场景={scenario_label}，模式={mode}，最大回合={rounds}\n"
+        f"角色分工：\n{role_block}\n\n"
+        f"累计议题：\n{pending_topic}\n\n"
+        f"用户本轮消息：\n{user_message}\n"
+    )
+    output = await run_agent(
+        message=discuss_prompt,
+        session_id=f"{session_id}::ma::controller",
+        config=config,
+        on_stream=None,
+        session=None,
+        router=router,
+        registry=registry,
+        on_tool_call=None,
+        on_tool_result=None,
+        images=None,
+        session_manager=None,
+        session_store=None,
+        memory_manager=None,
+        extra_memory=extra_memory,
+        trigger_event_id=trigger_event_id,
+        trigger_text_preview=trigger_text_preview,
+        group_compressor=None,
+        multi_agent_internal=True,
+    )
+    output = output.strip()
+    intro = (
+        "我是主控Agent协调者。\n"
+        f"当前场景：{scenario_label}；协作模式：{'并行' if mode == 'parallel' else '串行'}；"
+        f"最大回合：{rounds}。\n"
+        f"本轮将使用这 4 个角色协作：\n{role_intro}\n"
+    )
+    intro_block = f"{intro}\n" if include_intro else ""
+    if output:
+        return (
+            f"{intro_block}{output}\n\n"
+            "如果你觉得需求已经讲清楚，请回复“确认需求”；"
+            "如果要改回合可回复“改为2轮”；不想继续可回复“取消”。\n"
+            "你也可以直接指定交付物：例如“交付 PRD 文档 + 流程图图片 + 里程碑表”。"
+        )
+    return (
+        f"{intro_block}"
+        "我先和你确认需求：请补充目标、交付形式、截止时间与约束。"
+        "信息齐后回复“确认需求”，我会立即启动多Agent执行。"
+    )
+
+
+def _multi_agent_system_prompt(role: dict[str, object]) -> str:
+    text = str(role.get("system_prompt", "")).strip()
+    if text:
+        return text
+    return "负责从本角色视角提出可执行方案、风险与下一步建议。"
+
+
+def _compact_role_output(text: str, max_chars: int = 600) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[:max_chars] + "..."
+
+
+def _looks_like_bad_coordinator_output(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    hints = (
+        "请把下方各角色多轮输出",
+        "把各角色输出贴出来",
+        "请粘贴各角色",
+        "请提供各角色",
+        "请先提供角色输出",
+        "你提供的各角色多轮输出",
+        "把下面这些内容贴出来",
+        "你把材料发来",
+        "请把材料发来",
+        "我会把你提供的各角色",
+    )
+    if any(h in t for h in hints):
+        return True
+    ask_user_hints = (
+        "请你补充",
+        "请补充",
+        "请回复",
+        "你回复",
+        "请回答",
+        "你回答",
+        "请确认",
+        "需要你确认",
+        "请发我",
+        "你发我",
+        "你把",
+        "任选其一",
+        "任意选一种",
+        "为了我马上开工",
+        "我就能继续",
+        "我才能继续",
+    )
+    if any(h in t for h in ask_user_hints):
+        return True
+    if ("?" in t or "？" in t) and ("你" in t or "请" in t):
+        return True
+    if t.startswith("我将使用 ") and " 技能继续完成任务" in t:
+        return True
+    return "各角色" in t and ("贴出来" in t or "粘贴" in t or "发来" in t)
+
+
+def _is_transient_multi_agent_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    signals = (
+        "error 500",
+        "server_error",
+        "responses api error 500",
+        "timeout",
+        "timed out",
+        "rate limit",
+        "429",
+        "502",
+        "503",
+        "504",
+    )
+    return any(s in text for s in signals)
+
+
+def _looks_like_role_stall_output(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    hints = (
+        "我将使用",
+        "请你补充",
+        "请补充",
+        "你可以直接",
+        "你现在想先做哪一块",
+        "你先发",
+        "我将以",
+        "为了更高效推进",
+        "为了马上进入状态",
+        "请把要评审的内容发我",
+    )
+    if any(h in t for h in hints):
+        return True
+    return "?" in t or "？" in t
+
+
+def _role_config(config: WhaleclawConfig, role_model: str) -> WhaleclawConfig:
+    if not role_model:
+        return config
+    copied = config.model_copy(deep=True)
+    copied.agent.model = role_model
+    return copied
+
+
+def _need_image_output(user_message: str) -> bool:
+    t = user_message.lower()
+    negative_hints = (
+        "不要图片",
+        "不需要图片",
+        "无需图片",
+        "不要配图",
+        "不需要配图",
+        "无需配图",
+        "纯文字",
+        "仅文字",
+        "只要文字",
+        "text only",
+    )
+    if any(h in t for h in negative_hints):
+        return False
+    hints = (
+        "配图",
+        "图片",
+        "图文",
+        "海报",
+        "封面",
+        "插图",
+        "image",
+        "images",
+        "poster",
+        "cover",
+    )
+    return any(h in t for h in hints)
+
+
+def _extract_requested_deliverables(user_message: str) -> list[str]:
+    t = user_message.lower()
+    out: list[str] = []
+    rules: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
+        ("word", ("word", "docx", ".docx"), ("不要word", "不需要word", "不要docx", "不需要docx")),
+        ("ppt", ("ppt", "pptx", ".pptx", "幻灯片", "演示文稿"), ("不要ppt", "不需要ppt")),
+        ("excel", ("excel", "xlsx", ".xlsx", "表格"), ("不要excel", "不需要excel", "不要表格")),
+        ("html", ("html", "网页", "web页面"), ("不要html", "不需要html", "不要网页")),
+        ("pdf", ("pdf", ".pdf"), ("不要pdf", "不需要pdf")),
+        (
+            "script",
+            ("脚本", "python脚本", "py脚本", ".py", ".sh", "shell脚本", "bash脚本"),
+            ("不要脚本", "不需要脚本"),
+        ),
+        (
+            "image",
+            ("图片", "配图", "图文", "海报", "封面", "image", "images"),
+            ("不要图片", "不需要图片", "不要配图", "不需要配图"),
+        ),
+    ]
+    for name, positives, negatives in rules:
+        if any(n in t for n in negatives):
+            continue
+        if any(p in t for p in positives):
+            out.append(name)
+    return out
+
+
+def _subset_registry(registry: ToolRegistry, allowed_names: set[str]) -> ToolRegistry:
+    sub = ToolRegistry()
+    for name in sorted(allowed_names):
+        tool = registry.get(name)
+        if tool is not None:
+            sub.register(tool)
+    return sub
+
+
+def _choose_round_tool_lock(
+    *,
+    registry: ToolRegistry,
+    user_message: str,
+    shared_context: str,
+    round_no: int,
+    requested_deliverables: list[str],
+) -> list[str]:
+    query = f"第{round_no}轮\n{user_message}\n{shared_context}"
+    selected = _select_native_tool_names(registry, query)
+    for deliverable in requested_deliverables:
+        if deliverable == "word":
+            selected.update({"file_write", "docx_edit", "bash"})
+        elif deliverable == "ppt":
+            selected.update({"file_write", "ppt_edit", "bash"})
+        elif deliverable == "excel":
+            selected.update({"file_write", "xlsx_edit", "bash"})
+        elif deliverable == "html":
+            selected.update({"file_write", "file_edit"})
+        elif deliverable == "pdf":
+            selected.update({"file_write", "bash"})
+        elif deliverable == "image":
+            selected.update({"browser", "file_write"})
+    if not selected:
+        selected = {"file_read", "file_write"}
+    return sorted(selected)
+
+
+def _clip_text_for_role_view(text: str, max_chars: int = 200) -> str:
+    t = " ".join(text.split()).strip()
+    if len(t) <= max_chars:
+        return t
+    return t[:max_chars] + "..."
+
+
+def _build_multi_agent_requirement_baseline(
+    *,
+    message: str,
+    scenario: str,
+    mode: str,
+    max_rounds: int,
+    requested_deliverables: list[str],
+) -> str:
+    scenario_label = _MULTI_AGENT_SCENARIO_LABELS.get(scenario, scenario or "自定义")
+    deliverables = ", ".join(requested_deliverables) if requested_deliverables else "未明确指定"
+    text = (
+        "【冻结需求基线（每轮必须遵守，不得改写目标）】\n"
+        f"- 场景: {scenario_label}\n"
+        f"- 协作: {mode}\n"
+        f"- 轮次: {max_rounds}\n"
+        f"- 交付类型: {deliverables}\n"
+        f"- 用户确认需求原文:\n{message}\n"
+    )
+    return _truncate_to_tokens(text, 700)
+
+
+async def _run_multi_agent_executor(
+    *,
+    message: str,
+    session_id: str,
+    config: WhaleclawConfig,
+    on_stream: StreamCallback | None,
+    router: ModelRouter,
+    registry: ToolRegistry,
+    images: list[ImageContent] | None,
+    extra_memory: str,
+    trigger_event_id: str,
+    trigger_text_preview: str,
+    ma_cfg: dict[str, object],
+    on_round_result: OnRoundResult | None = None,
+) -> str:
+    roles = [
+        role
+        for role in cast(list[dict[str, object]], ma_cfg["roles"])
+        if bool(role.get("enabled", True))
+    ]
+    if not roles:
+        return "多Agent已启用，但没有可用角色。请在“多Agent”页面至少启用一个角色。"
+
+    mode = cast(str, ma_cfg["mode"])
+    max_rounds = cast(int, ma_cfg["max_rounds"])
+    scenario = str(ma_cfg.get("scenario", "software_development")).strip()
+    requested_deliverables = _extract_requested_deliverables(message)
+    include_image_output = "image" in requested_deliverables or _need_image_output(message)
+    requirement_baseline = _build_multi_agent_requirement_baseline(
+        message=message,
+        scenario=scenario,
+        mode=mode,
+        max_rounds=max_rounds,
+        requested_deliverables=requested_deliverables,
+    )
+    if on_stream is not None:
+        await on_stream(
+            f"[多Agent] 已启用 {len(roles)} 个角色，模式={mode}，最大回合={max_rounds}。"
+        )
+
+    history_blocks: list[str] = []
+    round_deliveries: list[str] = []
+    shared_context = ""
+    last_delivery_paths: list[str] = []
+
+    async def _run_one_role(
+        role: dict[str, object],
+        round_no: int,
+        context_block: str,
+        round_tools: list[str],
+        round_registry: ToolRegistry,
+        start_delay: float = 0.0,
+    ) -> tuple[str, str, str]:
+        if start_delay > 0:
+            await asyncio.sleep(start_delay)
+        role_id = str(role.get("id", "role")).strip() or "role"
+        role_name = str(role.get("name", role_id)).strip() or role_id
+        prompt = _multi_agent_system_prompt(role)
+        role_msg = (
+            f"你当前扮演的角色是「{role_name}」。\n"
+            f"角色职责：{prompt}\n"
+            f"当前是协作第 {round_no}/{max_rounds} 轮。\n"
+            f"用户原始议题：{message}\n"
+        )
+        role_msg += f"\n{requirement_baseline}\n"
+        if context_block:
+            role_msg += f"\n前序协作要点：\n{context_block}\n"
+        if last_delivery_paths:
+            hint_lines = [f"- {p}" for p in last_delivery_paths]
+            role_msg += (
+                "\n上一轮最终交付路径（读取这些文件继续优化，并另存为本轮新版本，不要覆盖旧版）：\n"
+                + "\n".join(hint_lines)
+                + "\n"
+            )
+        role_msg += (
+            f"\n本轮工具锁定：{', '.join(round_tools)}\n"
+            "\n请只输出“本角色观点（<=200字）”。\n"
+            "要求：必须给出明确判断/建议；不要列步骤。\n"
+            "限制：\n"
+            "- 不要向用户追问或索取额外材料。\n"
+            "- 信息不足时请自行做“最小必要假设”，并在输出中明确标注“假设”。\n"
+            "- 禁止出现“我将使用xx技能继续完成任务”等过程话术。\n"
+        )
+
+        role_cfg = _role_config(config, str(role.get("model", "")).strip())
+        last_error = ""
+        for attempt in range(1, 4):
+            try:
+                output = await run_agent(
+                    message=role_msg,
+                    session_id=f"{session_id}::ma::{role_id}::r{round_no}",
+                    config=role_cfg,
+                    on_stream=None,
+                    session=None,
+                    router=router,
+                    registry=round_registry,
+                    on_tool_call=None,
+                    on_tool_result=None,
+                    images=None,
+                    session_manager=None,
+                    session_store=None,
+                    memory_manager=None,
+                    extra_memory=extra_memory,
+                    trigger_event_id=trigger_event_id,
+                    trigger_text_preview=trigger_text_preview,
+                    group_compressor=None,
+                    multi_agent_internal=True,
+                )
+                cleaned = output.strip()
+                if not _looks_like_role_stall_output(cleaned):
+                    return role_id, role_name, cleaned
+                rewrite_prompt = (
+                    f"你是角色「{role_name}」。下面是一次无效输出，请改写成可直接交付的轮次结果。\n"
+                    "要求：\n"
+                    "1) 给出本轮结论（必须具体）\n"
+                    "2) 给出3-5条可执行行动项（禁止提问）\n"
+                    "3) 给出需要其他角色配合的点\n"
+                    "4) 若信息不足，写明“假设”但仍要给出可执行版本\n\n"
+                    f"无效输出：\n{cleaned}\n"
+                )
+                rewritten = await run_agent(
+                    message=rewrite_prompt,
+                    session_id=f"{session_id}::ma::{role_id}::rewrite::{round_no}",
+                    config=role_cfg,
+                    on_stream=None,
+                    session=None,
+                    router=router,
+                    registry=round_registry,
+                    on_tool_call=None,
+                    on_tool_result=None,
+                    images=None,
+                    session_manager=None,
+                    session_store=None,
+                    memory_manager=None,
+                    extra_memory=extra_memory,
+                    trigger_event_id=trigger_event_id,
+                    trigger_text_preview=trigger_text_preview,
+                    group_compressor=None,
+                    multi_agent_internal=True,
+                )
+                rewritten_clean = rewritten.strip()
+                if not _looks_like_role_stall_output(rewritten_clean):
+                    return role_id, role_name, rewritten_clean
+                fallback = "观点：在既有信息下先交付可用版本，假设最小化并保留下一轮优化空间。"
+                return role_id, role_name, fallback
+            except Exception as exc:
+                last_error = str(exc)
+                if not _is_transient_multi_agent_error(exc) or attempt >= 3:
+                    break
+                await asyncio.sleep(0.8 * attempt)
+        return role_id, role_name, f"（角色执行失败，已跳过：{last_error or '未知错误'}）"
+
+    aborted_round_no: int | None = None
+    for round_no in range(1, max_rounds + 1):
+        round_tools = _choose_round_tool_lock(
+            registry=registry,
+            user_message=message,
+            shared_context=shared_context,
+            round_no=round_no,
+            requested_deliverables=requested_deliverables,
+        )
+        round_registry = _subset_registry(registry, set(round_tools))
+        role_outputs: list[tuple[str, str, str]] = []
+        if mode == "parallel":
+            role_outputs = await asyncio.gather(
+                *[
+                    _run_one_role(
+                        role,
+                        round_no,
+                        shared_context,
+                        round_tools,
+                        round_registry,
+                        idx * 0.25,
+                    )
+                    for idx, role in enumerate(roles)
+                ],
+                return_exceptions=False,
+            )
+        else:
+            for role in roles:
+                role_outputs.append(
+                    await _run_one_role(
+                        role,
+                        round_no,
+                        shared_context,
+                        round_tools,
+                        round_registry,
+                    )
+                )
+
+        lines: list[str] = [f"### 第 {round_no} 轮角色观点"]
+        for _, role_name, out in role_outputs:
+            result = _clip_text_for_role_view((out or "（无输出）").strip(), 200)
+            lines.append(f"- {role_name}：{result}")
+        role_round_block = "\n".join(lines)
+        history_blocks.append(role_round_block)
+
+        requested_text = ", ".join(requested_deliverables) if requested_deliverables else "未指定"
+        round_synthesize_message = (
+            "你是“结果协调者 Agent”。请基于本轮角色输出，给出“本轮唯一交付结果”。\n"
+            f"用户原始议题：{message}\n"
+            f"当前场景：{_MULTI_AGENT_SCENARIO_LABELS.get(scenario, scenario or '自定义')}\n"
+            f"当前轮次：第 {round_no}/{max_rounds} 轮\n\n"
+            f"{requirement_baseline}\n"
+            f"本轮工具锁定：{', '.join(round_tools)}\n"
+            f"用户要求交付类型：{requested_text}\n"
+            f"本轮角色输出：\n{role_round_block}\n\n"
+            "输出格式（严格遵守，精简）：\n"
+            f"## 第 {round_no} 轮交付\n"
+            "1) 本轮工具锁定（原样回写）\n"
+            "2) 角色观点（4条，每条<=200字）\n"
+            "3) 本轮可直接交付结果（必须给出具体内容）\n"
+            "4) 结果协调者执行记录（本轮调用了哪些工具、产出什么路径）\n"
+            "5) 与上一轮相比的改进点（没有则写“首轮基线”）\n"
+            "限制：\n"
+            "- 禁止向用户提问。\n"
+            "- 禁止要求用户补充材料。\n"
+            "- 不要解释过程，不要贴角色原文。\n"
+            "- 禁止出现“我将使用xx技能继续完成任务”这类过程话术。\n"
+            "- 总长度控制在 700-1200 中文字符。\n"
+            "- 若用户明确要求了文件类型（如 html/excel/word/ppt/pdf），"
+            "必须调用工具真实生成并返回绝对路径。\n"
+            "- 若已有上一轮文件路径，必须在其基础上优化，但最终请另存为本轮新版本文件，"
+            "文件名后缀使用 `_V轮次`（如 `_V2`），不要覆盖上一轮。\n"
+        )
+        if last_delivery_paths:
+            path_lines = [f"- {p}" for p in last_delivery_paths]
+            round_synthesize_message += (
+                "\n上一轮可复用最终交付路径：\n"
+                + "\n".join(path_lines)
+                + "\n"
+            )
+        if include_image_output:
+            round_synthesize_message += (
+                "附加要求（必须满足）：\n"
+                "- 增加“4) 配图”章节。\n"
+                "- 配图数量不要写死：应根据本轮交付内容的页数/模块数与信息密度决定，"
+                "确保关键页面或关键模块都有对应图片支撑。\n"
+                "- 无论交付是 PPT/Word/HTML/PDF 等，都请先列“结构化配图清单”"
+                "（按页/按章节/按模块，注明每块需要几张、主体是什么），"
+                "再按清单逐项拉图；不同主体必须分别调用 search_images。\n"
+                "- 除非用户明确同意，不要把同一张图重复用于多页。\n"
+                "- 若有真实图片链接，用 Markdown 图片格式给出；\n"
+                "- 若无真实图片，给“可直接用于生成图”的提示词"
+                "（含主体/场景/风格/光线/构图）。\n"
+            )
+        round_delivery = ""
+        delivery_accepted = False
+        last_round_error = ""
+
+        async def _run_round_coordinator(
+            pass_no: int,
+            base_message: str = round_synthesize_message,
+            current_round_no: int = round_no,
+            current_registry: ToolRegistry = round_registry,
+        ) -> tuple[str, bool, str]:
+            msg = base_message
+            if pass_no == 2:
+                msg += (
+                    "\n这是本轮自动重跑（第2次也是最后一次）。"
+                    "请严格围绕当前议题与上一轮交付输出最终结果；"
+                    "禁止泛化模板与跑题内容。\n"
+                )
+            try:
+                out = await run_agent(
+                    message=msg,
+                    session_id=f"{session_id}::ma::round::{current_round_no}::p{pass_no}",
+                    config=config,
+                    on_stream=None,
+                    session=None,
+                    router=router,
+                    registry=current_registry,
+                    on_tool_call=None,
+                    on_tool_result=None,
+                    images=None,
+                    session_manager=None,
+                    session_store=None,
+                    memory_manager=None,
+                    extra_memory=extra_memory,
+                    trigger_event_id=trigger_event_id,
+                    trigger_text_preview=trigger_text_preview,
+                    group_compressor=None,
+                    multi_agent_internal=True,
+                )
+                clean = out.strip()
+                ok = bool(clean) and not _looks_like_bad_coordinator_output(clean)
+                return clean or out, ok, ""
+            except Exception as exc:
+                return "", False, str(exc)
+
+        first_out, first_ok, first_err = await _run_round_coordinator(1)
+        if first_ok:
+            round_delivery = first_out
+            delivery_accepted = True
+        else:
+            last_round_error = first_err
+            if on_stream is not None:
+                await on_stream(
+                    f"[多Agent] 第 {round_no} 轮首次失败，自动重跑本轮一次（止损上限=2次）。"
+                )
+            second_out, second_ok, second_err = await _run_round_coordinator(2)
+            if second_ok:
+                round_delivery = second_out
+                delivery_accepted = True
+            else:
+                if second_out:
+                    round_delivery = second_out
+                last_round_error = second_err or last_round_error
+
+        if not delivery_accepted:
+            fallback_base = (
+                f"## 第 {round_no} 轮交付\n"
+                f"1) 本轮工具锁定：{', '.join(round_tools)}\n"
+                "2) 角色观点（4条）：\n"
+                + "\n".join(lines[1:])
+                + "\n"
+            )
+            if round_no > 1 and round_deliveries:
+                prev = _extract_round_delivery_section(round_deliveries[-1]) or round_deliveries[-1]
+                base = (
+                    fallback_base
+                    + "3) 本轮可直接交付结果（降级继承上一轮并保持可用）：\n"
+                    + prev
+                    + "\n"
+                    + "4) 结果协调者执行记录：本轮协调输出未达交付标准，"
+                    + "已自动继承上一轮最终交付作为本轮基线，避免内容漂移。"
+                )
+                if last_round_error:
+                    base += f" 错误摘要：{last_round_error[:180]}"
+                base += "\n"
+                if last_delivery_paths:
+                    path_lines = [f"- {p}" for p in last_delivery_paths]
+                    base += "   复用文件路径：\n" + "\n".join(path_lines) + "\n"
+                base += "5) 与上一轮相比的改进点：本轮为稳定性兜底，未引入新改动。\n"
+            else:
+                base = (
+                    fallback_base
+                    + "3) 本轮可直接使用的产物：\n"
+                    "- 基于角色观点的可执行摘要\n"
+                    "- 当前轮次的风险与下一步建议\n"
+                    "4) 结果协调者执行记录：未拿到稳定工具回执，已返回可直接使用文本版本。\n"
+                    "5) 与上一轮相比的改进点：首轮基线。\n"
+                )
+            if include_image_output:
+                base += (
+                    "6) 配图：\n"
+                    "- 提示词：一个极简现代马克杯放在木质办公桌上，清晨自然光，"
+                    "45度侧拍，浅景深，真实摄影风格，4:3构图。\n"
+                )
+            round_delivery = base
+            aborted_round_no = round_no
+
+        round_deliveries.append(round_delivery)
+        allow_script_paths = "script" in requested_deliverables
+        detected_paths = _extract_delivery_artifact_paths(
+            round_delivery,
+            include_scripts=allow_script_paths,
+        )
+        existing_paths = [
+            str(Path(p).expanduser().resolve())
+            for p in detected_paths
+            if Path(p).expanduser().exists()
+        ]
+        if existing_paths:
+            verified_lines = [f"- {p}" for p in existing_paths]
+            round_delivery = (
+                f"{round_delivery.rstrip()}\n\n"
+                "7) 系统校验的实际产物绝对路径（以此为准）\n"
+                + "\n".join(verified_lines)
+            )
+        if existing_paths:
+            versioned_paths = _snapshot_round_artifacts(existing_paths, round_no)
+            last_delivery_paths = versioned_paths or existing_paths
+        context_chunks: list[str] = []
+        for idx, delivery in enumerate(round_deliveries, 1):
+            section = _extract_round_delivery_section(delivery) or delivery
+            context_chunks.append(f"[第{idx}轮最终交付]\n{section.strip()}")
+        shared_context = _truncate_to_tokens(
+            f"{requirement_baseline}\n\n" + "\n\n".join(context_chunks),
+            1400,
+        )
+        if on_round_result is not None:
+            await on_round_result(round_no, round_delivery)
+
+        if on_stream is not None:
+            await on_stream(
+                "[多Agent] "
+                f"第 {round_no} 轮交付：\n"
+                f"{round_delivery}\n"
+            )
+
+        if aborted_round_no == round_no:
+            if on_stream is not None:
+                await on_stream(
+                    f"[多Agent] 第 {round_no} 轮连续两次失败，"
+                    "已提前结束后续轮次以避免偏离目标与额外消耗。"
+                )
+            break
+
+    if aborted_round_no is not None:
+        return (
+            f"多Agent执行已提前结束，停在第 {aborted_round_no} 轮（该轮两次失败已止损）。"
+            f"已产出 {len(round_deliveries)} 轮结果。"
+        )
+    return f"多Agent执行完成，共 {len(round_deliveries)} 轮。"
+
+
 async def run_agent(
     message: str,
     session_id: str,
@@ -1815,6 +3070,7 @@ async def run_agent(
     registry: ToolRegistry | None = None,
     on_tool_call: OnToolCall | None = None,
     on_tool_result: OnToolResult | None = None,
+    on_round_result: OnRoundResult | None = None,
     images: list[ImageContent] | None = None,
     session_manager: SessionManager | None = None,
     session_store: SessionStore | None = None,
@@ -1823,6 +3079,7 @@ async def run_agent(
     trigger_event_id: str = "",
     trigger_text_preview: str = "",
     group_compressor: "SessionGroupCompressor | None" = None,
+    multi_agent_internal: bool = False,
 ) -> str:
     """Run the Agent loop with tool support and multi-turn context.
 
@@ -1843,6 +3100,217 @@ async def run_agent(
     if registry is None:
         registry = create_default_registry()
 
+    if not multi_agent_internal:
+        ma_cfg = _resolve_multi_agent_cfg(config, session)
+        await _sync_multi_agent_compression_boundary(
+            session,
+            session_manager,
+            group_compressor,
+            ma_enabled=bool(ma_cfg.get("enabled", False)),
+        )
+        if bool(ma_cfg.get("enabled", False)):
+            if session is not None:
+                state = str(session.metadata.get("multi_agent_state", "")).strip().lower()
+                waiting = state == "confirm" or (state == "" and bool(
+                    session.metadata.get("multi_agent_waiting_confirm", False)
+                ))
+                intro_done = bool(session.metadata.get("multi_agent_intro_done", False))
+                pending_topic = str(session.metadata.get("multi_agent_pending_topic", "")).strip()
+
+                if waiting and _is_multi_agent_cancel(message):
+                    session.metadata.pop("multi_agent_state", None)
+                    session.metadata.pop("multi_agent_waiting_confirm", None)
+                    session.metadata.pop("multi_agent_intro_done", None)
+                    session.metadata.pop("multi_agent_pending_topic", None)
+                    session.metadata.pop("multi_agent_pending_rounds", None)
+                    await _persist_session_metadata(session, session_manager)
+                    return "已取消本次多Agent执行。你可以继续普通对话，或发新需求后再确认启动。"
+
+                rounds_override = _extract_multi_agent_rounds(message)
+                if rounds_override is not None and waiting:
+                    session.metadata["multi_agent_pending_rounds"] = rounds_override
+                    topic = _attach_rounds_marker(pending_topic or message, rounds_override)
+                    session.metadata["multi_agent_pending_topic"] = topic
+                    await _persist_session_metadata(session, session_manager)
+                    ma_cfg["max_rounds"] = rounds_override
+                    return await _run_multi_agent_controller_discussion(
+                        user_message=message,
+                        pending_topic=topic,
+                        cfg=ma_cfg,
+                        session_id=session_id,
+                        config=config,
+                        router=router,
+                        registry=registry,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        include_intro=not intro_done,
+                    )
+
+                if state == "discuss":
+                    if _is_multi_agent_cancel(message):
+                        session.metadata.pop("multi_agent_state", None)
+                        session.metadata.pop("multi_agent_intro_done", None)
+                        session.metadata.pop("multi_agent_pending_topic", None)
+                        session.metadata.pop("multi_agent_pending_rounds", None)
+                        await _persist_session_metadata(session, session_manager)
+                        return "已取消本次多Agent讨论。你可以继续普通对话。"
+
+                    topic = pending_topic
+
+                    if _is_multi_agent_discuss_done(message):
+                        rounds_raw = session.metadata.get("multi_agent_pending_rounds")
+                        if isinstance(rounds_raw, int):
+                            ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+                        cleaned_topic, marker_rounds = _extract_rounds_marker(topic or "")
+                        if not isinstance(rounds_raw, int) and marker_rounds is not None:
+                            ma_cfg["max_rounds"] = marker_rounds
+                        session.metadata.pop("multi_agent_state", None)
+                        session.metadata.pop("multi_agent_waiting_confirm", None)
+                        session.metadata.pop("multi_agent_intro_done", None)
+                        session.metadata.pop("multi_agent_pending_topic", None)
+                        session.metadata.pop("multi_agent_pending_rounds", None)
+                        await _persist_session_metadata(session, session_manager)
+                        return await _run_multi_agent_executor(
+                            message=cleaned_topic or "（请补充你的任务目标）",
+                            session_id=session_id,
+                            config=config,
+                            on_stream=on_stream,
+                            router=router,
+                            registry=registry,
+                            images=images,
+                            extra_memory=extra_memory,
+                            trigger_event_id=trigger_event_id,
+                            trigger_text_preview=trigger_text_preview,
+                            ma_cfg=ma_cfg,
+                            on_round_result=on_round_result,
+                        )
+
+                    if message.strip():
+                        if topic:
+                            topic = f"{topic}\n补充要求: {message.strip()}".strip()
+                        else:
+                            topic = message.strip()
+                        session.metadata["multi_agent_pending_topic"] = topic
+                    if rounds_override is not None:
+                        session.metadata["multi_agent_pending_rounds"] = rounds_override
+                        session.metadata["multi_agent_pending_topic"] = _attach_rounds_marker(
+                            topic or message,
+                            rounds_override,
+                        )
+                        topic = str(session.metadata["multi_agent_pending_topic"])
+                        ma_cfg["max_rounds"] = rounds_override
+
+                    include_intro = not bool(session.metadata.get("multi_agent_intro_done", False))
+                    if include_intro:
+                        session.metadata["multi_agent_intro_done"] = True
+                    await _persist_session_metadata(session, session_manager)
+                    return await _run_multi_agent_controller_discussion(
+                        user_message=message,
+                        pending_topic=topic or message,
+                        cfg=ma_cfg,
+                        session_id=session_id,
+                        config=config,
+                        router=router,
+                        registry=registry,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        include_intro=include_intro,
+                    )
+
+                if waiting and _is_multi_agent_confirm(message):
+                    topic = pending_topic or message
+                    rounds_raw = session.metadata.get("multi_agent_pending_rounds")
+                    if isinstance(rounds_raw, int):
+                        ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+                    cleaned_topic, marker_rounds = _extract_rounds_marker(topic or "")
+                    if not isinstance(rounds_raw, int) and marker_rounds is not None:
+                        ma_cfg["max_rounds"] = marker_rounds
+                    session.metadata.pop("multi_agent_state", None)
+                    session.metadata.pop("multi_agent_waiting_confirm", None)
+                    session.metadata.pop("multi_agent_intro_done", None)
+                    session.metadata.pop("multi_agent_pending_topic", None)
+                    session.metadata.pop("multi_agent_pending_rounds", None)
+                    await _persist_session_metadata(session, session_manager)
+                    return await _run_multi_agent_executor(
+                        message=cleaned_topic or topic,
+                        session_id=session_id,
+                        config=config,
+                        on_stream=on_stream,
+                        router=router,
+                        registry=registry,
+                        images=images,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        ma_cfg=ma_cfg,
+                        on_round_result=on_round_result,
+                    )
+
+                if waiting and not _is_multi_agent_confirm(message):
+                    topic = pending_topic
+                    if message.strip() and not _is_multi_agent_cancel(message):
+                        topic = f"{topic}\n补充要求: {message.strip()}".strip()
+                        session.metadata["multi_agent_pending_topic"] = topic
+                        await _persist_session_metadata(session, session_manager)
+                    rounds_raw = session.metadata.get("multi_agent_pending_rounds")
+                    if isinstance(rounds_raw, int):
+                        ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+                    else:
+                        _, marker_rounds = _extract_rounds_marker(topic or "")
+                        if marker_rounds is not None:
+                            ma_cfg["max_rounds"] = marker_rounds
+                    topic = topic or "（请补充你的任务目标）"
+                    return await _run_multi_agent_controller_discussion(
+                        user_message=message,
+                        pending_topic=topic,
+                        cfg=ma_cfg,
+                        session_id=session_id,
+                        config=config,
+                        router=router,
+                        registry=registry,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        include_intro=False,
+                    )
+
+                session.metadata["multi_agent_state"] = "discuss"
+                session.metadata["multi_agent_waiting_confirm"] = False
+                session.metadata["multi_agent_intro_done"] = True
+                session.metadata["multi_agent_pending_topic"] = message.strip() or message
+                session.metadata.pop("multi_agent_pending_rounds", None)
+                await _persist_session_metadata(session, session_manager)
+                return await _run_multi_agent_controller_discussion(
+                    user_message=message,
+                    pending_topic=message.strip() or message,
+                    cfg=ma_cfg,
+                    session_id=session_id,
+                    config=config,
+                    router=router,
+                    registry=registry,
+                    extra_memory=extra_memory,
+                    trigger_event_id=trigger_event_id,
+                    trigger_text_preview=trigger_text_preview,
+                    include_intro=True,
+                )
+
+            return await _run_multi_agent_executor(
+                message=message,
+                session_id=session_id,
+                config=config,
+                on_stream=on_stream,
+                router=router,
+                registry=registry,
+                images=images,
+                extra_memory=extra_memory,
+                trigger_event_id=trigger_event_id,
+                trigger_text_preview=trigger_text_preview,
+                ma_cfg=ma_cfg,
+                on_round_result=on_round_result,
+            )
+
     if _is_evomap_status_question(message):
         enabled = _is_evomap_enabled(config)
         switch_text = "已开启" if enabled else "已关闭"
@@ -1858,88 +3326,78 @@ async def run_agent(
     previous_locked_skill_ids: list[str] = []
     lock_waiting_done = False
     skill_announce_pending = False
-    if session is not None:
-        raw_locked = session.metadata.get("locked_skill_ids")
-        if isinstance(raw_locked, list):
-            locked_skill_ids = [
-                str(x).strip().lower()
-                for x in raw_locked
-                if isinstance(x, str) and str(x).strip()
-            ]
-        elif isinstance(session.metadata.get("forced_skill_id"), str):
-            legacy_forced = str(session.metadata.get("forced_skill_id", "")).strip().lower()
-            if legacy_forced:
-                locked_skill_ids = [legacy_forced]
-                session.metadata["locked_skill_ids"] = locked_skill_ids
-                session.metadata.pop("forced_skill_id", None)
-                metadata_dirty = True
-        raw_waiting = session.metadata.get("skill_lock_waiting_done")
-        lock_waiting_done = bool(raw_waiting)
-        skill_announce_pending = bool(session.metadata.get("skill_lock_announce_pending"))
-    previous_locked_skill_ids = list(locked_skill_ids)
+    routed_skills: list[Skill] = []
+    routed_skill_ids: list[str] = []
+    if not multi_agent_internal:
+        if session is not None:
+            raw_locked = session.metadata.get("locked_skill_ids")
+            if isinstance(raw_locked, list):
+                locked_skill_ids = [
+                    str(x).strip().lower()
+                    for x in raw_locked
+                    if isinstance(x, str) and str(x).strip()
+                ]
+            elif isinstance(session.metadata.get("forced_skill_id"), str):
+                legacy_forced = str(session.metadata.get("forced_skill_id", "")).strip().lower()
+                if legacy_forced:
+                    locked_skill_ids = [legacy_forced]
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata.pop("forced_skill_id", None)
+                    metadata_dirty = True
+            raw_waiting = session.metadata.get("skill_lock_waiting_done")
+            lock_waiting_done = bool(raw_waiting)
+            skill_announce_pending = bool(session.metadata.get("skill_lock_announce_pending"))
+        previous_locked_skill_ids = list(locked_skill_ids)
 
-    use_cmd = _parse_use_command(message)
-    if use_cmd is not None:
-        use_skill_ids, remainder = use_cmd
-        if len(use_skill_ids) == 1 and use_skill_ids[0] in _USE_CLEAR_IDS:
+        use_cmd = _parse_use_command(message)
+        if use_cmd is not None:
+            use_skill_ids, remainder = use_cmd
+            if len(use_skill_ids) == 1 and use_skill_ids[0] in _USE_CLEAR_IDS:
+                locked_skill_ids = []
+                lock_waiting_done = False
+                skill_announce_pending = False
+                if session is not None:
+                    session.metadata.pop("locked_skill_ids", None)
+                    session.metadata.pop("skill_lock_waiting_done", None)
+                    session.metadata.pop("skill_lock_announce_pending", None)
+                    session.metadata.pop("skill_param_state", None)
+                    metadata_dirty = True
+                if remainder:
+                    llm_message = remainder
+            else:
+                locked_skill_ids = use_skill_ids
+                lock_waiting_done = False
+                skill_announce_pending = True
+                if session is not None:
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata["skill_lock_waiting_done"] = False
+                    session.metadata["skill_lock_announce_pending"] = True
+                    metadata_dirty = True
+                llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
+        elif lock_waiting_done and _is_task_done_confirmation(message):
             locked_skill_ids = []
             lock_waiting_done = False
-            skill_announce_pending = False
             if session is not None:
                 session.metadata.pop("locked_skill_ids", None)
                 session.metadata.pop("skill_lock_waiting_done", None)
                 session.metadata.pop("skill_lock_announce_pending", None)
                 session.metadata.pop("skill_param_state", None)
-                metadata_dirty = True
-            if remainder:
-                llm_message = remainder
-        else:
-            locked_skill_ids = use_skill_ids
+                if session_manager is not None:
+                    await session_manager._store.update_session_field(  # noqa: SLF001
+                        session.id,
+                        metadata=session.metadata,
+                    )
+            return "已确认任务完成，已解除本轮技能锁定。"
+        elif lock_waiting_done:
             lock_waiting_done = False
-            skill_announce_pending = True
             if session is not None:
-                session.metadata["locked_skill_ids"] = locked_skill_ids
                 session.metadata["skill_lock_waiting_done"] = False
-                session.metadata["skill_lock_announce_pending"] = True
                 metadata_dirty = True
-            llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
-    elif lock_waiting_done and _is_task_done_confirmation(message):
-        locked_skill_ids = []
-        lock_waiting_done = False
-        if session is not None:
-            session.metadata.pop("locked_skill_ids", None)
-            session.metadata.pop("skill_lock_waiting_done", None)
-            session.metadata.pop("skill_lock_announce_pending", None)
-            session.metadata.pop("skill_param_state", None)
-            if session_manager is not None:
-                await session_manager._store.update_session_field(  # noqa: SLF001
-                    session.id,
-                    metadata=session.metadata,
-                )
-        return "已确认任务完成，已解除本轮技能锁定。"
-    elif lock_waiting_done:
-        lock_waiting_done = False
-        if session is not None:
-            session.metadata["skill_lock_waiting_done"] = False
-            metadata_dirty = True
 
-    routed_skills = _assembler.route_skills(llm_message)
-    routed_skill_ids = _normalize_skill_ids(routed_skills)
+        routed_skills = _assembler.route_skills(llm_message)
+        routed_skill_ids = _normalize_skill_ids(routed_skills)
 
-    # 会话默认“粘住已命中技能”：一旦命中即锁定，直到用户确认任务完成。
-    if not locked_skill_ids and routed_skill_ids:
-        locked_skill_ids = routed_skill_ids
-        lock_waiting_done = False
-        skill_announce_pending = True
-        if session is not None:
-            session.metadata["locked_skill_ids"] = locked_skill_ids
-            session.metadata["skill_lock_waiting_done"] = False
-            session.metadata["skill_lock_announce_pending"] = True
-            metadata_dirty = True
-
-    # 已锁定时禁止自动漂移到其它技能；只有用户明确同意切换才允许切。
-    if locked_skill_ids and routed_skill_ids and routed_skill_ids != locked_skill_ids:
-        if _is_skill_switch_consent(message):
+        if not locked_skill_ids and routed_skill_ids:
             locked_skill_ids = routed_skill_ids
             lock_waiting_done = False
             skill_announce_pending = True
@@ -1948,50 +3406,64 @@ async def run_agent(
                 session.metadata["skill_lock_waiting_done"] = False
                 session.metadata["skill_lock_announce_pending"] = True
                 metadata_dirty = True
-        else:
-            locked = ", ".join(locked_skill_ids)
-            target = ", ".join(routed_skill_ids)
-            return (
-                f"当前任务仍锁定在技能：{locked}。\n"
-                f"检测到你可能想切到：{target}。\n"
-                "请先确认：回复“同意切换技能”，我再切换继续。"
-            )
 
-    # 通用参数采集守卫：技能声明了 param_guard 时，缺参先问清单，不执行工具。
-    if locked_skill_ids and not lock_waiting_done and session is not None:
-        locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)
-        guards = _guarded_skills(locked_skills)
-        if guards:
-            state_map_raw = session.metadata.get("skill_param_state")
-            state_map = state_map_raw.copy() if isinstance(state_map_raw, dict) else {}
-            missing_any = False
-            for skill in guards:
-                guard = skill.param_guard
-                if guard is None:
-                    continue
-                skill_state_raw = state_map.get(skill.id, {})
-                skill_state = skill_state_raw.copy() if isinstance(skill_state_raw, dict) else {}
-                updated, missing = _update_guard_state(
-                    guard.params, skill_state, llm_message, images
+        if locked_skill_ids and routed_skill_ids and routed_skill_ids != locked_skill_ids:
+            if _is_skill_switch_consent(message):
+                locked_skill_ids = routed_skill_ids
+                lock_waiting_done = False
+                skill_announce_pending = True
+                if session is not None:
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata["skill_lock_waiting_done"] = False
+                    session.metadata["skill_lock_announce_pending"] = True
+                    metadata_dirty = True
+            else:
+                locked = ", ".join(locked_skill_ids)
+                target = ", ".join(routed_skill_ids)
+                return (
+                    f"当前任务仍锁定在技能：{locked}。\n"
+                    f"检测到你可能想切到：{target}。\n"
+                    "请先确认：回复“同意切换技能”，我再切换继续。"
                 )
-                state_map[skill.id] = updated
-                missing_any = missing_any or missing
-            session.metadata["skill_param_state"] = state_map
-            metadata_dirty = True
-            if missing_any:
-                if session_manager is not None:
-                    await session_manager._store.update_session_field(  # noqa: SLF001
-                        session.id,
-                        metadata=session.metadata,
+
+        if locked_skill_ids and not lock_waiting_done and session is not None:
+            locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)
+            guards = _guarded_skills(locked_skills)
+            if guards:
+                state_map_raw = session.metadata.get("skill_param_state")
+                state_map = state_map_raw.copy() if isinstance(state_map_raw, dict) else {}
+                missing_any = False
+                for skill in guards:
+                    guard = skill.param_guard
+                    if guard is None:
+                        continue
+                    skill_state_raw = state_map.get(skill.id, {})
+                    skill_state = (
+                        skill_state_raw.copy()
+                        if isinstance(skill_state_raw, dict)
+                        else {}
                     )
-                blocks = [
-                    _build_skill_param_guard_reply(
-                        s.id, s.param_guard.params, state_map.get(s.id, {})
+                    updated, missing = _update_guard_state(
+                        guard.params, skill_state, llm_message, images
                     )
-                    for s in guards
-                    if s.param_guard is not None
-                ]
-                return "\n\n".join(blocks)
+                    state_map[skill.id] = updated
+                    missing_any = missing_any or missing
+                session.metadata["skill_param_state"] = state_map
+                metadata_dirty = True
+                if missing_any:
+                    if session_manager is not None:
+                        await session_manager._store.update_session_field(  # noqa: SLF001
+                            session.id,
+                            metadata=session.metadata,
+                        )
+                    blocks = [
+                        _build_skill_param_guard_reply(
+                            s.id, s.param_guard.params, state_map.get(s.id, {})
+                        )
+                        for s in guards
+                        if s.param_guard is not None
+                    ]
+                    return "\n\n".join(blocks)
 
     if session is not None:
         pending_raw = session.metadata.get("evomap_pending_choices")
@@ -2269,9 +3741,16 @@ async def run_agent(
     ):
         _t_group_start = _time.monotonic()
         try:
+            conversation_for_compress = conversation
+            if isinstance(session.metadata, dict):
+                raw_cutoff = session.metadata.get("compression_resume_message_index")
+                if isinstance(raw_cutoff, int) and raw_cutoff > 0:
+                    cutoff = max(0, min(raw_cutoff, len(conversation) - 1))
+                    if cutoff > 0:
+                        conversation_for_compress = conversation[cutoff:]
             conversation = await group_compressor.build_window_messages(
                 session_id=session_id,
-                messages=conversation,
+                messages=conversation_for_compress,
                 router=router,
                 model_id=summarizer_cfg.model.strip(),
             )

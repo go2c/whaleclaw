@@ -135,6 +135,11 @@ class SessionManager:
         session.thinking_level = level
         await self._store.update_session_field(session.id, thinking_level=level)
 
+    async def update_metadata(self, session: Session, metadata: dict[str, Any]) -> None:
+        """Update session metadata and persist it."""
+        session.metadata = metadata
+        await self._store.update_session_field(session.id, metadata=metadata)
+
     async def reset(self, session_id: str) -> Session | None:
         """Clear messages but keep the session."""
         session = await self.get(session_id)

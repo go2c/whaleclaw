@@ -31,10 +31,15 @@ class _StubClient:
 class _StubSessionManager:
     def __init__(self) -> None:
         self.updated_to: str | None = None
+        self.updated_metadata: dict[str, Any] | None = None
 
     async def update_model(self, session: Any, model: str) -> None:
         session.model = model
         self.updated_to = model
+
+    async def update_metadata(self, session: Any, metadata: dict[str, Any]) -> None:
+        session.metadata = metadata
+        self.updated_metadata = metadata
 
 
 class TestExtractText:
@@ -257,3 +262,58 @@ async def test_model_command_switch_by_index(monkeypatch: pytest.MonkeyPatch) ->
     assert sm.updated_to == "qwen/qwen3-max"
     assert cfg.agent.model == "qwen/qwen3-max"
     assert persisted == ["qwen/qwen3-max"]
+
+
+@pytest.mark.asyncio
+async def test_multi_command_toggle_session_override() -> None:
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+    cfg = WhaleclawConfig()
+    cfg.plugins["multi_agent"] = {
+        "enabled": False,
+        "mode": "parallel",
+        "max_rounds": 2,
+        "roles": [],
+    }
+    sm = _StubSessionManager()
+    bot._whaleclaw_config = cfg  # noqa: SLF001
+    bot._session_manager = sm  # noqa: SLF001
+    session = SimpleNamespace(id="s1", model="openai/gpt-5.2", metadata={})
+
+    on_out = await bot._handle_command("/multi on", session)  # noqa: SLF001
+    off_out = await bot._handle_command("/multi off", session)  # noqa: SLF001
+
+    assert on_out is not None and "已开启本会话多Agent" in on_out
+    assert off_out is not None and "已关闭本会话多Agent" in off_out
+    assert sm.updated_metadata is not None
+    assert sm.updated_metadata.get("multi_agent_enabled") is False
+
+
+@pytest.mark.asyncio
+async def test_multi_command_status_shows_effective_state() -> None:
+    bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
+    cfg = WhaleclawConfig()
+    cfg.plugins["multi_agent"] = {
+        "enabled": False,
+        "mode": "parallel",
+        "max_rounds": 2,
+        "roles": [],
+    }
+    bot._whaleclaw_config = cfg  # noqa: SLF001
+    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    session = SimpleNamespace(
+        id="s1",
+        model="openai/gpt-5.2",
+        metadata={
+            "multi_agent_enabled": True,
+            "multi_agent_mode": "serial",
+            "multi_agent_max_rounds": 4,
+        },
+    )
+
+    out = await bot._handle_command("/multi status", session)  # noqa: SLF001
+
+    assert out is not None
+    assert "全局: 关闭" in out
+    assert "当前生效: 开启" in out
+    assert "串行（serial）" in out
+    assert "回合=4" in out

@@ -96,6 +96,15 @@ createApp({
     const activeTab = ref('chat');
     const skills = ref([]);
     const tools = ref([]);
+    const multiAgentLoading = ref(false);
+    const multiAgentSaving = ref(false);
+    const multiAgentEnabled = ref(false);
+    const multiAgentScenario = ref('software_development');
+    const multiAgentCustomScenarios = ref([]);
+    const multiAgentCustomScenarioInput = ref('');
+    const multiAgentMode = ref('parallel');
+    const multiAgentMaxRounds = ref(3);
+    const multiAgentRoles = ref([]);
     const skillSourceTab = ref('local');
     const skillInstallSource = ref('');
     const skillInstalling = ref(false);
@@ -539,6 +548,490 @@ createApp({
       } catch { /* ignore */ }
     }
 
+    const _MA_SCENARIO_BUILTINS = [
+      { value: 'product_design', label: '产品设计' },
+      { value: 'content_creation', label: '内容创作' },
+      { value: 'software_development', label: '软件开发' },
+      { value: 'data_analysis_decision', label: '数据分析决策' },
+      { value: 'scientific_research', label: '科研' },
+      { value: 'intelligent_assistant', label: '智能助理' },
+      { value: 'workflow_automation', label: '自动化工作流' },
+    ];
+    const _MA_SCENARIO_CUSTOM_ENTRY = { value: '__custom__', label: '自定义' };
+    const _MA_SCENARIO_DEFAULT = 'software_development';
+
+    const _ROLE_PRESETS_BY_SCENARIO = {
+      product_design: [
+        {
+          id: 'product_manager',
+          name: '产品经理',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责把需求变成可执行产品方案。输出：目标用户、核心问题、价值主张、优先级与里程碑。',
+        },
+        {
+          id: 'ux_researcher',
+          name: '用户研究',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责验证用户需求与场景。输出：关键用户画像、使用路径、痛点证据、调研与验证计划。',
+        },
+        {
+          id: 'interaction_designer',
+          name: '交互设计',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责设计信息架构与交互流程。输出：页面结构、关键流程、状态切换、异常处理与可用性原则。',
+        },
+        {
+          id: 'product_reviewer',
+          name: '产品评审',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责从业务、技术、体验与风险角度评审。输出：问题清单、优化建议、上线门槛与验收标准。',
+        },
+      ],
+      content_creation: [
+        {
+          id: 'content_strategist',
+          name: '内容策划',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责内容定位与选题策略。输出：目标受众、传播目标、内容结构、选题矩阵与发布节奏。',
+        },
+        {
+          id: 'copywriter',
+          name: '文案主笔',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责撰写主文案。输出：标题方案、正文初稿、核心论点、金句与行动号召。',
+        },
+        {
+          id: 'editor',
+          name: '编辑润色',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责语言优化与一致性。输出：修订稿、表达问题清单、结构优化点、风格统一建议。',
+        },
+        {
+          id: 'distribution_operator',
+          name: '分发运营',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责渠道分发与增长。输出：渠道改写版本、发布时间建议、互动策略、复盘指标与迭代计划。',
+        },
+      ],
+      software_development: [
+        {
+          id: 'planner',
+          name: '规划师',
+          enabled: true,
+          model: '',
+          system_prompt: '你是规划师。先澄清目标与约束，再拆解任务边界。输出：目标定义、范围/非范围、里程碑、优先级与验收标准。',
+        },
+        {
+          id: 'architect',
+          name: '架构师',
+          enabled: true,
+          model: '',
+          system_prompt: '你是架构师。基于规划给出技术方案与关键决策。输出：总体架构、模块边界、关键接口、技术选型、风险与降级方案。',
+        },
+        {
+          id: 'implementer',
+          name: '执行者',
+          enabled: true,
+          model: '',
+          system_prompt: '你是执行者。把方案落地为可执行步骤或代码改动。输出：分步实施计划、关键实现细节、命令/代码片段与完成定义。',
+        },
+        {
+          id: 'reviewer',
+          name: '评审者',
+          enabled: true,
+          model: '',
+          system_prompt: '你是评审者。独立审视可行性与质量风险。输出：问题清单、回归点、测试策略、监控指标与上线检查项。',
+        },
+      ],
+      data_analysis_decision: [
+        {
+          id: 'business_analyst',
+          name: '业务分析',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责定义业务问题与指标口径。输出：问题定义、指标体系、分析假设、成功标准与决策边界。',
+        },
+        {
+          id: 'data_analyst',
+          name: '数据分析',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责数据拆解与结论生成。输出：数据观察、关键对比、异常点、因果假设与可视化建议。',
+        },
+        {
+          id: 'decision_advisor',
+          name: '决策顾问',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责给出可执行决策方案。输出：备选方案、收益风险、资源成本、执行优先级与时间表。',
+        },
+        {
+          id: 'risk_controller',
+          name: '风险控制',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责识别风险并设监控。输出：风险清单、预警阈值、应急预案、复盘机制与治理建议。',
+        },
+      ],
+      scientific_research: [
+        {
+          id: 'research_director',
+          name: '研究总监',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责定义研究问题与边界。输出：研究目标、核心假设、创新点、评估指标与阶段计划。',
+        },
+        {
+          id: 'literature_analyst',
+          name: '文献分析',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责梳理相关工作。输出：关键文献脉络、方法对比、空白点、可复现要点与引用建议。',
+        },
+        {
+          id: 'experiment_engineer',
+          name: '实验工程',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责实验设计与执行方案。输出：实验变量、对照设置、数据采集方案、复现实验步骤与失败兜底。',
+        },
+        {
+          id: 'peer_reviewer',
+          name: '同行评议',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责批判性评审。输出：方法缺陷、统计风险、结论边界、补充实验建议与投稿准备清单。',
+        },
+      ],
+      intelligent_assistant: [
+        {
+          id: 'intent_analyst',
+          name: '意图分析',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责解析用户目标与上下文。输出：用户意图、约束条件、信息缺口与任务拆解。',
+        },
+        {
+          id: 'task_planner',
+          name: '任务规划',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责制定执行路径。输出：步骤计划、依赖条件、时间预算、优先级与中断恢复策略。',
+        },
+        {
+          id: 'tool_executor',
+          name: '工具执行',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责工具调用与动作落地。输出：执行结果、关键产物、失败重试策略与状态更新。',
+        },
+        {
+          id: 'quality_guard',
+          name: '质量把关',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责结果质量与用户体验。输出：结果核对、风险提示、可读性优化、后续建议与确认项。',
+        },
+      ],
+      workflow_automation: [
+        {
+          id: 'workflow_designer',
+          name: '流程设计',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责定义自动化流程。输出：触发条件、流程图节点、输入输出规范与异常分支。',
+        },
+        {
+          id: 'integration_engineer',
+          name: '集成工程',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责系统对接与接口实现。输出：接口映射、鉴权方案、重试机制、幂等设计与部署要求。',
+        },
+        {
+          id: 'operator',
+          name: '运行维护',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责上线运行与监控。输出：监控指标、告警策略、运行手册、回滚策略与值班流程。',
+        },
+        {
+          id: 'compliance_auditor',
+          name: '合规审计',
+          enabled: true,
+          model: '',
+          system_prompt: '你负责安全合规与审计。输出：权限边界、数据合规点、审计日志要求、风险项与整改清单。',
+        },
+      ],
+    };
+
+    function _customScenarioValue(name) {
+      return `custom::${encodeURIComponent(String(name || '').trim())}`;
+    }
+
+    function _customScenarioNameFromValue(value) {
+      const raw = String(value || '');
+      if (!raw.startsWith('custom::')) return '';
+      return decodeURIComponent(raw.slice('custom::'.length));
+    }
+
+    const multiAgentScenarioOptions = computed(() => {
+      const list = [..._MA_SCENARIO_BUILTINS];
+      for (const name of multiAgentCustomScenarios.value) {
+        list.push({
+          value: _customScenarioValue(name),
+          label: name,
+        });
+      }
+      list.push(_MA_SCENARIO_CUSTOM_ENTRY);
+      return list;
+    });
+
+    function _buildCustomScenarioPresets(name) {
+      const label = String(name || '自定义场景').trim() || '自定义场景';
+      return [
+        {
+          id: 'lead',
+          name: '主持人',
+          enabled: true,
+          model: '',
+          system_prompt: `你是「${label}」主持人。负责澄清目标、约束与成功标准，并形成执行议程。`,
+        },
+        {
+          id: 'analyst',
+          name: '分析者',
+          enabled: true,
+          model: '',
+          system_prompt: `你是「${label}」分析者。负责提出关键分析框架、证据点与判断依据。`,
+        },
+        {
+          id: 'executor',
+          name: '执行者',
+          enabled: true,
+          model: '',
+          system_prompt: `你是「${label}」执行者。负责产出可落地步骤、关键动作与交付清单。`,
+        },
+        {
+          id: 'reviewer',
+          name: '复核者',
+          enabled: true,
+          model: '',
+          system_prompt: `你是「${label}」复核者。负责检查风险、补充边界条件并给出最终确认建议。`,
+        },
+      ];
+    }
+
+    function _presetsByScenarioValue(value) {
+      const scenario = String(value || '');
+      if (_ROLE_PRESETS_BY_SCENARIO[scenario]) {
+        return _ROLE_PRESETS_BY_SCENARIO[scenario];
+      }
+      const customName = _customScenarioNameFromValue(scenario);
+      if (customName) {
+        return _buildCustomScenarioPresets(customName);
+      }
+      return _ROLE_PRESETS_BY_SCENARIO[_MA_SCENARIO_DEFAULT];
+    }
+
+    function _buildRolesFromScenario(value) {
+      return _presetsByScenarioValue(value).map((role) => ({
+        id: String(role.id || ''),
+        name: String(role.name || ''),
+        enabled: role.enabled !== false,
+        model: String(role.model || ''),
+        system_prompt: String(role.system_prompt || ''),
+      }));
+    }
+
+    function _normalizeScenarioValue(value) {
+      const str = String(value || '').trim();
+      if (!str) return _MA_SCENARIO_DEFAULT;
+      if (str === '__custom__') return '__custom__';
+      if (_MA_SCENARIO_BUILTINS.some((x) => x.value === str)) return str;
+      if (str.startsWith('custom::')) return str;
+      return _MA_SCENARIO_DEFAULT;
+    }
+
+    function _scenarioValueForPersist(value) {
+      const normalized = _normalizeScenarioValue(value);
+      if (normalized !== '__custom__') return normalized;
+      if (multiAgentCustomScenarios.value.length > 0) {
+        return _customScenarioValue(multiAgentCustomScenarios.value[0]);
+      }
+      return _MA_SCENARIO_DEFAULT;
+    }
+
+    function _buildRoleDraft(order = 1) {
+      const presets = _presetsByScenarioValue(multiAgentScenario.value);
+      const preset = presets[(Math.max(1, order) - 1) % presets.length];
+      const existingIds = new Set(
+        (Array.isArray(multiAgentRoles.value) ? multiAgentRoles.value : []).map((r) =>
+          String((r && r.id) || '').trim().toLowerCase()
+        )
+      );
+      const baseId = String(preset.id || `role_${order}`).trim().toLowerCase();
+      let roleId = baseId || `role_${order}`;
+      let n = 2;
+      while (existingIds.has(roleId)) {
+        roleId = `${baseId}_${n}`;
+        n += 1;
+      }
+      return {
+        id: roleId,
+        name: String(preset.name || `角色${order}`),
+        enabled: preset.enabled !== false,
+        model: String(preset.model || ''),
+        system_prompt: String(preset.system_prompt || ''),
+      };
+    }
+
+    function _defaultRoleDraft(index = 1) {
+      return _buildRoleDraft(index);
+    }
+
+    function onMultiAgentScenarioChange() {
+      const scenario = _normalizeScenarioValue(multiAgentScenario.value);
+      multiAgentScenario.value = scenario;
+      if (scenario === '__custom__') return;
+      multiAgentRoles.value = _buildRolesFromScenario(scenario);
+    }
+
+    function addCustomMultiAgentScenario() {
+      const name = String(multiAgentCustomScenarioInput.value || '').trim();
+      if (!name) {
+        showUiAlert('请先输入自定义模式名称');
+        return;
+      }
+      if (multiAgentCustomScenarios.value.includes(name)) {
+        const value = _customScenarioValue(name);
+        multiAgentScenario.value = value;
+        multiAgentRoles.value = _buildRolesFromScenario(value);
+        multiAgentCustomScenarioInput.value = '';
+        return;
+      }
+      multiAgentCustomScenarios.value.push(name);
+      const value = _customScenarioValue(name);
+      multiAgentScenario.value = value;
+      multiAgentRoles.value = _buildRolesFromScenario(value);
+      multiAgentCustomScenarioInput.value = '';
+    }
+
+    function removeCustomMultiAgentScenario(name) {
+      const target = String(name || '').trim();
+      if (!target) return;
+      multiAgentCustomScenarios.value = multiAgentCustomScenarios.value.filter((x) => x !== target);
+      if (multiAgentScenario.value === _customScenarioValue(target)) {
+        multiAgentScenario.value = '__custom__';
+      }
+    }
+
+    async function loadMultiAgentConfig() {
+      multiAgentLoading.value = true;
+      try {
+        if (!availableModels.value.length) {
+          await loadModels();
+        }
+        const data = await apiFetch('/api/plugins/multi-agent');
+        multiAgentEnabled.value = data.enabled === true;
+        const customScenariosRaw = Array.isArray(data.custom_scenarios) ? data.custom_scenarios : [];
+        multiAgentCustomScenarios.value = customScenariosRaw
+          .map((x) => String(x || '').trim())
+          .filter((x, idx, arr) => x && arr.indexOf(x) === idx);
+        multiAgentScenario.value = _normalizeScenarioValue(
+          String(data.scenario || _MA_SCENARIO_DEFAULT)
+        );
+        multiAgentMode.value = data.mode === 'serial' ? 'serial' : 'parallel';
+        multiAgentMaxRounds.value = Number.isFinite(Number(data.max_rounds))
+          ? Math.max(1, Math.min(10, Number(data.max_rounds)))
+          : 3;
+        const rawRoles = Array.isArray(data.roles) ? data.roles : [];
+        multiAgentRoles.value = rawRoles.map((r, idx) => ({
+          id: String(r.id || `role_${idx + 1}`),
+          name: String(r.name || `角色${idx + 1}`),
+          enabled: r.enabled !== false,
+          model: String(r.model || ''),
+          system_prompt: String(r.system_prompt || ''),
+        }));
+        const customName = _customScenarioNameFromValue(multiAgentScenario.value);
+        if (customName && !multiAgentCustomScenarios.value.includes(customName)) {
+          multiAgentCustomScenarios.value.push(customName);
+        }
+        if (!multiAgentRoles.value.length) {
+          multiAgentRoles.value = _buildRolesFromScenario(multiAgentScenario.value);
+        }
+      } catch (e) {
+        showUiAlert('加载多Agent配置失败: ' + (e.message || e));
+      } finally {
+        multiAgentLoading.value = false;
+      }
+    }
+
+    function addMultiAgentRole() {
+      multiAgentRoles.value.push(_buildRoleDraft(multiAgentRoles.value.length + 1));
+    }
+
+    function removeMultiAgentRole(index) {
+      if (index < 0 || index >= multiAgentRoles.value.length) return;
+      multiAgentRoles.value.splice(index, 1);
+      if (!multiAgentRoles.value.length) multiAgentRoles.value.push(_defaultRoleDraft(1));
+    }
+
+    async function saveMultiAgentConfig() {
+      const payload = {
+        enabled: multiAgentEnabled.value === true,
+        scenario: _scenarioValueForPersist(multiAgentScenario.value),
+        custom_scenarios: multiAgentCustomScenarios.value.map((x) => String(x || '').trim()).filter(Boolean),
+        mode: multiAgentMode.value === 'serial' ? 'serial' : 'parallel',
+        max_rounds: Number.isFinite(Number(multiAgentMaxRounds.value))
+          ? Math.max(1, Math.min(10, Number(multiAgentMaxRounds.value)))
+          : 3,
+        roles: multiAgentRoles.value.map((r, idx) => ({
+          id: String(r.id || `role_${idx + 1}`).trim(),
+          name: String(r.name || `角色${idx + 1}`).trim(),
+          enabled: r.enabled !== false,
+          model: String(r.model || '').trim(),
+          system_prompt: String(r.system_prompt || '').trim(),
+        })),
+      };
+      multiAgentSaving.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/multi-agent', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        multiAgentEnabled.value = data.enabled === true;
+        const customScenariosRaw = Array.isArray(data.custom_scenarios) ? data.custom_scenarios : [];
+        multiAgentCustomScenarios.value = customScenariosRaw
+          .map((x) => String(x || '').trim())
+          .filter((x, idx, arr) => x && arr.indexOf(x) === idx);
+        multiAgentScenario.value = _normalizeScenarioValue(
+          String(data.scenario || _MA_SCENARIO_DEFAULT)
+        );
+        multiAgentMode.value = data.mode === 'serial' ? 'serial' : 'parallel';
+        multiAgentMaxRounds.value = Number(data.max_rounds || 3);
+        multiAgentRoles.value = (Array.isArray(data.roles) ? data.roles : []).map((r, idx) => ({
+          id: String(r.id || `role_${idx + 1}`),
+          name: String(r.name || `角色${idx + 1}`),
+          enabled: r.enabled !== false,
+          model: String(r.model || ''),
+          system_prompt: String(r.system_prompt || ''),
+        }));
+        showUiAlert('多Agent配置已保存');
+      } catch (e) {
+        showUiAlert('保存多Agent配置失败: ' + (e.message || e));
+      } finally {
+        multiAgentSaving.value = false;
+      }
+    }
+
     /* ── Global Memory Style ── */
     function _formatClock(d) {
       const hh = String(d.getHours()).padStart(2, '0');
@@ -822,6 +1315,29 @@ createApp({
       scrollToBottom();
     }
 
+    async function syncActiveSessionHistory() {
+      const sid = activeSessionId.value;
+      if (!sid) return;
+      try {
+        const data = await apiFetch(`/api/sessions/${sid}`);
+        const serverMessages = (data.messages || []).map((m, i) => ({
+          id: `hist-sync-${i}-${Date.now()}`,
+          role: m.role,
+          content: m.content,
+          rendered: renderMarkdown(m.content),
+          toolCalls: [],
+        }));
+        if (serverMessages.length >= messages.value.length) {
+          messages.value = serverMessages;
+        }
+        currentModel.value = data.model || currentModel.value;
+        thinkingLevel.value = data.thinking_level || thinkingLevel.value;
+        _bumpMessageCount();
+        await nextTick();
+        scrollToBottom();
+      } catch { /* ignore */ }
+    }
+
     /* ── WebSocket ── */
     let _wsGeneration = 0;
 
@@ -844,12 +1360,32 @@ createApp({
             socket.send(JSON.stringify({ type: 'ping' }));
           }
         }, 25000);
+        if (activeSessionId.value) {
+          syncActiveSessionHistory();
+        }
       };
 
       socket.onmessage = (evt) => {
         if (gen !== _wsGeneration) return;
         let msg;
         try { msg = JSON.parse(evt.data); } catch { return; }
+        const incomingSid = msg.session_id || '';
+        if (
+          incomingSid &&
+          incomingSid !== activeSessionId.value &&
+          isStreaming.value
+        ) {
+          activeSessionId.value = incomingSid;
+          const exists = sessions.value.some((s) => s.id === incomingSid);
+          if (!exists) {
+            sessions.value.unshift({
+              id: incomingSid,
+              model: currentModel.value || '',
+              message_count: messages.value.length,
+              created_at: new Date().toISOString(),
+            });
+          }
+        }
 
         if (msg.type === 'stream') {
           if (!streamingMessage) {
@@ -1298,6 +1834,8 @@ createApp({
       sessionTokens, totalTokens, formatTokens,
       formatCount, formatClawhubStats,
       activeTab, skills, tools, groupedSkills, groupedTools,
+      multiAgentLoading, multiAgentSaving, multiAgentEnabled, multiAgentMode, multiAgentMaxRounds, multiAgentRoles,
+      multiAgentScenario, multiAgentScenarioOptions, multiAgentCustomScenarios, multiAgentCustomScenarioInput,
       skillSourceTab,
       skillInstallSource, skillInstalling, skillDetail, pendingUninstallSkillId,
       installSkill, uninstallSkill, requestUninstallSkill, cancelUninstallSkill, showSkillDetail,
@@ -1311,6 +1849,8 @@ createApp({
       isClawhubSkillInstalled,
       loadClawhubConfig, saveClawhubConfig, onClawhubEnabledChange, searchClawhub, installClawhubSkill, publishInstalledSkill,
       publishDialog, publishSlugInput, publishVersionInput, openPublishDialog, closePublishDialog, confirmPublishDialog,
+      loadMultiAgentConfig, saveMultiAgentConfig, addMultiAgentRole, removeMultiAgentRole,
+      onMultiAgentScenarioChange, addCustomMultiAgentScenario, removeCustomMultiAgentScenario,
       toolDetail,
       memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
       loadMemoryStyle, onMemoryStyleRefresh, saveMemoryStyle, clearMemoryStyle,
@@ -1382,6 +1922,7 @@ createApp({
         <div class="sidebar-tab-bar">
           <button class="sidebar-tab" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">💬 聊天</button>
           <button class="sidebar-tab" :class="{ active: activeTab === 'skills' }" @click="activeTab = 'skills'; loadSkills(); loadClawhubConfig()">🧩 技能</button>
+          <button class="sidebar-tab" :class="{ active: activeTab === 'multi-agent' }" @click="activeTab = 'multi-agent'; loadModels(); loadMultiAgentConfig()">🧠 多Agent</button>
           <button class="sidebar-tab" :class="{ active: activeTab === 'tools' }" @click="activeTab = 'tools'; loadTools()">🔧 工具</button>
         </div>
       </aside>
@@ -1424,6 +1965,7 @@ createApp({
         <div class="page-header" v-if="activeTab !== 'chat'">
           <button class="btn-icon mobile-menu" @click="showSidebar = !showSidebar">☰</button>
           <h2 v-if="activeTab === 'skills'">🧩 技能管理</h2>
+          <h2 v-if="activeTab === 'multi-agent'">🧠 多Agent 编排</h2>
           <h2 v-if="activeTab === 'tools'">🔧 工具列表 <small>({{ tools.length }})</small></h2>
         </div>
 
@@ -1629,6 +2171,91 @@ createApp({
                 </div>
               </div>
             </template>
+          </div>
+        </template>
+
+        <!-- Multi-Agent Tab -->
+        <template v-if="activeTab === 'multi-agent'">
+          <div class="tab-content">
+            <div class="panel-toolbar multi-agent-toolbar">
+              <label class="switch">
+                <input type="checkbox" :checked="multiAgentEnabled" :disabled="multiAgentSaving || multiAgentLoading" @change="multiAgentEnabled = $event.target.checked">
+                <span class="switch-slider"></span>
+              </label>
+              <span class="clawhub-enable-text">启用多Agent编排</span>
+              <span class="multi-agent-label mode-label">模式</span>
+              <select class="model-selector scenario-select" v-model="multiAgentScenario" :disabled="multiAgentSaving || multiAgentLoading" @change="onMultiAgentScenarioChange()">
+                <option v-for="item in multiAgentScenarioOptions" :key="'ma-scenario-' + item.value" :value="item.value">{{ item.label }}</option>
+              </select>
+              <span class="multi-agent-label">协作</span>
+              <select class="model-selector mini-select" v-model="multiAgentMode" :disabled="multiAgentSaving || multiAgentLoading">
+                <option value="parallel">并行</option>
+                <option value="serial">串行</option>
+              </select>
+              <span class="multi-agent-label">最大回合</span>
+              <input class="panel-search mini-input" type="number" min="1" max="10" v-model.number="multiAgentMaxRounds" :disabled="multiAgentSaving || multiAgentLoading" />
+              <button class="btn-pill" :disabled="multiAgentSaving || multiAgentLoading" @click="saveMultiAgentConfig()">{{ multiAgentSaving ? '保存中…' : '保存配置' }}</button>
+              <span class="multi-agent-feishu-note">备注：飞书里使用/multi on/off 来切换单agent和多agent模式</span>
+            </div>
+            <div class="tab-content-body">
+              <div class="panel-toolbar multi-agent-custom-toolbar" v-if="multiAgentScenario === '__custom__' || multiAgentCustomScenarios.length">
+                <input
+                  v-if="multiAgentScenario === '__custom__'"
+                  v-model="multiAgentCustomScenarioInput"
+                  class="panel-search custom-scenario-input"
+                  placeholder="输入自定义模式名称，例如：读书会议"
+                  :disabled="multiAgentSaving || multiAgentLoading"
+                  @keydown.enter="addCustomMultiAgentScenario()"
+                />
+                <button
+                  v-if="multiAgentScenario === '__custom__'"
+                  class="btn-outline"
+                  :disabled="multiAgentSaving || multiAgentLoading || !multiAgentCustomScenarioInput.trim()"
+                  @click="addCustomMultiAgentScenario()"
+                >加入列表</button>
+                <div class="multi-agent-custom-list" v-if="multiAgentCustomScenarios.length">
+                  <span v-for="name in multiAgentCustomScenarios" :key="'ma-custom-' + name" class="multi-agent-custom-chip">
+                    {{ name }}
+                    <button class="multi-agent-custom-remove" title="删除自定义模式" @click="removeCustomMultiAgentScenario(name)">✕</button>
+                  </span>
+                </div>
+              </div>
+              <div class="panel-toolbar">
+                <button class="btn-outline" :disabled="multiAgentSaving || multiAgentLoading" @click="addMultiAgentRole()">+ 新增角色</button>
+              </div>
+              <div v-if="multiAgentLoading" class="tab-empty">配置加载中…</div>
+              <div v-else class="panel-grid multi-agent-grid">
+                <div v-for="(role, idx) in multiAgentRoles" :key="role.id + '-' + idx" class="panel-card multi-agent-role-card">
+                  <div class="panel-card-main">
+                    <div class="multi-agent-role-head">
+                      <label class="switch">
+                        <input type="checkbox" :checked="role.enabled" :disabled="multiAgentSaving" @change="role.enabled = $event.target.checked">
+                        <span class="switch-slider"></span>
+                      </label>
+                      <span class="chip" :class="role.enabled ? 'chip-ok' : ''">{{ role.enabled ? '启用' : '忽略' }}</span>
+                    </div>
+                    <div class="multi-agent-role-fields">
+                      <input class="panel-search" v-model="role.id" placeholder="角色ID (slug)" :disabled="multiAgentSaving" />
+                      <input class="panel-search" v-model="role.name" placeholder="角色名" :disabled="multiAgentSaving" />
+                      <select class="panel-search role-model-select" v-model="role.model" :disabled="multiAgentSaving">
+                        <option value="">默认模型（当前: {{ defaultModel || '未设置' }}）</option>
+                        <template v-if="groupedModels.length">
+                          <optgroup v-for="g in groupedModels" :key="'ma-role-' + g.provider" :label="g.label">
+                            <option v-for="m in g.models" :key="'ma-role-opt-' + m.id" :value="m.id">
+                              {{ m.name }}
+                            </option>
+                          </optgroup>
+                        </template>
+                      </select>
+                      <textarea class="setting-textarea" rows="4" v-model="role.system_prompt" placeholder="角色系统提示词..." :disabled="multiAgentSaving"></textarea>
+                    </div>
+                  </div>
+                  <div class="panel-card-action">
+                    <button class="btn-danger-sm" @click="removeMultiAgentRole(idx)" title="删除角色">✕</button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </template>
 
