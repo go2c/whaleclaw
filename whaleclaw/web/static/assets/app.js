@@ -86,6 +86,8 @@ createApp({
     const memoryStyleRefreshNote = ref('');
     const evomapEnabled = ref(false);
     const evomapLoading = ref(false);
+    const browserVisible = ref(true);
+    const browserVisibleLoading = ref(false);
 
     const currentModel = ref('');
     const thinkingLevel = ref('off');
@@ -1145,6 +1147,33 @@ createApp({
       }
     }
 
+    async function loadBrowserVisibilitySetting() {
+      browserVisibleLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/browser');
+        browserVisible.value = data.visible !== false;
+      } catch { /* ignore */ }
+      finally {
+        browserVisibleLoading.value = false;
+      }
+    }
+
+    async function setBrowserVisible(enabled) {
+      if (browserVisibleLoading.value) return;
+      browserVisibleLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/browser', {
+          method: 'POST',
+          body: JSON.stringify({ visible: enabled }),
+        });
+        browserVisible.value = data.visible !== false;
+      } catch (e) {
+        showUiAlert('浏览器可视开关更新失败: ' + (e.message || e));
+      } finally {
+        browserVisibleLoading.value = false;
+      }
+    }
+
     const _SKILL_CATEGORIES = {
       bundled: '内置技能',
       user: '已安装技能',
@@ -1859,6 +1888,7 @@ createApp({
       loadTools();
       loadMemoryStyle();
       loadEvomapSetting();
+      loadBrowserVisibilitySetting();
     }
 
     onMounted(async () => {
@@ -1927,6 +1957,7 @@ createApp({
       memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
       loadMemoryStyle, onMemoryStyleRefresh, saveMemoryStyle, clearMemoryStyle,
       evomapEnabled, evomapLoading, loadEvomapSetting, setEvomapEnabled,
+      browserVisible, browserVisibleLoading, loadBrowserVisibilitySetting, setBrowserVisible,
       createSession, deleteSession, switchSession,
       sendMessage, handleKeydown, switchModel, loadModels,
       toggleTheme, formatTime, renderMarkdown,
@@ -2409,6 +2440,23 @@ createApp({
                 :checked="evomapEnabled"
                 :disabled="evomapLoading"
                 @change="setEvomapEnabled($event.target.checked)"
+              >
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="setting-group">
+          <div class="setting-row">
+            <div>
+              <label style="margin-bottom:2px">浏览器可视操作</label>
+              <p class="setting-hint" style="margin:0">开启后可看到 browser 工具操作窗口；关闭后后台无界面运行（下次启动 browser 生效）</p>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                :checked="browserVisible"
+                :disabled="browserVisibleLoading"
+                @change="setBrowserVisible($event.target.checked)"
               >
               <span class="switch-slider"></span>
             </label>

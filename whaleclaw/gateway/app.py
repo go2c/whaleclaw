@@ -1246,6 +1246,52 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         return JSONResponse({"ok": True, "enabled": enabled, "persisted_to": str(CONFIG_FILE)})
 
+    @app.get("/api/plugins/browser")
+    async def _api_get_browser_config() -> JSONResponse:
+        plugins_cfg: dict[str, Any] = (
+            config.plugins if isinstance(config.plugins, dict) else {}
+        )
+        browser_raw = plugins_cfg.get("browser", {})
+        visible = True
+        if isinstance(browser_raw, dict) and "visible" in browser_raw:
+            visible = bool(browser_raw.get("visible"))
+        return JSONResponse({"visible": visible})
+
+    @app.post("/api/plugins/browser")
+    async def _api_set_browser_config(body: dict[str, Any]) -> JSONResponse:
+        if "visible" not in body:
+            return JSONResponse({"error": "缺少 visible 参数"}, status_code=400)
+        visible = bool(body.get("visible", True))
+
+        if not isinstance(config.plugins, dict):
+            config.plugins = {}
+        current_cfg = config.plugins.get("browser", {})
+        if not isinstance(current_cfg, dict):
+            current_cfg = {}
+        current_cfg["visible"] = visible
+        config.plugins["browser"] = current_cfg
+
+        user_cfg = _read_json_config(CONFIG_FILE)
+        uc_plugins_browser: dict[str, Any] = user_cfg.get("plugins", {})
+        if not isinstance(uc_plugins_browser, dict):
+            uc_plugins_browser = {}
+            user_cfg["plugins"] = uc_plugins_browser
+        uc_browser: Any = uc_plugins_browser.get("browser")
+        if not isinstance(uc_browser, dict):
+            uc_browser = {}
+            uc_plugins_browser["browser"] = uc_browser
+        uc_browser["visible"] = visible
+
+        try:
+            _write_json_config(CONFIG_FILE, user_cfg)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"保存配置失败: {exc}"},
+                status_code=500,
+            )
+
+        return JSONResponse({"ok": True, "visible": visible, "persisted_to": str(CONFIG_FILE)})
+
     # ── Memory Style REST ─────────────────────────────────
 
     @app.get("/api/memory/style")
