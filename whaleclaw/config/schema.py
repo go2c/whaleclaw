@@ -105,7 +105,7 @@ class AgentConfig(BaseModel):
     """Agent runtime configuration."""
 
     model: str = "anthropic/claude-sonnet-4-20250514"
-    max_tool_rounds: int = 25
+    max_tool_rounds: int = 50
     workspace: str = str(WORKSPACE_DIR)
     thinking_level: str = "off"
     summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)

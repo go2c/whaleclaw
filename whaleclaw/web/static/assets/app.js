@@ -77,6 +77,7 @@ createApp({
     const showSettings = ref(false);
     const showSidebar = ref(false);
     const pendingImages = ref([]);
+    const pendingFiles = ref([]);
     const memoryStyle = ref('');
     const memoryStyleEnabled = ref(true);
     const memoryStyleLoading = ref(false);
@@ -984,6 +985,24 @@ createApp({
       if (!multiAgentRoles.value.length) multiAgentRoles.value.push(_defaultRoleDraft(1));
     }
 
+    async function toggleMultiAgentEnabled(enabled) {
+      multiAgentEnabled.value = enabled;
+      multiAgentSaving.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/multi-agent/toggle', {
+          method: 'POST',
+          body: JSON.stringify({ enabled }),
+        });
+        multiAgentEnabled.value = data.enabled === true;
+        showUiAlert(data.enabled ? '多Agent编排 已启用' : '多Agent编排 已关闭');
+      } catch (e) {
+        multiAgentEnabled.value = !enabled;
+        showUiAlert('切换多Agent模式失败: ' + (e.message || e));
+      } finally {
+        multiAgentSaving.value = false;
+      }
+    }
+
     async function saveMultiAgentConfig() {
       const payload = {
         enabled: multiAgentEnabled.value === true,
@@ -1523,13 +1542,23 @@ createApp({
         toolCalls: [],
       });
 
-      const payload = { content: text || '(用户发送了图片)' };
+      const attachments = pendingFiles.value.map((f) => ({
+        name: f.name,
+        url: f.url,
+        filename: f.filename,
+        size: f.size,
+      }));
+      const fallbackText = imgs.length ? '(用户发送了图片)' : attachments.length ? '(用户发送了文件)' : '';
+      const payload = { content: text || fallbackText };
       if (imgs.length) {
         payload.images = imgs.map((img) => ({
           data: img.dataUrl.split(',')[1],
           mime: img.mime,
           name: img.name,
         }));
+      }
+      if (attachments.length) {
+        payload.attachments = attachments;
       }
 
       ws.send(JSON.stringify({
@@ -1540,6 +1569,7 @@ createApp({
 
       inputText.value = '';
       pendingImages.value = [];
+      pendingFiles.value = [];
       isStreaming.value = true;
       streamingMessage = null;
       _bumpMessageCount();
@@ -1592,7 +1622,15 @@ createApp({
 
     function onDrop(e) {
       e.preventDefault();
-      if (e.dataTransfer?.files) addImageFiles(e.dataTransfer.files);
+      if (!e.dataTransfer?.files) return;
+      const imgFiles = [];
+      const otherFiles = [];
+      for (const f of e.dataTransfer.files) {
+        if (f.type.startsWith('image/')) imgFiles.push(f);
+        else otherFiles.push(f);
+      }
+      if (imgFiles.length) addImageFiles(imgFiles);
+      if (otherFiles.length) addFiles(otherFiles);
     }
 
     function onDragOver(e) { e.preventDefault(); }
@@ -1600,10 +1638,44 @@ createApp({
     function triggerFileInput() {
       const input = document.createElement('input');
       input.type = 'file';
-      input.accept = 'image/*';
       input.multiple = true;
-      input.onchange = (e) => { if (e.target.files) addImageFiles(e.target.files); };
+      input.onchange = (e) => {
+        if (!e.target.files) return;
+        const imgFiles = [];
+        const otherFiles = [];
+        for (const f of e.target.files) {
+          if (f.type.startsWith('image/')) imgFiles.push(f);
+          else otherFiles.push(f);
+        }
+        if (imgFiles.length) addImageFiles(imgFiles);
+        if (otherFiles.length) addFiles(otherFiles);
+      };
       input.click();
+    }
+
+    async function addFiles(files) {
+      for (const file of files) {
+        if (pendingFiles.value.length >= 5) break;
+        const formData = new FormData();
+        formData.append('file', file);
+        try {
+          const res = await fetch('/api/upload', { method: 'POST', body: formData });
+          const data = await res.json();
+          if (data.error) { showUiAlert('文件上传失败: ' + data.error); continue; }
+          pendingFiles.value.push({
+            name: file.name,
+            size: data.size || file.size,
+            url: data.url,
+            filename: data.filename,
+          });
+        } catch (e) {
+          showUiAlert('文件上传失败: ' + (e.message || e));
+        }
+      }
+    }
+
+    function removeFile(idx) {
+      pendingFiles.value.splice(idx, 1);
     }
 
     /* ── Settings ── */
@@ -1829,7 +1901,7 @@ createApp({
       theme, token, needLogin, authMode, loginPassword, loginToken, loginError, doLogin, doLogout,
       compressionReady, compressionRunning,
       sessions, activeSessionId, activeSession, messages,
-      inputText, isStreaming, showSettings, showSidebar, pendingImages,
+      inputText, isStreaming, showSettings, showSidebar, pendingImages, pendingFiles,
       currentModel, thinkingLevel, availableModels, defaultModel, groupedModels, messagesEl,
       sessionTokens, totalTokens, formatTokens,
       formatCount, formatClawhubStats,
@@ -1849,7 +1921,7 @@ createApp({
       isClawhubSkillInstalled,
       loadClawhubConfig, saveClawhubConfig, onClawhubEnabledChange, searchClawhub, installClawhubSkill, publishInstalledSkill,
       publishDialog, publishSlugInput, publishVersionInput, openPublishDialog, closePublishDialog, confirmPublishDialog,
-      loadMultiAgentConfig, saveMultiAgentConfig, addMultiAgentRole, removeMultiAgentRole,
+      loadMultiAgentConfig, saveMultiAgentConfig, toggleMultiAgentEnabled, addMultiAgentRole, removeMultiAgentRole,
       onMultiAgentScenarioChange, addCustomMultiAgentScenario, removeCustomMultiAgentScenario,
       toolDetail,
       memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
@@ -1859,7 +1931,7 @@ createApp({
       sendMessage, handleKeydown, switchModel, loadModels,
       toggleTheme, formatTime, renderMarkdown,
       renderSkillMarkdown, safeRenderSkillMarkdown,
-      addImageFiles, removeImage, onPaste, onDrop, onDragOver, triggerFileInput,
+      addImageFiles, removeImage, addFiles, removeFile, onPaste, onDrop, onDragOver, triggerFileInput,
       uiAlertMessage, closeUiAlert,
     };
   },
@@ -2016,9 +2088,17 @@ createApp({
                 <button class="image-remove-btn" @click="removeImage(idx)">✕</button>
               </div>
             </div>
+            <div v-if="pendingFiles.length" class="file-preview-strip">
+              <div v-for="(file, idx) in pendingFiles" :key="'f-'+idx" class="file-preview-item">
+                <span class="file-preview-icon">📎</span>
+                <span class="file-preview-name" :title="file.name">{{ file.name }}</span>
+                <span class="file-preview-size">{{ (file.size / 1024).toFixed(0) }}KB</span>
+                <button class="image-remove-btn" @click="removeFile(idx)">✕</button>
+              </div>
+            </div>
             <div class="input-wrapper">
-              <button class="btn-attach" @click="triggerFileInput" title="添加图片">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+              <button class="btn-attach" @click="triggerFileInput" title="添加图片或文件">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
               </button>
               <textarea
                 v-model="inputText"
@@ -2028,7 +2108,7 @@ createApp({
                 :disabled="!compressionReady"
                 rows="1"
               ></textarea>
-              <button class="btn-send" :disabled="!compressionReady || isStreaming || (!inputText.trim() && !pendingImages.length)" @click="sendMessage">
+              <button class="btn-send" :disabled="!compressionReady || isStreaming || (!inputText.trim() && !pendingImages.length && !pendingFiles.length)" @click="sendMessage">
                 发送
               </button>
             </div>
@@ -2179,7 +2259,7 @@ createApp({
           <div class="tab-content">
             <div class="panel-toolbar multi-agent-toolbar">
               <label class="switch">
-                <input type="checkbox" :checked="multiAgentEnabled" :disabled="multiAgentSaving || multiAgentLoading" @change="multiAgentEnabled = $event.target.checked">
+                <input type="checkbox" :checked="multiAgentEnabled" :disabled="multiAgentSaving || multiAgentLoading" @change="toggleMultiAgentEnabled($event.target.checked)">
                 <span class="switch-slider"></span>
               </label>
               <span class="clawhub-enable-text">启用多Agent编排</span>

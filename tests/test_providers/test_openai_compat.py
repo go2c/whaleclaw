@@ -184,8 +184,8 @@ async def test_oauth_rejects_non_gpt52_model() -> None:
         oauth_expires=4_102_444_800,  # 2100-01-01
         oauth_account_id="acct-1",
     )
-    with pytest.raises(ProviderError, match="仅支持 gpt-5.2"):
-        await provider.chat([Message(role="user", content="hi")], "gpt-5.2-codex")
+    with pytest.raises(ProviderError, match="仅支持"):
+        await provider.chat([Message(role="user", content="hi")], "gpt-4o")
 
 
 @pytest.mark.asyncio

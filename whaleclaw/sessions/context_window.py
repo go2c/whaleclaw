@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 MODEL_MAX_CONTEXT: dict[str, int] = {
     "claude-sonnet-4-20250514": 200_000,
     "claude-opus-4-20250514": 200_000,
+    "gpt-5.4": 1_000_000,
     "gpt-5.2": 1_000_000,
     "gpt-5.2-codex": 1_000_000,
     "gpt-5.3-codex": 1_000_000,

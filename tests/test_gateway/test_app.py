@@ -99,7 +99,7 @@ async def test_models_oauth_openai_only_shows_gpt52() -> None:
     assert resp.status_code == 200
     models = resp.json()["models"]
     ids = [m["id"] for m in models if m["provider"] == "openai"]
-    assert ids == ["openai/gpt-5.2"]
+    assert ids == ["openai/gpt-5.2", "openai/gpt-5.2-codex"]
 
 
 @pytest.mark.asyncio

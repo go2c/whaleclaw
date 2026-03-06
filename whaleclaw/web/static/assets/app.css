@@ -452,6 +452,42 @@ body {
 }
 .image-remove-btn:hover { background: #e74c3c; }
 
+.file-preview-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px 4px;
+}
+.file-preview-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 6px 28px 6px 10px;
+  font-size: 13px;
+  max-width: 240px;
+}
+.file-preview-icon { flex-shrink: 0; }
+.file-preview-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.file-preview-size {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.file-preview-item .image-remove-btn {
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+}
+
 /* ── Login Form ── */
 .login-overlay {
   position: fixed;

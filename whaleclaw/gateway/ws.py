@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -294,6 +295,21 @@ async def websocket_handler(
                             mime=img_data.get("mime", "image/png"),
                             data=img_data["data"],
                         ))
+
+            raw_attachments = incoming.payload.get("attachments", [])
+            if isinstance(raw_attachments, list) and raw_attachments:
+                att_lines: list[str] = []
+                for att in raw_attachments:
+                    if not isinstance(att, dict):
+                        continue
+                    att_name = str(att.get("name", "")).strip()
+                    att_filename = str(att.get("filename", "")).strip()
+                    if att_filename:
+                        att_path = str(Path.home() / ".whaleclaw" / "uploads" / att_filename)
+                        att_lines.append(f"[附件: {att_name}]({att_path})")
+                if att_lines:
+                    content = (content or "").rstrip()
+                    content = f"{content}\n\n用户上传了以下文件：\n" + "\n".join(att_lines)
 
             if not content and not images:
                 await _safe_send(websocket, make_error(session.id, "消息内容为空"))

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 MODEL_PRICING: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-20250514": (3.0, 15.0),
     "claude-opus-4-20250514": (15.0, 75.0),
+    "gpt-5.4": (2.5, 15.0),
     "gpt-5.2": (2.0, 8.0),
     "gpt-5.2-codex": (3.0, 15.0),
     "gpt-5.3-codex": (3.0, 15.0),

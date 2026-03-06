@@ -1109,13 +1109,20 @@ def _with_round_version_suffix(path: str, round_no: int) -> str:
     return str(p.with_name(target_name))
 
 
-def _fix_version_suffix(paths: list[str], round_no: int) -> list[str]:
-    """Rename files whose _V suffix doesn't match the current round_no.
+def _fix_version_suffix(
+    paths: list[str], round_no: int
+) -> tuple[list[str], dict[str, str]]:
+    """Copy files whose _V suffix doesn't match the current round_no.
 
     LLMs sometimes use the wrong version number (e.g. _V4 in round 3).
-    This renames the file on disk so later rounds don't collide.
+    Creates a correctly-suffixed copy; the original file is kept intact so
+    that previous rounds' snapshots are never destroyed.
+
+    Returns (fixed_paths, rename_map) where rename_map maps old->new for
+    callers that need to patch text references.
     """
     fixed: list[str] = []
+    rename_map: dict[str, str] = {}
     expected = f"_V{round_no}"
     for p in paths:
         fp = Path(p)
@@ -1125,15 +1132,17 @@ def _fix_version_suffix(paths: list[str], round_no: int) -> list[str]:
             correct = _with_round_version_suffix(p, round_no)
             correct_path = Path(correct)
             try:
+                correct_path.parent.mkdir(parents=True, exist_ok=True)
                 if correct_path.exists():
                     correct_path.unlink()
-                fp.rename(correct_path)
+                shutil.copy2(fp, correct_path)
+                rename_map[p] = str(correct_path)
                 fixed.append(str(correct_path))
                 continue
             except OSError:
                 pass
         fixed.append(p)
-    return fixed
+    return fixed, rename_map
 
 
 def _extract_artifact_baseline(paths: list[str]) -> str:
@@ -2816,7 +2825,7 @@ async def _run_multi_agent_executor(
             f"角色职责：{prompt}\n"
             f"当前是协作第 {round_no}/{max_rounds} 轮。\n"
             f"用户原始议题：{message}\n"
-            "请结合角色专长和场景模板发表观点，但方向须服从用户原始议题的核心意图。\n"
+            "请结合角色专长和场景模板发表观点，但内容须紧扣用户原始议题的核心意图。\n"
         )
         role_msg += f"\n{requirement_baseline}\n"
         if context_block:
@@ -2831,7 +2840,7 @@ async def _run_multi_agent_executor(
             )
         role_msg += (
             f"\n本轮工具锁定：{', '.join(round_tools)}\n"
-            "\n请只输出本角色观点，必须总结为200字以内的精炼观点（严格不超过200字）。\n"
+            "\n请只输出本角色观点，必须总结为120字以内的精炼观点（严格不超过120字）。\n"
             "要求：给出明确判断和建议，用连贯段落表达，不要分点罗列，不要列步骤。\n"
             "限制：\n"
             "- 不要向用户追问或索取额外材料。\n"
@@ -2973,8 +2982,10 @@ async def _run_multi_agent_executor(
         image_instruction = ""
         if include_image_output:
             image_instruction = (
-                "配图流程：先列配图清单（按页/模块），再逐项调用 search_images 搜图下载，"
-                "不同主体分别搜索，同一张图不要用于多页。\n"
+                "配图流程：\n"
+                "1) 先列配图清单（按页/模块），并声明「共 N 张配图」\n"
+                "2) 再逐项调用 search_images 搜图下载，不同主体分别搜索，同一张图不要用于多页\n"
+                "3) 搜完计划中的图后立刻进入写脚本步骤，禁止反复追加搜图\n"
             )
 
         round_synthesize_message: str = (
@@ -2989,14 +3000,14 @@ async def _run_multi_agent_executor(
             f"{requirement_baseline}\n"
             f"工具锁定：{', '.join(round_tools)}\n"
             f"交付类型：{requested_text}\n"
-            f"角色输出：\n{role_round_block}\n\n"
+            f"角色输出（仅供参考，必须以用户原始议题为准，角色观点偏离议题时忽略）：\n{role_round_block}\n\n"
             f"{prev_round_block}"
             f"{image_instruction}"
             "\n"
             f"## 第 {round_no} 轮交付（严格按此格式，每项必写）\n"
             "1. 本轮工具锁定（原样回写）\n"
             "2. 本轮可直接交付结果（必须给出具体内容）\n"
-            "3. 配图\n"
+            "3. 配图（必须用 ![描述](绝对路径) 格式逐张列出所有已下载的图片）\n"
             "4. 与上一轮相比的改进点（首轮写「首轮基线」）\n"
             "\n"
             "规则：\n"
@@ -3071,6 +3082,10 @@ async def _run_multi_agent_executor(
                     script_paths.append(p)
                     continue
                 if Path(p).expanduser().exists():
+                    return True
+            for om in _OFFICE_PATH_RE.finditer(text):
+                op = om.group(1).strip()
+                if op and Path(op).expanduser().exists():
                     return True
             for sp in script_paths:
                 sp_path = Path(sp).expanduser()
@@ -3168,7 +3183,6 @@ async def _run_multi_agent_executor(
             round_delivery = base
             aborted_round_no = round_no
 
-        round_deliveries.append(round_delivery)
         allow_script_paths = "script" in requested_deliverables
         detected_paths = _extract_delivery_artifact_paths(
             round_delivery,
@@ -3179,17 +3193,21 @@ async def _run_multi_agent_executor(
             for p in detected_paths
             if Path(p).expanduser().exists()
         ]
-        existing_paths = _fix_version_suffix(existing_paths, round_no)
+        existing_paths, rename_map = _fix_version_suffix(existing_paths, round_no)
+        if rename_map:
+            for old_p, new_p in rename_map.items():
+                round_delivery = round_delivery.replace(old_p, new_p)
         if existing_paths:
             verified_lines = [f"- {p}" for p in existing_paths]
             round_delivery = (
                 f"{round_delivery.rstrip()}\n\n"
-                "6) 系统校验的实际产物绝对路径（以此为准）\n"
+                "5) 系统校验的实际产物绝对路径（以此为准）\n"
                 + "\n".join(verified_lines)
             )
         if existing_paths:
             _snapshot_round_artifacts(existing_paths, round_no)
             prev_round_artifact_baseline = _extract_artifact_baseline(existing_paths)
+        round_deliveries.append(round_delivery)
         context_chunks: list[str] = []
         for idx, delivery in enumerate(round_deliveries, 1):
             section = _extract_round_delivery_section(delivery) or delivery
@@ -3714,7 +3732,7 @@ async def run_agent(
 
     native_tools = router.supports_native_tools(model_id)
     selected_tool_names: set[str] | None = None
-    evomap_enabled = _is_evomap_enabled(config)
+    evomap_enabled = _is_evomap_enabled(config) and not multi_agent_internal
     evomap_phase = "editing"
     if session is not None:
         raw_phase = session.metadata.get("evomap_phase")
@@ -3966,6 +3984,8 @@ async def run_agent(
     invalid_tool_rounds = 0
     empty_reply_rounds = 0
     browser_fail_streak = 0
+    search_images_count = 0
+    search_images_nudged = False
     bash_fail_streak = 0
     same_failed_bash_streak = 0
     last_failed_bash_signature = ""
@@ -4317,6 +4337,9 @@ async def run_agent(
                     break
                 browser_locked_by_evomap = not _is_no_match_evomap_output(result)
             if tc.name == "browser":
+                action = str(tc.arguments.get("action", "")).strip().lower()
+                if action == "search_images" and result.success:
+                    search_images_count += 1
                 if result.success:
                     browser_fail_streak = 0
                 else:
@@ -4482,6 +4505,52 @@ async def run_agent(
             break
         if stop_for_probe_loop:
             break
+        _SEARCH_NUDGE_AT = 6
+        _SEARCH_HARD_CAP = 20
+        if search_images_count >= _SEARCH_HARD_CAP:
+            log.warning(
+                "agent.search_images_hard_cap",
+                count=search_images_count,
+                session_id=session_id,
+            )
+            conversation.append(
+                Message(
+                    role="user",
+                    content=(
+                        f"[系统提示] 已完成 {search_images_count} 次图片搜索，"
+                        "已达系统上限。禁止再调用 search_images。"
+                        "请立刻进入下一步：用 file_write 写生成脚本，"
+                        "然后用 bash 执行脚本产出最终文件。"
+                    ),
+                )
+            )
+        elif (
+            search_images_count >= _SEARCH_NUDGE_AT
+            and not search_images_nudged
+            and tool_calls
+            and all(
+                str(tc.arguments.get("action", "")).strip().lower() == "search_images"
+                for tc in tool_calls
+                if tc.name == "browser"
+            )
+        ):
+            search_images_nudged = True
+            log.info(
+                "agent.search_images_nudge",
+                count=search_images_count,
+                session_id=session_id,
+            )
+            conversation.append(
+                Message(
+                    role="user",
+                    content=(
+                        f"[系统提示] 已完成 {search_images_count} 次图片搜索。"
+                        "如果配图已经够用，请立刻进入下一步：用 file_write 写生成脚本，"
+                        "然后用 bash 执行脚本产出最终文件。"
+                        "如果确实还缺少关键配图可以继续搜，但不要无限追加。"
+                    ),
+                )
+            )
         if metadata_dirty and session is not None and session_manager is not None:
             await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 session.id,

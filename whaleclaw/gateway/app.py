@@ -553,7 +553,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 for cm in pcfg.configured_models:
                     if not cm.verified:
                         continue
-                    if pname == "openai" and pcfg.auth_mode == "oauth" and cm.id != "gpt-5.2":
+                    if pname == "openai" and pcfg.auth_mode == "oauth" and not cm.id.lower().startswith("gpt-5"):
                         continue
                     tools: bool = True
                     if pname == "nvidia":
@@ -1149,6 +1149,42 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 "persisted_to": str(CONFIG_FILE),
             }
         )
+
+    @app.post("/api/plugins/multi-agent/toggle")
+    async def _api_toggle_multi_agent(body: dict[str, Any]) -> JSONResponse:
+        """Toggle multi-agent enabled state independently of other config."""
+        if "enabled" not in body:
+            return JSONResponse({"error": "缺少 enabled 参数"}, status_code=400)
+        enabled = bool(body["enabled"])
+
+        if not isinstance(config.plugins, dict):
+            config.plugins = {}
+        ma_cfg = config.plugins.get("multi_agent")
+        if not isinstance(ma_cfg, dict):
+            ma_cfg = _default_multi_agent_config()
+        ma_cfg["enabled"] = enabled
+        config.plugins["multi_agent"] = ma_cfg
+
+        user_cfg = _read_json_config(CONFIG_FILE)
+        uc_plugins: dict[str, Any] = user_cfg.get("plugins", {})
+        if not isinstance(uc_plugins, dict):
+            uc_plugins = {}
+            user_cfg["plugins"] = uc_plugins
+        uc_ma: dict[str, Any] = uc_plugins.get("multi_agent", {})
+        if not isinstance(uc_ma, dict):
+            uc_ma = {}
+        uc_ma["enabled"] = enabled
+        uc_plugins["multi_agent"] = uc_ma
+
+        try:
+            _write_json_config(CONFIG_FILE, user_cfg)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"切换多Agent模式失败: {exc}"},
+                status_code=500,
+            )
+
+        return JSONResponse({"ok": True, "enabled": enabled})
 
     @app.get("/api/plugins/evomap")
     async def _api_get_evomap_config() -> JSONResponse:

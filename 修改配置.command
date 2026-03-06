@@ -450,6 +450,8 @@ _MODELS_anthropic=(
 _URL_anthropic="https://api.anthropic.com"
 
 _MODELS_openai=(
+    "gpt-5.4|GPT-5.4|off"
+    "gpt-5.3-codex|GPT-5.3 Codex|off"
     "gpt-5.2|GPT-5.2|off"
 )
 _URL_openai="https://api.openai.com/v1"
@@ -645,13 +647,13 @@ else:
         0) return ;;
         a|A)
             if [ "$oauth_openai_only" = "yes" ]; then
-                echo "  ❌ OAuth 模式下 OpenAI 仅支持 GPT-5.2"
+                echo "  ❌ OAuth 模式下 OpenAI 仅支持推荐列表中的模型"
                 return
             fi
             _batch_verify_provider "$pname" "$apikey" "$base_url"; return ;;
         c|C)
             if [ "$oauth_openai_only" = "yes" ]; then
-                echo "  ❌ OAuth 模式下 OpenAI 仅支持 GPT-5.2"
+                echo "  ❌ OAuth 模式下 OpenAI 仅支持推荐列表中的模型"
                 return
             fi
             read -p "  输入模型 ID: " custom_mid
@@ -1474,7 +1476,7 @@ configure_model() {
     echo "  选择提供商:"
     echo "  ─────────────────────────────────────────────────"
     echo "  1) Anthropic  — Claude Sonnet 4 / Opus 4"
-    echo "  2) OpenAI     — GPT-5.2"
+    echo "  2) OpenAI     — GPT-5.4 / GPT-5.2"
     echo "  3) 通义千问   — qwen3.5-plus / qwen3-max / qwq-plus"
     echo "  4) 智谱 GLM   — glm-5 / glm-4.7 / glm-4.7-flash"
     echo "  5) MiniMax    — MiniMax-M2.5 / M2.1"

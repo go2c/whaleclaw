@@ -15,7 +15,7 @@ from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
 
-_CODEX_OAUTH_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+_OAUTH_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 
 
 def _is_responses_model(model: str) -> bool:
@@ -134,10 +134,18 @@ class OpenAIProvider(OpenAICompatProvider):
                 if not include_system and m.role in ("system", "developer"):
                     continue
                 role = m.role if m.role in ("user", "developer", "system") else "user"
+                content_parts: list[dict[str, Any]] = []
+                if m.images:
+                    for img in m.images:
+                        content_parts.append({
+                            "type": "input_image",
+                            "image_url": f"data:{img.mime};base64,{img.data}",
+                        })
+                content_parts.append({"type": "input_text", "text": m.content or ""})
                 items.append({
                     "role": role,
                     "type": "message",
-                    "content": [{"type": "input_text", "text": m.content or ""}],
+                    "content": content_parts,
                 })
         return items
 
@@ -177,7 +185,7 @@ class OpenAIProvider(OpenAICompatProvider):
 
     def _responses_urls(self) -> list[str]:
         if self._auth_mode == "oauth":
-            return [_CODEX_OAUTH_RESPONSES_URL]
+            return [_OAUTH_RESPONSES_URL]
         return [f"{self._base_url}/responses"]
 
     async def _chat_responses_once(
@@ -353,8 +361,10 @@ class OpenAIProvider(OpenAICompatProvider):
         on_stream: StreamCallback | None = None,
     ) -> AgentResponse:
         self._ensure_oauth_token()
-        if self._auth_mode == "oauth" and model != "gpt-5.2":
-            raise ProviderError("OpenAI OAuth 模式当前仅支持 gpt-5.2")
+        if self._auth_mode == "oauth" and not model.lower().startswith("gpt-5"):
+            raise ProviderError(
+                "OpenAI OAuth 模式仅支持 GPT-5 系列模型"
+            )
         # For ChatGPT OAuth, GPT-5 family is served via Responses API.
         use_responses = _is_responses_model(model) or (
             self._auth_mode == "oauth" and model.lower().startswith("gpt-5")

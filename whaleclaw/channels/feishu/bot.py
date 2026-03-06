@@ -155,7 +155,7 @@ class FeishuBot:
         self._dedup.mark(msg_id)
 
         text = self.extract_text(message)
-        images = await self._extract_images(message) if msg_type == "image" else []
+        images = await self._extract_images(message) if msg_type in ("image", "post") else []
         file_path = await self._extract_file(message) if msg_type == "file" else None
         if not text and not images and not file_path:
             return
@@ -553,7 +553,7 @@ class FeishuBot:
             for cm in pcfg.configured_models:
                 if not cm.verified:
                     continue
-                if pname == "openai" and pcfg.auth_mode == "oauth" and cm.id != "gpt-5.2":
+                if pname == "openai" and pcfg.auth_mode == "oauth" and not cm.id.lower().startswith("gpt-5"):
                     continue
                 if pname == "nvidia" and not NvidiaProvider.model_supports_tools(cm.id):
                     continue
@@ -668,29 +668,48 @@ class FeishuBot:
         return ""
 
     async def _extract_images(self, message: dict[str, Any]) -> list[ImageContent]:
-        """Download incoming Feishu image message and convert to ImageContent."""
+        """Download incoming Feishu image(s) and convert to ImageContent.
+
+        Supports both pure image messages (msg_type=image) and rich-text
+        posts (msg_type=post) that embed ``img`` elements with image_key.
+        """
         msg_id = message.get("message_id", "")
+        msg_type = message.get("message_type", "")
         content_str = message.get("content", "{}")
         try:
             content = json.loads(content_str)
         except (json.JSONDecodeError, TypeError):
             return []
 
-        image_key = content.get("image_key", "")
-        if not image_key:
+        image_keys: list[str] = []
+        if msg_type == "image":
+            key = content.get("image_key", "")
+            if key:
+                image_keys.append(key)
+        elif msg_type == "post":
+            blocks = content.get("content") or [[]]
+            for line in blocks:
+                for elem in line:
+                    if elem.get("tag") == "img" and elem.get("image_key"):
+                        image_keys.append(elem["image_key"])
+
+        if not image_keys:
             return []
 
-        try:
-            data = await self._client.download_resource(
-                msg_id, image_key, resource_type="image"
-            )
-        except Exception:
-            log.exception("feishu.image_download_failed", message_id=msg_id)
-            return []
-
-        if not data:
-            return []
-        return [ImageContent(mime="image/png", data=base64.b64encode(data).decode("ascii"))]
+        results: list[ImageContent] = []
+        for key in image_keys[:4]:
+            try:
+                data = await self._client.download_resource(
+                    msg_id, key, resource_type="image"
+                )
+            except Exception:
+                log.exception("feishu.image_download_failed", message_id=msg_id, image_key=key)
+                continue
+            if data:
+                results.append(ImageContent(
+                    mime="image/png", data=base64.b64encode(data).decode("ascii"),
+                ))
+        return results
 
     async def _extract_file(self, message: dict[str, Any]) -> str | None:
         """Download incoming Feishu file message and return local absolute path."""
