@@ -17,7 +17,53 @@ TINY_PNG_BASE64 = (
     "AAAAAAAAAAAAAAAAAAAAAA4G4IAAAFQh4v8AAAAASUVORK5CYII="
 )
 _KEY_FILE = Path.home() / ".whaleclaw" / "credentials" / "nano_banana_api_key.txt"
+_DEFAULT_MODEL_FILE = (
+    Path.home() / ".whaleclaw" / "credentials" / "nano_banana_default_model.txt"
+)
 _DEFAULT_OUT_DIR = Path.home() / ".whaleclaw" / "workspace" / "nano_banana_test"
+_DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+_DEFAULT_EDIT_MODEL = "gemini-3.1-flash-image-preview"
+_MODEL_ALIASES = {
+    "香蕉2": _DEFAULT_MODEL,
+    "香蕉pro": "nano-banana-2",
+    "nano-banana-2": "nano-banana-2",
+    "gemini-3.1-flash-image-preview": _DEFAULT_MODEL,
+}
+_MODEL_DISPLAY_NAMES = {
+    _DEFAULT_MODEL: "香蕉2",
+    "nano-banana-2": "香蕉pro",
+}
+
+
+def _normalize_model_name(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return text
+    return _MODEL_ALIASES.get(text.lower(), _MODEL_ALIASES.get(text, text))
+
+
+def _display_model_name(model: str) -> str:
+    normalized = _normalize_model_name(model)
+    return _MODEL_DISPLAY_NAMES.get(normalized, normalized)
+
+
+def _load_saved_default_model() -> str:
+    if not _DEFAULT_MODEL_FILE.exists():
+        return _DEFAULT_MODEL
+    try:
+        saved = _DEFAULT_MODEL_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return _DEFAULT_MODEL
+    normalized = _normalize_model_name(saved)
+    return normalized or _DEFAULT_MODEL
+
+
+def _save_default_model(model: str) -> str:
+    normalized = _normalize_model_name(model) or _DEFAULT_MODEL
+    _DEFAULT_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _DEFAULT_MODEL_FILE.write_text(normalized, encoding="utf-8")
+    os.chmod(_DEFAULT_MODEL_FILE, 0o600)
+    return normalized
 
 
 def _build_headers(api_key: str) -> dict[str, str]:
@@ -226,12 +272,14 @@ def _collect_input_images(provided_paths: list[str], interactive: bool) -> list[
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="测试 Nano-banana-2 文生图与图生图")
+    parser = argparse.ArgumentParser(description="测试香蕉模型文生图与图生图")
     parser.add_argument("--api-key", default=os.getenv("NANO_BANANA_API_KEY", ""))
     parser.add_argument("--check-key", action="store_true")
+    parser.add_argument("--set-default-model", default="")
+    parser.add_argument("--show-default-model", action="store_true")
     parser.add_argument("--base-url", default="https://ai.t8star.cn")
-    parser.add_argument("--model", default="nano-banana-2")
-    parser.add_argument("--edit-model", default="nano-banana-2")
+    parser.add_argument("--model", default="")
+    parser.add_argument("--edit-model", default="")
     parser.add_argument("--mode", choices=["text", "edit", "both"], default="")
     parser.add_argument("--prompt", default="")
     parser.add_argument("--input-image", action="append", default=[])
@@ -256,14 +304,32 @@ def main() -> int:
         print(result)
         return 0
 
+    if args.show_default_model:
+        print(f"当前默认模型: {_display_model_name(_load_saved_default_model())}")
+        return 0
+
+    if args.set_default_model.strip():
+        saved_model = _save_default_model(args.set_default_model)
+        print(f"默认模型已设置为: {_display_model_name(saved_model)}")
+        return 0
+
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     api_key = _collect_api_key(args.api_key, interactive)
     mode = _collect_mode(args.mode, interactive)
     prompt = _collect_prompt(args.prompt, mode, interactive)
+    default_model = _load_saved_default_model()
+    args.model = _normalize_model_name(str(args.model)) or default_model
+    args.edit_model = _normalize_model_name(str(args.edit_model)) or default_model
 
     out_dir = Path(args.out_dir)
     text_output = out_dir / "text_to_image.png"
     edit_output = out_dir / "image_to_image.png"
+
+    if args.model == args.edit_model:
+        print(f"当前使用模型: {_display_model_name(args.model)}")
+    else:
+        print(f"当前使用模型: {_display_model_name(args.model)}")
+        print(f"图生图模型: {_display_model_name(args.edit_model)}")
 
     with httpx.Client(headers=_build_headers(api_key), follow_redirects=True) as client:
         try:

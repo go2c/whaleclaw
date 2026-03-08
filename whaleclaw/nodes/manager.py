@@ -36,7 +36,9 @@ class NodeManager:
         """List all registered nodes."""
         return list(self._nodes.values())
 
-    async def invoke(self, node_id: str, action: str, params: dict) -> dict:
+    async def invoke(
+        self, node_id: str, action: str, params: dict[str, object]
+    ) -> dict[str, object]:
         """Invoke action on node. Stub returns not_implemented."""
         if node_id not in self._nodes:
             return {"status": "error", "error": "节点不存在"}

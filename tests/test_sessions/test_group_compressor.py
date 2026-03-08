@@ -134,19 +134,19 @@ async def test_recent_over_budget_downgrades_2_and_3_to_l0(tmp_path) -> None:  #
 
 
 @pytest.mark.asyncio
-async def test_window_plan_compresses_22_groups_when_25_groups_present(tmp_path) -> None:  # noqa: ANN001
+async def test_window_plan_compresses_20_groups_when_25_groups_present(tmp_path) -> None:  # noqa: ANN001
     store = await _mk_store(tmp_path)
     try:
         compressor = SessionGroupCompressor(store)
-        groups = [_mk_group(i, "消息") for i in range(1, 26)]
+        groups = [_mk_group(i, "消息") for i in range(1, 25 + 1)]
         plan = compressor._window_plan(_flatten(groups))  # noqa: SLF001
         l2 = sum(1 for x in plan if x.level == "L2")
         l1 = sum(1 for x in plan if x.level == "L1")
         l0 = sum(1 for x in plan if x.level == "L0")
-        assert l2 == 3
+        assert l2 == 5
         assert l1 == 7
-        assert l0 == 15
-        assert l1 + l0 == 22
+        assert l0 == 13
+        assert l1 + l0 == 20
     finally:
         await store.close()
 

@@ -108,6 +108,8 @@ class AgentConfig(BaseModel):
     max_tool_rounds: int = 50
     workspace: str = str(WORKSPACE_DIR)
     thinking_level: str = "off"
+    auto_self_heal_on_error: bool = True
+    self_heal_max_retries: int = Field(default=1, ge=0, le=3)
     summarizer: SummarizerConfig = Field(default_factory=SummarizerConfig)
     memory: AgentMemoryConfig = Field(default_factory=AgentMemoryConfig)
 

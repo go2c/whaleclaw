@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import base64
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from whaleclaw.agent.commands import ChatCommand
-from whaleclaw.agent.loop import run_agent
+from whaleclaw.agent.helpers.tool_execution import (
+    is_transient_cli_usage_error as _is_transient_cli_usage_error,
+)
+from whaleclaw.agent.single_agent import (
+    is_multi_agent_confirm,
+    is_multi_agent_discuss_done,
+    run_agent,
+)
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.gateway.protocol import (
     MessageType,
@@ -26,11 +34,13 @@ from whaleclaw.gateway.protocol import (
     make_tool_result,
 )
 from whaleclaw.gateway.task_registry import task_registry
+from whaleclaw.media.image_resize import resize_image_long_edge
 from whaleclaw.plugins.evomap.bridge import build_memory_hint_from_hook_data
 from whaleclaw.plugins.hooks import HookContext, HookManager, HookPoint
 from whaleclaw.providers.base import ImageContent
 from whaleclaw.providers.router import ModelRouter
 from whaleclaw.sessions.manager import Session, SessionManager
+from whaleclaw.sessions.store import SessionStore
 from whaleclaw.tools.base import ToolResult
 from whaleclaw.tools.registry import ToolRegistry
 from whaleclaw.utils.log import get_logger
@@ -42,6 +52,8 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _active_connections: dict[str, WebSocket] = {}
+_SELF_HEAL_MARKER = "[system_self_heal]"
+_SELF_HEAL_RETRY_KEY = "self_heal_retries"
 
 
 def _is_multi_agent_effective_for_session(
@@ -49,11 +61,9 @@ def _is_multi_agent_effective_for_session(
     session: Session,
 ) -> bool:
     global_enabled = False
-    if isinstance(config.plugins, dict):
-        raw = config.plugins.get("multi_agent", {})
-        if isinstance(raw, dict):
-            global_enabled = bool(raw.get("enabled", False))
-    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    raw = config.plugins.get("multi_agent", {})
+    global_enabled = bool(raw.get("enabled", False))
+    metadata = session.metadata
     if isinstance(metadata.get("multi_agent_enabled"), bool):
         return bool(metadata["multi_agent_enabled"])
     return global_enabled
@@ -64,24 +74,18 @@ def _should_run_multi_agent_in_background(
     session: Session,
     user_message: str,
 ) -> bool:
-    """True only when multi-Agent is enabled AND this message will trigger execution (not discussion)."""
+    """True only when multi-Agent is enabled and message triggers execution."""
     if not _is_multi_agent_effective_for_session(config, session):
         return False
-    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    metadata = session.metadata
     state = str(metadata.get("multi_agent_state", "")).strip().lower()
     waiting = state == "confirm" or (
         state == "" and bool(metadata.get("multi_agent_waiting_confirm", False))
     )
     msg = user_message.strip()
-    from whaleclaw.agent.loop import (
-        _is_multi_agent_confirm,  # pyright: ignore[reportPrivateUsage]
-        _is_multi_agent_discuss_done,  # pyright: ignore[reportPrivateUsage]
-    )
-    if state == "discuss" and _is_multi_agent_discuss_done(msg):
+    if state == "discuss" and is_multi_agent_discuss_done(msg):
         return True
-    if waiting and _is_multi_agent_confirm(msg):
-        return True
-    return False
+    return bool(waiting and is_multi_agent_confirm(msg))
 
 
 async def push_to_session(session_id: str, msg: WSMessage) -> bool:
@@ -154,14 +158,14 @@ async def websocket_handler(
     router = ModelRouter(config.models)
     from whaleclaw.sessions.compressor import ContextCompressor
 
-    _store = session_manager._store  # noqa: SLF001
+    session_store = session_manager.store
     _compressor = ContextCompressor()
     chat_cmd = ChatCommand(
         session_manager,
         config=config,
         router=router,
         compressor=_compressor,
-        session_store=_store,
+        session_store=session_store,
     )
     ws_alive = True
     inbox: asyncio.Queue[WSMessage] = asyncio.Queue()
@@ -170,7 +174,7 @@ async def websocket_handler(
 
     # ---- helpers to build a WS sink from the current connection ----
 
-    def _make_sink(ws: WebSocket) -> Callable[[WSMessage], Any]:
+    def _make_sink(ws: WebSocket) -> Callable[[WSMessage], Awaitable[bool]]:
         async def _sink(msg: WSMessage) -> bool:
             return await _safe_send(ws, msg)
         return _sink
@@ -278,32 +282,62 @@ async def websocket_handler(
                 continue
 
             content = incoming.payload.get("content", "")
-            raw_images = incoming.payload.get("images", [])
+            raw_images_obj = incoming.payload.get("images", [])
+            raw_images = (
+                cast(list[object], raw_images_obj)
+                if isinstance(raw_images_obj, list)
+                else []
+            )
             log.debug(
                 "ws.message_processing",
                 session_id=session.id,
                 incoming_session_id=incoming.session_id,
                 content_len=len(content) if isinstance(content, str) else 0,
-                images_count=len(raw_images) if isinstance(raw_images, list) else 0,
+                images_count=len(raw_images),
             )
 
             images: list[ImageContent] = []
-            if isinstance(raw_images, list):
-                for img_data in raw_images:
-                    if isinstance(img_data, dict) and img_data.get("data"):
-                        images.append(ImageContent(
-                            mime=img_data.get("mime", "image/png"),
-                            data=img_data["data"],
-                        ))
+            for img_data in raw_images:
+                if not isinstance(img_data, dict):
+                    continue
+                image_item = cast(dict[object, object], img_data)
+                image_data = image_item.get("data")
+                if not image_data:
+                    continue
+                mime = str(image_item.get("mime", "image/png"))
+                raw_b64 = str(image_data)
+                try:
+                    decoded = base64.b64decode(raw_b64, validate=True)
+                except Exception:
+                    log.warning("ws.image_invalid_base64", session_id=session.id)
+                    continue
+                resized = resize_image_long_edge(decoded, mime=mime, max_long_edge=1536)
+                if resized.resized:
+                    log.info(
+                        "ws.image_resized",
+                        session_id=session.id,
+                        width=resized.width,
+                        height=resized.height,
+                    )
+                images.append(ImageContent(
+                    mime=resized.mime or mime,
+                    data=base64.b64encode(resized.data).decode("ascii"),
+                ))
 
-            raw_attachments = incoming.payload.get("attachments", [])
-            if isinstance(raw_attachments, list) and raw_attachments:
+            raw_attachments_obj = incoming.payload.get("attachments", [])
+            raw_attachments = (
+                cast(list[object], raw_attachments_obj)
+                if isinstance(raw_attachments_obj, list)
+                else []
+            )
+            if raw_attachments:
                 att_lines: list[str] = []
                 for att in raw_attachments:
                     if not isinstance(att, dict):
                         continue
-                    att_name = str(att.get("name", "")).strip()
-                    att_filename = str(att.get("filename", "")).strip()
+                    att_item = cast(dict[object, object], att)
+                    att_name = str(att_item.get("name", "")).strip()
+                    att_filename = str(att_item.get("filename", "")).strip()
                     if att_filename:
                         att_path = str(Path.home() / ".whaleclaw" / "uploads" / att_filename)
                         att_lines.append(f"[附件: {att_name}]({att_path})")
@@ -349,7 +383,7 @@ async def websocket_handler(
                     router=router,
                     registry=registry,
                     session_manager=session_manager,
-                    session_store=_store,
+                    session_store=session_store,
                     memory_manager=memory_manager,
                     hook_manager=hook_manager,
                     group_compressor=group_compressor,
@@ -366,7 +400,7 @@ async def websocket_handler(
                     router=router,
                     registry=registry,
                     session_manager=session_manager,
-                    session_store=_store,
+                    session_store=session_store,
                     memory_manager=memory_manager,
                     hook_manager=hook_manager,
                     group_compressor=group_compressor,
@@ -387,7 +421,7 @@ async def websocket_handler(
         router: ModelRouter,
         registry: ToolRegistry,
         session_manager: SessionManager,
-        session_store: Any,
+        session_store: SessionStore,
         memory_manager: MemoryManager | None,
         hook_manager: HookManager | None,
         group_compressor: SessionGroupCompressor | None,
@@ -400,7 +434,7 @@ async def websocket_handler(
 
         async def on_tool_call_cb(
             name: str,
-            arguments: dict[str, Any],
+            arguments: dict[str, object],
             _sid: str = sid,
         ) -> None:
             if ws_alive_fn():
@@ -411,6 +445,8 @@ async def websocket_handler(
             result: ToolResult,
             _sid: str = sid,
         ) -> None:
+            if _is_transient_cli_usage_error(result):
+                return
             if ws_alive_fn():
                 await _safe_send(
                     websocket,
@@ -429,8 +465,81 @@ async def websocket_handler(
             await session_manager.add_message(_session, "assistant", round_msg)
             await _safe_send(websocket, make_message(_sid, round_msg))
 
+        async def _clear_self_heal_retries() -> None:
+            if _SELF_HEAL_RETRY_KEY not in session.metadata:
+                return
+            session.metadata.pop(_SELF_HEAL_RETRY_KEY, None)
+            await session_manager.update_metadata(session, session.metadata)
+
+        async def _attempt_self_heal_inline(root_error: str, extra_memory: str) -> bool:
+            if not config.agent.auto_self_heal_on_error:
+                return False
+            if content.strip().startswith(_SELF_HEAL_MARKER):
+                return False
+            retry_used_raw = session.metadata.get(_SELF_HEAL_RETRY_KEY, 0)
+            try:
+                retry_used = int(retry_used_raw)
+            except (TypeError, ValueError):
+                retry_used = 0
+            if retry_used >= config.agent.self_heal_max_retries:
+                return False
+            session.metadata[_SELF_HEAL_RETRY_KEY] = retry_used + 1
+            await session_manager.update_metadata(session, session.metadata)
+
+            await _safe_send(
+                websocket,
+                make_status(session.id, "执行中断，正在自动恢复并继续完成任务…"),
+            )
+
+            heal_message = (
+                f"{_SELF_HEAL_MARKER}\n"
+                "上一轮执行出现异常，请立即执行自愈流程：\n"
+                "1) 读取 ~/.whaleclaw/logs/gateway.err "
+                "与 ~/.whaleclaw/logs/gateway.log 最近 200 行\n"
+                "2) 定位错误根因，必要时在当前项目中修复代码（优先用 patch_apply）\n"
+                "3) 执行最小回归验证，确认错误消失\n"
+                "4) 修复成功后，继续完成用户原始任务\n"
+                "5) 对用户的最终回复只输出任务结果，不要暴露内部报错、日志或堆栈\n"
+                "6) 仅当你确认仍无法完成任务时，才简要说明错误与建议\n\n"
+                f"原始用户请求: {content or '(用户发送了图片)'}\n"
+                f"内部参考错误(勿直接输出给用户): {root_error}"
+            )
+            try:
+                heal_reply = await run_agent(
+                    message=heal_message,
+                    session_id=session.id,
+                    config=config,
+                    on_stream=on_stream,
+                    session=session,
+                    router=router,
+                    registry=registry,
+                    on_tool_call=on_tool_call_cb,
+                    on_tool_result=on_tool_result_cb,
+                    on_round_result=on_round_result_cb,
+                    images=images or None,
+                    session_manager=session_manager,
+                    session_store=session_store,
+                    memory_manager=memory_manager,
+                    extra_memory=extra_memory,
+                    trigger_event_id=incoming.id,
+                    trigger_text_preview="[self-heal]",
+                    group_compressor=group_compressor,
+                )
+                if heal_reply.strip():
+                    await session_manager.add_message(session, "assistant", heal_reply)
+                    await _safe_send(websocket, make_message(session.id, heal_reply))
+                await _clear_self_heal_retries()
+                return True
+            except Exception as heal_exc:
+                log.error(
+                    "agent.self_heal_failed",
+                    error=str(heal_exc),
+                    session_id=session.id,
+                )
+                return False
+
+        extra_memory = ""
         try:
-            extra_memory = ""
             if hook_manager is not None:
                 hook_out = await hook_manager.run(
                     HookPoint.BEFORE_MESSAGE,
@@ -470,6 +579,7 @@ async def websocket_handler(
             if reply.strip():
                 await session_manager.add_message(session, "assistant", reply)
                 await _safe_send(websocket, make_message(session.id, reply))
+            await _clear_self_heal_retries()
         except Exception as exc:
             if hook_manager is not None:
                 with suppress(Exception):
@@ -486,9 +596,10 @@ async def websocket_handler(
                         ),
                     )
             log.error("agent.error", error=str(exc), session_id=session.id)
-            await _safe_send(
-                websocket, make_error(session.id, f"Agent 处理失败: {exc}"),
-            )
+            healed = await _attempt_self_heal_inline(str(exc), extra_memory=extra_memory)
+            if healed:
+                return
+            await _safe_send(websocket, make_error(session.id, f"Agent 处理失败: {exc}"))
 
     # ---- background multi-Agent execution ----
 
@@ -503,7 +614,7 @@ async def websocket_handler(
         router: ModelRouter,
         registry: ToolRegistry,
         session_manager: SessionManager,
-        session_store: Any,
+        session_store: SessionStore,
         memory_manager: MemoryManager | None,
         hook_manager: HookManager | None,
         group_compressor: SessionGroupCompressor | None,
@@ -537,7 +648,7 @@ async def websocket_handler(
                 if entry:
                     await entry.emit(make_stream(sid, chunk))
 
-            async def on_tool_call_bg(name: str, arguments: dict[str, Any]) -> None:
+            async def on_tool_call_bg(name: str, arguments: dict[str, object]) -> None:
                 if entry:
                     await entry.emit(make_tool_call(sid, name, arguments))
 

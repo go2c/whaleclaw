@@ -74,7 +74,7 @@ _TOOL_FALLBACK_HEADER = """\
 - 等收到工具执行结果后，再继续回复
 - 搜索/下载图片 → 用 browser 工具的 search_images
 - 执行系统命令 → 用 bash
-- 读写文件 → 用 file_read / file_write / file_edit
+- 读写文件/补丁 → 用 file_read / file_write / file_edit / patch_apply
 
 以下是全部可用工具：
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from whaleclaw.providers.base import Message
-from whaleclaw.sessions.context_window import ContextWindow, TARGET_CONTENT_TOKENS, _estimate_tokens
+from whaleclaw.sessions.context_window import TARGET_CONTENT_TOKENS, ContextWindow, _estimate_tokens
 
 
 def _tokens(msgs: list[Message]) -> int:
@@ -35,22 +35,24 @@ class TestContextWindow:
         trimmed = cw.trim(msgs, "glm-4.7")
         assert trimmed == msgs
 
-    def test_recent_three_groups_are_protected(self) -> None:
+    def test_recent_five_groups_are_protected(self) -> None:
         cw = ContextWindow()
         msgs = [Message(role="system", content="sys")]
-        for i in range(12):
+        for i in range(10):
             msgs.append(Message(role="user", content=f"旧组用户{i} " + "旧历史内容 " * 120))
             msgs.append(Message(role="assistant", content=f"旧组助手{i} " + "旧历史回复 " * 120))
         recent_groups = [
             ("最近组1-用户", "最近组1-助手"),
             ("最近组2-用户", "最近组2-助手"),
             ("最近组3-用户", "最近组3-助手"),
+            ("最近组4-用户", "最近组4-助手"),
+            ("最近组5-用户", "最近组5-助手"),
         ]
         for u, a in recent_groups:
             msgs.append(Message(role="user", content=u))
             msgs.append(Message(role="assistant", content=a))
         trimmed = cw.trim(msgs, "qwen3.5-plus")
-        tail = trimmed[-6:]
+        tail = trimmed[-10:]
         assert [m.content for m in tail] == [x for g in recent_groups for x in g]
 
     def test_applies_l1_and_l0_compression(self) -> None:
@@ -66,6 +68,10 @@ class TestContextWindow:
             Message(role="assistant", content="recent-2-a"),
             Message(role="user", content="recent-3-u"),
             Message(role="assistant", content="recent-3-a"),
+            Message(role="user", content="recent-4-u"),
+            Message(role="assistant", content="recent-4-a"),
+            Message(role="user", content="recent-5-u"),
+            Message(role="assistant", content="recent-5-a"),
         ])
 
         trimmed = cw.trim(msgs, "qwen3.5-plus")
@@ -109,8 +115,16 @@ class TestTrimWithSummaries:
             Message(role="user", content="最后第三条"),
         ]
         summaries = [
-            self._make_summary_row(level="L0", content="L0总览：用户偏好简洁，近期在调试飞书附件", token_count=40),
-            self._make_summary_row(level="L1", content="L1详述：历史中多次处理媒体文件与会话压缩问题", token_count=80),
+            self._make_summary_row(
+                level="L0",
+                content="L0总览：用户偏好简洁，近期在调试飞书附件",
+                token_count=40,
+            ),
+            self._make_summary_row(
+                level="L1",
+                content="L1详述：历史中多次处理媒体文件与会话压缩问题",
+                token_count=80,
+            ),
         ]
 
         trimmed = cw.trim_with_summaries(msgs, "qwen3.5-plus", summaries)

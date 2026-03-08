@@ -1219,11 +1219,26 @@ createApp({
       system: '系统',
       file: '文件操作',
       browser: '浏览器',
+      device: '设备与界面',
       session: '会话管理',
       automation: '自动化',
+      memory: '记忆',
+      skill: '技能',
+      integration: '集成与插件',
       other: '其他',
     };
-    const _TOOL_CATEGORY_ORDER = ['system', 'file', 'browser', 'session', 'automation', 'other'];
+    const _TOOL_CATEGORY_ORDER = [
+      'system',
+      'file',
+      'browser',
+      'device',
+      'session',
+      'automation',
+      'memory',
+      'skill',
+      'integration',
+      'other',
+    ];
 
     const groupedTools = computed(() => {
       const groups = {};

@@ -17,11 +17,11 @@ from whaleclaw.providers.router import ModelRouter
 from whaleclaw.sessions.store import SessionStore
 from whaleclaw.utils.log import get_logger
 
-RECENT_L2_GROUPS = 3
+RECENT_L2_GROUPS = 5
 RECENT_RAW_PREV_GROUPS = 2
 L1_GROUPS = 7
-L0_GROUPS = 15
-MAX_WINDOW_GROUPS = 25
+L0_GROUPS = 13
+MAX_WINDOW_GROUPS = RECENT_L2_GROUPS + L1_GROUPS + L0_GROUPS
 CONTENT_BUDGET = 1600
 BUILD_CONCURRENCY = 6
 log = get_logger(__name__)
@@ -113,7 +113,7 @@ def _build_history_summary_block(items: list[tuple[int, str]]) -> str:
 def _build_recent_raw_block(items: list[tuple[int, list[Message]]]) -> str:
     if not items:
         return ""
-    lines = ["【最近对话原文（最近2~3轮）】"]
+    lines = ["【最近对话原文（最近2轮）】"]
     for idx, group in items:
         lines.append(f"第{idx}轮:")
         lines.append(_group_text(group))

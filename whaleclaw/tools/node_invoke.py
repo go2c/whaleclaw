@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from whaleclaw.nodes.manager import NodeManager
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
@@ -50,20 +50,32 @@ class NodeInvokeTool(Tool):
         if not action:
             return ToolResult(success=False, output="", error="action 不能为空")
 
-        params: dict = {}
+        params: dict[str, object] = {}
         if params_raw:
             try:
-                params = json.loads(str(params_raw))
-                if not isinstance(params, dict):
+                parsed_params = json.loads(str(params_raw))
+                if not isinstance(parsed_params, dict):
                     params = {}
+                else:
+                    params = {
+                        str(key): value
+                        for key, value in cast(dict[object, object], parsed_params).items()
+                        if isinstance(key, str)
+                    }
             except json.JSONDecodeError:
                 return ToolResult(success=False, output="", error="params 不是有效 JSON")
 
-        result = await self._manager.invoke(node_id, action, params)
+        raw_result: dict[str, object] = await self._manager.invoke(node_id, action, params)
+        result = {
+            str(key): value
+            for key, value in raw_result.items()
+        }
         output = json.dumps(result)
-        success = result.get("status") != "error" and result.get("status") != "not_implemented"
+        success = result.get("status") not in {"error", "not_implemented"}
+        error_value = result.get("error")
+        error = str(error_value) if not success and error_value is not None else None
         return ToolResult(
             success=success,
             output=output,
-            error=result.get("error") if not success else None,
+            error=error,
         )
