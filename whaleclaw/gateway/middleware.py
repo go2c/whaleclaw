@@ -7,7 +7,7 @@ import hmac
 import json
 import time
 from base64 import b64decode, b64encode
-from typing import Any
+from typing import Any, cast
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -58,9 +58,12 @@ def _verify_jwt(secret: str, token: str) -> dict[str, Any] | None:
         return None
     padding = 4 - len(parts[1]) % 4
     try:
-        payload = json.loads(b64decode(parts[1] + "=" * padding))
+        payload_raw = json.loads(b64decode(parts[1] + "=" * padding))
     except Exception:
         return None
+    if not isinstance(payload_raw, dict):
+        return None
+    payload = cast(dict[str, Any], payload_raw)
     if payload.get("exp", 0) < time.time():
         return None
     return payload
@@ -91,14 +94,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
         if self._config.mode == "none":
-            return await call_next(request)
+            response = await call_next(request)
+            return cast(Response, response)
 
         path = request.url.path
         if path in _PUBLIC_PATHS:
-            return await call_next(request)
+            response = await call_next(request)
+            return cast(Response, response)
         for prefix in _PUBLIC_PREFIXES:
             if path.startswith(prefix):
-                return await call_next(request)
+                response = await call_next(request)
+                return cast(Response, response)
 
         if request.scope.get("type") == "websocket":
             token = request.query_params.get("token", "")
@@ -110,7 +116,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if self._config.mode == "token":
             if token == self._config.token:
-                return await call_next(request)
+                response = await call_next(request)
+                return cast(Response, response)
             return JSONResponse(
                 status_code=401,
                 content={"error": "认证失败"},
@@ -118,10 +125,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if self._config.mode == "password":
             if verify_jwt(self._config, token):
-                return await call_next(request)
+                response = await call_next(request)
+                return cast(Response, response)
             return JSONResponse(
                 status_code=401,
                 content={"error": "认证失败，请先登录"},
             )
 
-        return await call_next(request)
+        response = await call_next(request)
+        return cast(Response, response)

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
-from typing import Any
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, cast
 
-from whaleclaw.config.paths import WHALECLAW_HOME
+from whaleclaw.config.paths import CONFIG_FILE, WHALECLAW_HOME
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 from whaleclaw.utils.log import get_logger
 
@@ -115,7 +118,7 @@ _GOOGLE_JS = """
 }
 """
 
-_IMAGE_ENGINES: list[tuple[str, object, str]] = [
+_IMAGE_ENGINES: list[tuple[str, Callable[[str], str], str]] = [
     (
         "google",
         lambda q: f"https://www.google.com/search?q={q}&tbm=isch&udm=2",
@@ -145,6 +148,35 @@ class BrowserTool(Tool):
         self._browser: Any = None
         self._page: Any = None
         self._playwright: Any = None
+
+    @staticmethod
+    def _is_headless_enabled() -> bool:
+        """Read browser visibility setting from user config.
+
+        plugins.browser.visible=true  -> headless=False (show browser window)
+        plugins.browser.visible=false -> headless=True  (no browser window)
+        """
+        try:
+            if not CONFIG_FILE.is_file():
+                return False
+            raw_obj: object = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if not isinstance(raw_obj, dict):
+                return False
+            raw = cast(dict[str, object], raw_obj)
+            plugins_obj = raw.get("plugins")
+            if not isinstance(plugins_obj, dict):
+                return False
+            plugins = cast(dict[str, object], plugins_obj)
+            browser_cfg_obj = plugins.get("browser")
+            if not isinstance(browser_cfg_obj, dict):
+                return False
+            browser_cfg = cast(dict[str, object], browser_cfg_obj)
+            visible_obj = browser_cfg.get("visible")
+            if visible_obj is None:
+                return False
+            return not bool(visible_obj)
+        except Exception:
+            return False
 
     @property
     def definition(self) -> ToolDefinition:
@@ -216,10 +248,11 @@ class BrowserTool(Tool):
 
         from playwright.async_api import async_playwright
 
+        headless = self._is_headless_enabled()
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             channel="chrome",
-            headless=True,
+            headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
         context = await self._browser.new_context(
@@ -233,7 +266,7 @@ class BrowserTool(Tool):
         self._page = await context.new_page()
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        log.info("browser.launched", channel="chrome", headless=True)
+        log.info("browser.launched", channel="chrome", headless=headless)
         return self._page
 
     async def _close(self) -> ToolResult:
@@ -388,7 +421,7 @@ class BrowserTool(Tool):
 
         import httpx
 
-        _MIN_IMAGE_BYTES = 50 * 1024  # prefer images >= 50 KB
+        min_image_bytes = 50 * 1024  # prefer images >= 50 KB
         best_fallback: tuple[Path, int] | None = None
 
         for url in img_urls:
@@ -418,7 +451,7 @@ class BrowserTool(Tool):
                     data = resp.content
                     path.write_bytes(data)
 
-                    if len(data) >= _MIN_IMAGE_BYTES:
+                    if len(data) >= min_image_bytes:
                         size_kb = len(data) / 1024
                         return ToolResult(
                             success=True,

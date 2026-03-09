@@ -51,6 +51,13 @@ async def test_timeout(tool: BashTool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_background_returns_session_id(tool: BashTool) -> None:
+    result = await tool.execute(command="sleep 1", background=True)
+    assert result.success
+    assert "session_id:" in result.output
+
+
+@pytest.mark.asyncio
 async def test_control_chars_are_stripped(tool: BashTool) -> None:
     result = await tool.execute(command="\x18echo hello\x18")
     assert result.success

@@ -217,6 +217,8 @@ body {
 .bubble ul, .bubble ol { padding-left: 20px; margin: 4px 0; }
 .bubble a { color: var(--accent); text-decoration: none; }
 .bubble a:hover { text-decoration: underline; }
+.bubble.user a { color: #ffffff; }
+.bubble.user a:hover { color: #eaf3ff; }
 .bubble img { max-width: 100%; max-height: 400px; border-radius: 8px; margin: 8px 0; cursor: pointer; }
 .bubble img:hover { opacity: 0.9; }
 

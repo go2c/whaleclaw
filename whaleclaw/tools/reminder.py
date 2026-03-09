@@ -44,9 +44,18 @@ class ReminderTool(Tool):
         raw_min = kwargs.get("minutes")
         if raw_min is None:
             return ToolResult(success=False, output="", error="缺少 minutes 参数")
-        try:
+        if isinstance(raw_min, bool):
+            return ToolResult(success=False, output="", error="minutes 必须为整数")
+        if isinstance(raw_min, int):
+            minutes = raw_min
+        elif isinstance(raw_min, float):
             minutes = int(raw_min)
-        except (TypeError, ValueError):
+        elif isinstance(raw_min, str):
+            try:
+                minutes = int(raw_min.strip())
+            except ValueError:
+                return ToolResult(success=False, output="", error="minutes 必须为整数")
+        else:
             return ToolResult(success=False, output="", error="minutes 必须为整数")
         if minutes < 1:
             return ToolResult(success=False, output="", error="minutes 必须大于 0")

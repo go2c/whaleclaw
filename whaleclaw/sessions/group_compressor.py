@@ -17,11 +17,11 @@ from whaleclaw.providers.router import ModelRouter
 from whaleclaw.sessions.store import SessionStore
 from whaleclaw.utils.log import get_logger
 
-RECENT_L2_GROUPS = 3
-RECENT_RAW_PREV_GROUPS = 2
+RECENT_L2_GROUPS = 5
+RECENT_RAW_PREV_GROUPS = 4
 L1_GROUPS = 7
-L0_GROUPS = 15
-MAX_WINDOW_GROUPS = 25
+L0_GROUPS = 13
+MAX_WINDOW_GROUPS = RECENT_L2_GROUPS + L1_GROUPS + L0_GROUPS
 CONTENT_BUDGET = 1600
 BUILD_CONCURRENCY = 6
 log = get_logger(__name__)
@@ -101,10 +101,11 @@ def _extract_latest_user_text(group: list[Message]) -> str:
 def _build_history_summary_block(items: list[tuple[int, str]]) -> str:
     if not items:
         return ""
-    start = items[0][0]
-    end = items[-1][0]
+    ordered = list(reversed(items))
+    start = min(idx for idx, _ in items)
+    end = max(idx for idx, _ in items)
     lines = [f"【历史摘要（第{start}~{end}轮）】"]
-    for idx, content in items:
+    for idx, content in ordered:
         txt = " ".join(content.split())
         lines.append(f"- 第{idx}轮: {txt}")
     return "\n".join(lines)
@@ -113,7 +114,7 @@ def _build_history_summary_block(items: list[tuple[int, str]]) -> str:
 def _build_recent_raw_block(items: list[tuple[int, list[Message]]]) -> str:
     if not items:
         return ""
-    lines = ["【最近对话原文（最近2~3轮）】"]
+    lines = [f"【最近对话原文（最近{len(items)}轮）】"]
     for idx, group in items:
         lines.append(f"第{idx}轮:")
         lines.append(_group_text(group))
@@ -122,16 +123,50 @@ def _build_recent_raw_block(items: list[tuple[int, list[Message]]]) -> str:
 
 def _build_task_status_block(current_group_idx: int, current_group: list[Message]) -> str:
     latest_user = _extract_latest_user_text(current_group)
+    progress = _build_current_progress_lines(current_group)
+    next_action = (
+        "继续直接回应当前用户请求。"
+        if not progress
+        else "基于以上本轮进展继续完成当前请求，避免重复已完成步骤。"
+    )
     status = (
         f"待处理用户请求：{latest_user}"
         if latest_user
         else "待处理：继续基于当前轮上下文生成下一步动作。"
     )
-    return "\n".join([
+    lines = [
         "【当前任务状态】",
         f"当前轮次: 第{current_group_idx}轮",
         status,
-    ])
+    ]
+    if progress:
+        lines.append("本轮已知进展：")
+        lines.extend(progress)
+    lines.append(f"下一步：{next_action}")
+    return "\n".join(lines)
+
+
+def _build_current_progress_lines(current_group: list[Message]) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for msg in current_group:
+        if msg.role == "user":
+            continue
+        text = " ".join(msg.content.split()).strip()
+        if not text:
+            continue
+        label = (
+            f"工具结果：{text[:120]}"
+            if msg.role == "tool"
+            else f"本轮输出：{text[:120]}"
+        )
+        if label in seen:
+            continue
+        seen.add(label)
+        lines.append(f"- {label}")
+        if len(lines) >= 3:
+            break
+    return lines
 
 
 def _build_done_summary_zh(
@@ -358,30 +393,28 @@ class SessionGroupCompressor:
             content, _ = compressed_results[idx]
             history_items.append((item.group_idx, content))
 
+        history_block = ""
         if history_items:
             history_block = _build_history_summary_block(history_items)
             history_block = _clip_text(history_block, 520)
-            if history_block:
-                rendered.append([Message(role="assistant", content=history_block)])
 
         if not recent_l2_items:
             # Fallback: keep latest group raw to preserve current-turn semantics.
             recent_l2_items.append((plan[-1].group_idx, plan[-1].group))
 
         current_group_idx, current_group = recent_l2_items[-1]
-        prev_recent = recent_l2_items[:-1]
-        prev_recent = prev_recent[-RECENT_RAW_PREV_GROUPS:]
-        if prev_recent:
-            recent_block = _build_recent_raw_block(prev_recent)
-            recent_block = _clip_text(recent_block, 320)
+        recent_raw_items = list(reversed(recent_l2_items[-(RECENT_RAW_PREV_GROUPS + 1):]))
+        if recent_raw_items:
+            recent_block = _build_recent_raw_block(recent_raw_items)
+            recent_block = _clip_text(recent_block, 520)
             if recent_block:
                 rendered.append([Message(role="assistant", content=recent_block)])
 
         status_block = _build_task_status_block(current_group_idx, current_group)
         if status_block:
             rendered.append([Message(role="assistant", content=status_block)])
-
-        rendered.append(current_group)
+        if history_block:
+            rendered.append([Message(role="assistant", content=history_block)])
 
         pre_truncate_tokens = sum(_group_tokens(g) for g in rendered)
         out = self._truncate_group_atomic(rendered)
@@ -458,9 +491,9 @@ class SessionGroupCompressor:
         for offset, group in enumerate(groups):
             group_idx = start_idx + offset
             from_tail = total_groups - group_idx + 1
-            if recent_over_budget and from_tail == 1:
+            if recent_over_budget and from_tail in {1, 2}:
                 level = "L2"
-            elif recent_over_budget and from_tail in {2, 3}:
+            elif recent_over_budget and from_tail in {3, 4, 5}:
                 level = "L0"
             elif from_tail <= RECENT_L2_GROUPS:
                 level = "L2"

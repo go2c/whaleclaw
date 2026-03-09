@@ -12,7 +12,7 @@ _TARGET_CHARS = 2000
 _SECTION_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
 
 
-def _estimate_tokens(text: str) -> int:
+def _estimate_tokens(text: str) -> int:  # pyright: ignore[reportUnusedFunction]
     return max(1, len(text) // 3)
 
 

@@ -23,7 +23,7 @@ import time
 from typing import TYPE_CHECKING
 
 from whaleclaw.providers.base import Message
-from whaleclaw.sessions.context_window import _estimate_tokens
+from whaleclaw.sessions.context_window import estimate_tokens
 from whaleclaw.types import ProviderRateLimitError
 from whaleclaw.utils.log import get_logger
 
@@ -168,8 +168,8 @@ class ContextCompressor:
                 log.warning("compressor.llm_failed", error=str(exc))
                 return False
 
-            l0_tokens = _estimate_tokens(l0)
-            l1_tokens = _estimate_tokens(l1)
+            l0_tokens = estimate_tokens(l0)
+            l1_tokens = estimate_tokens(l1)
 
             await store.save_summary(
                 session_id=session_id,

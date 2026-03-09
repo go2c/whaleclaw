@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,7 @@ from whaleclaw.channels.feishu.dedup import MessageDedup
 from whaleclaw.channels.feishu.mention import is_bot_mentioned, strip_bot_mention
 from whaleclaw.config.loader import set_default_agent_model
 from whaleclaw.config.paths import WHALECLAW_HOME
+from whaleclaw.media.image_resize import resize_image_long_edge
 from whaleclaw.plugins.evomap.bridge import build_memory_hint_from_hook_data
 from whaleclaw.plugins.hooks import HookContext, HookManager, HookPoint
 from whaleclaw.providers.base import ImageContent
@@ -26,6 +28,7 @@ from whaleclaw.utils.log import get_logger
 
 _IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _FILE_RE = re.compile(r"(?<!!)\[([^\]]+)\]\((/[^)]+)\)")
+_SUBMIT_RE = re.compile(r"(?:^|[\s，。,\.!！?？])提交\s*$", re.IGNORECASE)
 _FILE_EXTS = {
     ".txt",
     ".md",
@@ -80,6 +83,16 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 _FEISHU_MEDIA_DIR = WHALECLAW_HOME / "media" / "feishu"
+_PENDING_IMAGE_PATHS_KEY = "feishu_pending_image_paths"
+_PENDING_PROMPT_KEY = "feishu_pending_prompt"
+
+
+@dataclass(slots=True)
+class _InboundImage:
+    """Normalized inbound Feishu image for both agent input and local replay."""
+
+    content: ImageContent
+    path: str
 
 
 def _format_exception_text(exc: Exception) -> str:
@@ -154,18 +167,31 @@ class FeishuBot:
             return
         self._dedup.mark(msg_id)
 
-        text = self.extract_text(message)
-        images = await self._extract_images(message) if msg_type in ("image", "post") else []
+        raw_text = self.extract_text(message).strip()
+        inbound_images = (
+            await self._extract_images(message)
+            if msg_type in ("image", "post")
+            else []
+        )
+        images = [item.content for item in inbound_images]
+        image_markdown = self._build_image_markdown(inbound_images)
         file_path = await self._extract_file(message) if msg_type == "file" else None
-        if not text and not images and not file_path:
+        if not raw_text and not images and not file_path:
             return
         if file_path:
-            if text:
-                text = f"{text}\n\n📎 用户发送了文件:\n{file_path}"
+            if raw_text:
+                raw_text = f"{raw_text}\n\n📎 用户发送了文件:\n{file_path}"
             else:
-                text = f"(用户发送了文件)\n{file_path}"
-        elif not text and images:
-            text = "(用户发送了一张图片)"
+                raw_text = f"(用户发送了文件)\n{file_path}"
+        if images:
+            if raw_text:
+                text = f"{raw_text}\n\n{image_markdown}"
+            elif image_markdown:
+                text = image_markdown
+            else:
+                text = "(用户发送了一张图片)"
+        else:
+            text = raw_text
 
         if chat_type == "group":
             group_cfg = self._config.groups.get(
@@ -177,6 +203,7 @@ class FeishuBot:
             if need_mention and not is_bot_mentioned(message, self._bot_open_id):
                 return
             text = strip_bot_mention(text, "")
+            raw_text = strip_bot_mention(raw_text, "").strip()
 
         not_allowed = (
             chat_type == "p2p"
@@ -201,10 +228,141 @@ class FeishuBot:
             has_file=bool(file_path),
         )
 
+        session = None
+        if self._session_manager is not None:
+            session = await self._session_manager.get_or_create("feishu", open_id)
+        if session is not None and not file_path and not raw_text.startswith("/"):
+            buffer_result = await self._handle_pending_image_submission(
+                session,
+                raw_text=raw_text,
+                inbound_images=inbound_images,
+            )
+            if buffer_result is not None:
+                reply_text, run_text, run_images = buffer_result
+                if reply_text:
+                    await self._client.reply_message(
+                        msg_id,
+                        "text",
+                        json.dumps({"text": reply_text}, ensure_ascii=False),
+                    )
+                if run_text is None:
+                    return
+                text = run_text
+                images = run_images
+
         await self._client.reply_message(
             msg_id, "text", json.dumps({"text": "收到，处理中..."}, ensure_ascii=False)
         )
         await self._run_agent_and_reply(text, open_id, msg_id, images=images)
+
+    async def _handle_pending_image_submission(
+        self,
+        session: Any,
+        *,
+        raw_text: str,
+        inbound_images: list[_InboundImage],
+    ) -> tuple[str | None, str | None, list[ImageContent] | None] | None:
+        """Buffer Feishu images until the user explicitly submits the request."""
+        if self._session_manager is None:
+            return None
+
+        metadata = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+        pending_paths = [
+            str(item).strip()
+            for item in metadata.get(_PENDING_IMAGE_PATHS_KEY, [])
+            if str(item).strip()
+        ]
+        pending_prompt = str(metadata.get(_PENDING_PROMPT_KEY, "")).strip()
+        stripped_text, submitted = self._strip_submit_suffix(raw_text)
+
+        if inbound_images:
+            for item in inbound_images:
+                if item.path not in pending_paths:
+                    pending_paths.append(item.path)
+
+        if inbound_images and stripped_text and not submitted:
+            buffered = self._load_buffered_images(pending_paths)
+            metadata.pop(_PENDING_IMAGE_PATHS_KEY, None)
+            metadata.pop(_PENDING_PROMPT_KEY, None)
+            await self._session_manager.update_metadata(session, metadata)
+            markdown = self._build_image_markdown(buffered)
+            full_text = f"{stripped_text}\n\n{markdown}" if markdown else stripped_text
+            return (None, full_text, [item.content for item in buffered])
+
+        if inbound_images and not stripped_text and not submitted:
+            metadata[_PENDING_IMAGE_PATHS_KEY] = pending_paths
+            metadata.pop(_PENDING_PROMPT_KEY, None)
+            await self._session_manager.update_metadata(session, metadata)
+            start = len(pending_paths) - len(inbound_images) + 1
+            labels = self._format_image_range(start, len(pending_paths))
+            return (
+                f"已收到{labels}。继续上传图片，或发送提示词并以“提交”结尾后开始执行。",
+                None,
+                None,
+            )
+
+        if pending_paths and stripped_text and not submitted:
+            buffered = self._load_buffered_images(pending_paths)
+            metadata.pop(_PENDING_IMAGE_PATHS_KEY, None)
+            metadata.pop(_PENDING_PROMPT_KEY, None)
+            await self._session_manager.update_metadata(session, metadata)
+            markdown = self._build_image_markdown(buffered)
+            full_text = f"{stripped_text}\n\n{markdown}" if markdown else stripped_text
+            return (None, full_text, [item.content for item in buffered])
+
+        if pending_paths and submitted:
+            prompt = stripped_text or pending_prompt
+            if not prompt:
+                metadata[_PENDING_IMAGE_PATHS_KEY] = pending_paths
+                metadata.pop(_PENDING_PROMPT_KEY, None)
+                await self._session_manager.update_metadata(session, metadata)
+                return ("已收到图片。请先发送提示词，再回复“提交”。", None, None)
+            buffered = self._load_buffered_images(pending_paths)
+            metadata.pop(_PENDING_IMAGE_PATHS_KEY, None)
+            metadata.pop(_PENDING_PROMPT_KEY, None)
+            await self._session_manager.update_metadata(session, metadata)
+            markdown = self._build_image_markdown(buffered)
+            full_text = f"{prompt}\n\n{markdown}" if markdown else prompt
+            return (None, full_text, [item.content for item in buffered])
+
+        return None
+
+    @staticmethod
+    def _strip_submit_suffix(text: str) -> tuple[str, bool]:
+        stripped = text.strip()
+        if not stripped:
+            return ("", False)
+        if not _SUBMIT_RE.search(stripped):
+            return (stripped, False)
+        cleaned = _SUBMIT_RE.sub("", stripped).strip("，。, .!！?？")
+        return (cleaned.strip(), True)
+
+    def _load_buffered_images(self, image_paths: list[str]) -> list[_InboundImage]:
+        """Rehydrate buffered image paths into agent-ready image payloads."""
+        loaded: list[_InboundImage] = []
+        for raw_path in image_paths:
+            path = Path(raw_path).expanduser()
+            if not path.is_file():
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+            loaded.append(_InboundImage(
+                content=ImageContent(
+                    mime=mime,
+                    data=base64.b64encode(data).decode("ascii"),
+                ),
+                path=str(path),
+            ))
+        return loaded
+
+    @staticmethod
+    def _format_image_range(start: int, end: int) -> str:
+        if end <= start:
+            return f"图{start}"
+        return f"图{start}到图{end}"
 
     async def _run_agent_and_reply(
         self,
@@ -553,7 +711,11 @@ class FeishuBot:
             for cm in pcfg.configured_models:
                 if not cm.verified:
                     continue
-                if pname == "openai" and pcfg.auth_mode == "oauth" and not cm.id.lower().startswith("gpt-5"):
+                if (
+                    pname == "openai"
+                    and pcfg.auth_mode == "oauth"
+                    and not cm.id.lower().startswith("gpt-5")
+                ):
                     continue
                 if pname == "nvidia" and not NvidiaProvider.model_supports_tools(cm.id):
                     continue
@@ -696,7 +858,7 @@ class FeishuBot:
         if not image_keys:
             return []
 
-        results: list[ImageContent] = []
+        results: list[_InboundImage] = []
         for key in image_keys[:4]:
             try:
                 data = await self._client.download_resource(
@@ -706,10 +868,67 @@ class FeishuBot:
                 log.exception("feishu.image_download_failed", message_id=msg_id, image_key=key)
                 continue
             if data:
-                results.append(ImageContent(
-                    mime="image/png", data=base64.b64encode(data).decode("ascii"),
+                resized = resize_image_long_edge(data, mime=None, max_long_edge=1536)
+                if resized.resized:
+                    log.info(
+                        "feishu.image_resized",
+                        message_id=msg_id,
+                        image_key=key,
+                        width=resized.width,
+                        height=resized.height,
+                    )
+                mime = resized.mime or "image/png"
+                image_path = self._save_inbound_image(
+                    message_id=msg_id,
+                    image_key=key,
+                    data=resized.data,
+                    mime=mime,
+                )
+                results.append(_InboundImage(
+                    content=ImageContent(
+                        mime=mime,
+                        data=base64.b64encode(resized.data).decode("ascii"),
+                    ),
+                    path=image_path,
                 ))
         return results
+
+    @staticmethod
+    def _build_image_markdown(images: list[_InboundImage]) -> str:
+        """Render local image paths into markdown for WebChat/history replay."""
+        if not images:
+            return ""
+        lines = ["(用户发送了图片)"]
+        for idx, image in enumerate(images, start=1):
+            lines.append(f"![飞书图片{idx}]({image.path})")
+        return "\n".join(lines)
+
+    def _save_inbound_image(
+        self,
+        *,
+        message_id: str,
+        image_key: str,
+        data: bytes,
+        mime: str,
+    ) -> str:
+        """Persist inbound Feishu image so WebChat/session history can reference it."""
+        suffix = self._image_suffix_for_mime(mime)
+        _FEISHU_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        dest = _FEISHU_MEDIA_DIR / f"{message_id[:8]}_{image_key}{suffix}"
+        dest.write_bytes(data)
+        return str(dest.resolve())
+
+    @staticmethod
+    def _image_suffix_for_mime(mime: str) -> str:
+        """Map normalized image mime to a stable file suffix."""
+        normalized = mime.strip().lower()
+        if normalized == "image/png":
+            return ".png"
+        if normalized == "image/webp":
+            return ".webp"
+        if normalized == "image/gif":
+            return ".gif"
+        return ".jpg"
 
     async def _extract_file(self, message: dict[str, Any]) -> str | None:
         """Download incoming Feishu file message and return local absolute path."""

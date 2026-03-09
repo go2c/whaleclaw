@@ -8,15 +8,25 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
+from typing import cast
 from urllib.parse import quote
 
 import httpx
 
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL | re.MULTILINE)
+_SEARCH_CACHE_TTL_SECONDS = 45.0
+_DETAIL_CACHE_TTL_SECONDS = 900.0
+_DETAIL_ENRICH_MAX_ITEMS = 24
+_CLI_INSPECT_FALLBACK_MAX_ITEMS = 2
+_DETAIL_ENRICH_MAX_WORKERS = 4
+_search_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
+_detail_cache: dict[str, tuple[float, dict[str, object]]] = {}
 
 
 class ClawHubCliError(RuntimeError):
@@ -264,36 +274,6 @@ def _clean_cli_error(message: str) -> str:
     return text
 
 
-def _parse_search_text(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#") or line.startswith("slug") or set(line) <= {"-", " "}:
-            continue
-
-        # typical line style: "my-skill  A short summary..."
-        m = re.match(r"^([a-zA-Z0-9_.-]{2,})\s+(.*)$", line)
-        if not m:
-            continue
-        slug = m.group(1).strip()
-        summary = m.group(2).strip()
-        if not slug:
-            continue
-        rows.append(
-            {
-                "slug": slug,
-                "name": slug,
-                "summary": summary,
-                "version": "",
-                "detail_url": "",
-                "repo_url": "",
-            }
-        )
-    return rows
-
-
 def _decorate_results(
     *,
     items: list[dict[str, object]],
@@ -314,38 +294,16 @@ def _decorate_results(
     return out
 
 
-def _apply_search_filter_and_sort(
-    *,
-    items: list[dict[str, object]],
-    query: str,
-) -> list[dict[str, object]]:
-    """Filter by keyword match first, then sort by requested priority."""
-    terms = [t for t in re.split(r"\s+", query.strip().lower()) if t]
-    if not terms:
-        return []
-
-    matched: list[tuple[int, dict[str, object]]] = []
-    for row in items:
-        slug = str(row.get("slug", "")).strip().lower()
-        name = str(row.get("name", "")).strip().lower()
-        summary = str(row.get("summary", "")).strip().lower()
-
-        title_hit = all(term in f"{slug} {name}" for term in terms)
-        summary_hit = all(term in summary for term in terms)
-        if not title_hit and not summary_hit:
-            continue
-        rank = 0 if title_hit else 1
-        matched.append((rank, row))
-
-    matched.sort(
-        key=lambda item: (
-            item[0],
-            -_to_int(item[1].get("stars", 0)),
-            -_to_int(item[1].get("all_time_installs", 0)),
-            str(item[1].get("slug", "")),
+def _sort_results_by_stats(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    ranked = list(items)
+    ranked.sort(
+        key=lambda row: (
+            -_to_int(row.get("stars", 0)),
+            -_to_int(row.get("downloads", 0)),
+            str(row.get("slug", "")),
         )
     )
-    return [row for _, row in matched]
+    return ranked
 
 
 def _is_empty_value(value: object) -> bool:
@@ -356,7 +314,7 @@ def _is_empty_value(value: object) -> bool:
     return False
 
 
-def _merge_result_rows(
+def _merge_result_rows(  # pyright: ignore[reportUnusedFunction]
     *,
     base_items: list[dict[str, object]],
     extra_items: list[dict[str, object]],
@@ -403,29 +361,87 @@ def _fill_guessed_install_stats(items: list[dict[str, object]]) -> None:
             row["all_time_installs"] = guessed
 
 
-def _enrich_search_results_stats(
+def _search_cache_key(
     *,
-    results: list[dict[str, object]],
-    search_limit: int,
+    query: str,
     registry_url: str,
-    workspace_dir: Path,
     api_token: str | None,
+    limit: int,
+) -> str:
+    token_key = "token" if api_token else "anon"
+    return f"{registry_url.rstrip('/')}\n{query.strip().lower()}\n{limit}\n{token_key}"
+
+
+def _clone_rows(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [dict(item) for item in items]
+
+
+def _cache_get(
+    cache: dict[str, tuple[float, list[dict[str, object]]]],
+    key: str,
+    ttl_seconds: float,
+) -> list[dict[str, object]] | None:
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    expires_at, items = entry
+    if expires_at < time.monotonic():
+        cache.pop(key, None)
+        return None
+    return _clone_rows(items)
+
+
+def _cache_put(
+    cache: dict[str, tuple[float, list[dict[str, object]]]],
+    key: str,
+    items: list[dict[str, object]],
+    ttl_seconds: float,
 ) -> None:
-    if not results:
-        return
-    _enrich_results_with_cli_explore_stats(
-        items=results,
+    cache[key] = (time.monotonic() + ttl_seconds, _clone_rows(items))
+
+
+def _detail_cache_key(*, registry_url: str, slug: str, api_token: str | None) -> str:
+    token_key = "token" if api_token else "anon"
+    return f"{registry_url.rstrip('/')}\n{slug.strip().lower()}\n{token_key}"
+
+
+def _detail_cache_get(
+    *,
+    registry_url: str,
+    slug: str,
+    api_token: str | None,
+) -> dict[str, object] | None:
+    cache_key = _detail_cache_key(
         registry_url=registry_url,
-        workspace_dir=workspace_dir,
+        slug=slug,
         api_token=api_token,
     )
-    _enrich_results_with_cli_inspect_stats(
-        items=results,
+    cached = _detail_cache.get(cache_key)
+    if cached is None:
+        return None
+    expires_at, payload = cached
+    if expires_at < time.monotonic():
+        _detail_cache.pop(cache_key, None)
+        return None
+    return dict(payload)
+
+
+def _detail_cache_put(
+    *,
+    registry_url: str,
+    slug: str,
+    api_token: str | None,
+    payload: dict[str, object],
+) -> None:
+    cache_key = _detail_cache_key(
         registry_url=registry_url,
+        slug=slug,
         api_token=api_token,
-        max_items=min(search_limit, 24),
     )
-    _fill_guessed_install_stats(results)
+    _detail_cache[cache_key] = (
+        time.monotonic() + _DETAIL_CACHE_TTL_SECONDS,
+        dict(payload),
+    )
 
 
 def _to_int(value: object) -> int:
@@ -480,12 +496,14 @@ def _walk_dict_values(value: object) -> list[tuple[list[str], object]]:
 
     def _walk(node: object, path: list[str]) -> None:
         if isinstance(node, dict):
-            for k, v in node.items():
+            node_dict = cast(dict[object, object], node)
+            for k, v in node_dict.items():
                 if isinstance(k, str):
                     _walk(v, [*path, k])
             return
         if isinstance(node, list):
-            for idx, v in enumerate(node):
+            node_list = cast(list[object], node)
+            for idx, v in enumerate(node_list):
                 _walk(v, [*path, str(idx)])
             return
         out.append((path, node))
@@ -499,11 +517,14 @@ def _walk_dict_nodes(value: object) -> list[dict[str, object]]:
 
     def _walk(node: object) -> None:
         if isinstance(node, dict):
-            out.append(node)
-            for v in node.values():
+            node_dict = cast(dict[object, object], node)
+            normalized = {str(k): v for k, v in node_dict.items() if isinstance(k, str)}
+            out.append(normalized)
+            for v in node_dict.values():
                 _walk(v)
         elif isinstance(node, list):
-            for v in node:
+            node_list = cast(list[object], node)
+            for v in node_list:
                 _walk(v)
 
     _walk(value)
@@ -530,7 +551,7 @@ def _extract_stats_from_metric_nodes(source: dict[str, object]) -> dict[str, int
         "all_time_installs": None,
     }
     for node in _walk_dict_nodes(source):
-        keys = {str(k): v for k, v in node.items() if isinstance(k, str)}
+        keys = dict(node)
         if not keys:
             continue
         marker_parts: list[str] = []
@@ -576,7 +597,7 @@ def _extract_stats_from_metric_nodes(source: dict[str, object]) -> dict[str, int
 
 def _extract_stats(source: dict[str, object]) -> dict[str, int | None]:
     stats_raw = source.get("stats")
-    stats = stats_raw if isinstance(stats_raw, dict) else {}
+    stats = cast(dict[str, object], stats_raw) if isinstance(stats_raw, dict) else {}
     installs = _pick_first_int(
         source.get("installs"),
         stats.get("installs"),
@@ -684,7 +705,7 @@ def _extract_stats(source: dict[str, object]) -> dict[str, int | None]:
     }
 
 
-def _has_any_stats(item: dict[str, object]) -> bool:
+def _has_any_stats(item: dict[str, object]) -> bool:  # pyright: ignore[reportUnusedFunction]
     for key in ("stars", "downloads", "current_installs", "all_time_installs"):
         if _to_int_or_none(item.get(key)) is not None:
             return True
@@ -776,218 +797,33 @@ def search_skills(
     api_token: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, object]]:
-    """Search ClawHub skills by query via CLI only."""
-    if not is_clawhub_cli_available():
-        raise ClawHubCliError("未检测到 clawhub CLI，无法执行搜索")
+    """Search ClawHub skills via HTTP API, then enrich via HTTP detail API."""
     search_limit = max(1, min(limit, 200))
-
-    env = _build_env(
+    cache_key = _search_cache_key(
+        query=query,
         registry_url=registry_url,
-        workspace_dir=workspace_dir,
         api_token=api_token,
+        limit=search_limit,
     )
+    cached = _cache_get(_search_cache, cache_key, _SEARCH_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached[:limit]
 
-    json_search_ok = False
     try:
-        raw_json = _run(
-            ["clawhub", "search", query, "--json", "--limit", str(search_limit)],
-            env=env,
-        )
-        json_search_ok = True
-        data = json.loads(raw_json)
-        items = data if isinstance(data, list) else data.get("items", [])
-        results: list[dict[str, object]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            slug = str(item.get("slug", "")).strip()
-            if not slug:
-                continue
-            results.append(
-                {
-                    "slug": slug,
-                    "name": str(item.get("name", slug)).strip() or slug,
-                    "summary": str(item.get("summary", "")).strip(),
-                    "version": str(item.get("version", "")).strip(),
-                }
-            )
-        if results:
-            _enrich_search_results_stats(
-                results=results,
-                search_limit=search_limit,
-                registry_url=registry_url,
-                workspace_dir=workspace_dir,
-                api_token=api_token,
-            )
-            filtered_sorted = _apply_search_filter_and_sort(items=results, query=query)
-            decorated = _decorate_results(items=filtered_sorted, registry_url=registry_url)
-            return decorated[:limit]
-        # CLI 执行成功但无结果：视为正常“0 条”
-        return []
-    except Exception:
-        pass
-
-    text_search_ok = False
-    with contextlib.suppress(Exception):
-        text = _run(
-            ["clawhub", "search", query, "--limit", str(search_limit)],
-            env=env,
-        )
-        text_search_ok = True
-        parsed = _parse_search_text(text)
-        if parsed:
-            _enrich_search_results_stats(
-                results=parsed,
-                search_limit=search_limit,
-                registry_url=registry_url,
-                workspace_dir=workspace_dir,
-                api_token=api_token,
-            )
-            filtered_sorted = _apply_search_filter_and_sort(items=parsed, query=query)
-            return _decorate_results(items=filtered_sorted, registry_url=registry_url)[:limit]
-        # CLI 执行成功但文本为空/无法解析：按“无结果”处理
-        return []
-    if json_search_ok or text_search_ok:
-        return []
-    raise ClawHubCliError("CLI 搜索失败，请重试或检查 clawhub 登录状态")
-
-
-def _enrich_results_with_cli_explore_stats(
-    *,
-    items: list[dict[str, object]],
-    registry_url: str,
-    workspace_dir: Path,
-    api_token: str | None,
-) -> None:
-    if not items or not is_clawhub_cli_available():
-        return
-    env = _build_env(
-        registry_url=registry_url,
-        workspace_dir=workspace_dir,
-        api_token=api_token,
-    )
-    try:
-        raw = _run(
-            ["clawhub", "explore", "--json", "--limit", "200", "--sort", "installsAllTime"],
-            env=env,
-        )
-        payload = json.loads(raw)
-    except Exception:
-        return
-    if not isinstance(payload, dict):
-        return
-    raw_items = payload.get("items")
-    if not isinstance(raw_items, list):
-        return
-    by_slug: dict[str, dict[str, int | None]] = {}
-    for entry in raw_items:
-        if not isinstance(entry, dict):
-            continue
-        slug = str(entry.get("slug", "")).strip()
-        if not slug:
-            continue
-        by_slug[slug] = _extract_stats(entry)
-    for row in items:
-        slug = str(row.get("slug", "")).strip()
-        if not slug:
-            continue
-        stats = by_slug.get(slug)
-        if not stats:
-            continue
-        for key, value in stats.items():
-            if value is not None:
-                row[key] = value
-
-
-def _enrich_results_with_cli_inspect_stats(
-    *,
-    items: list[dict[str, object]],
-    registry_url: str,
-    api_token: str | None,
-    max_items: int,
-) -> None:
-    if not items or max_items <= 0 or not is_clawhub_cli_available():
-        return
-    checked = 0
-    for row in items:
-        if checked >= max_items:
-            break
-        checked += 1
-        if _has_primary_stats(row):
-            continue
-        slug = str(row.get("slug", "")).strip()
-        if not slug:
-            continue
-        stats = _inspect_skill_stats_via_cli(
-            slug=slug,
+        items = _search_via_http(
+            query=query,
             registry_url=registry_url,
             api_token=api_token,
+            limit=search_limit,
         )
-        for key, value in stats.items():
-            if value is not None:
-                row[key] = value
-
-
-def _enrich_results_with_http_skill_list(
-    *,
-    items: list[dict[str, object]],
-    registry_url: str,
-    api_token: str | None,
-) -> None:
-    if not items:
-        return
-    base = registry_url.rstrip("/") + "/"
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
-    target_slugs = {
-        str(x.get("slug", "")).strip()
-        for x in items
-        if str(x.get("slug", "")).strip()
-    }
-    if not target_slugs:
-        return
-    found: dict[str, dict[str, int | None]] = {}
-    cursor: str | None = None
-    scanned_pages = 0
-    with httpx.Client(timeout=12, follow_redirects=True) as client:
-        while scanned_pages < 10 and len(found) < len(target_slugs):
-            params: dict[str, str | int] = {"limit": 100, "sort": "installsAllTime"}
-            if cursor:
-                params["cursor"] = cursor
-            resp = client.get(f"{base}api/v1/skills", params=params, headers=headers)
-            if resp.status_code >= 400:
-                break
-            payload = resp.json()
-            if not isinstance(payload, dict):
-                break
-            raw_items = payload.get("items")
-            if not isinstance(raw_items, list):
-                break
-            for entry in raw_items:
-                if not isinstance(entry, dict):
-                    continue
-                slug = str(entry.get("slug", "")).strip()
-                if not slug or slug not in target_slugs:
-                    continue
-                found[slug] = _extract_stats(entry)
-            next_cursor = payload.get("nextCursor")
-            cursor = str(next_cursor).strip() if next_cursor is not None else ""
-            scanned_pages += 1
-            if not cursor:
-                break
-    if not found:
-        return
-    for row in items:
-        slug = str(row.get("slug", "")).strip()
-        if not slug:
-            continue
-        stats = found.get(slug)
-        if not stats:
-            continue
-        for key, value in stats.items():
-            if value is not None:
-                row[key] = value
+    except Exception as exc:
+        raise ClawHubCliError(f"HTTP 搜索失败: {_clean_cli_error(str(exc))}") from exc
+    if items:
+        decorated = _decorate_results(items=items, registry_url=registry_url)[:limit]
+        _cache_put(_search_cache, cache_key, decorated, _SEARCH_CACHE_TTL_SECONDS)
+        return decorated
+    _cache_put(_search_cache, cache_key, [], _SEARCH_CACHE_TTL_SECONDS)
+    return []
 
 
 def install_skill(
@@ -1168,13 +1004,18 @@ def _search_via_http(
     for item in raw_results:
         if not isinstance(item, dict):
             continue
-        slug = str(item.get("slug", "")).strip()
+        item_map = {
+            str(key): value
+            for key, value in cast(dict[object, object], item).items()
+            if isinstance(key, str)
+        }
+        slug = str(item_map.get("slug", "")).strip()
         if not slug:
             continue
-        name = str(item.get("displayName", slug)).strip() or slug
-        summary = str(item.get("summary", "")).strip()
+        name = str(item_map.get("displayName", slug)).strip() or slug
+        summary = str(item_map.get("summary", "")).strip()
         guessed_total = _parse_number_from_name(name) or _parse_number_from_text(summary)
-        stats = _extract_stats(item)
+        stats = _extract_stats(item_map)
         if stats["all_time_installs"] is None and guessed_total > 0:
             stats["all_time_installs"] = guessed_total
         results.append(
@@ -1182,31 +1023,32 @@ def _search_via_http(
                 "slug": slug,
                 "name": name,
                 "summary": summary,
-                "version": str(item.get("version", "")).strip(),
+                "version": str(item_map.get("version", "")).strip(),
                 "stars": stats["stars"],
                 "downloads": stats["downloads"],
                 "current_installs": stats["current_installs"],
                 "all_time_installs": stats["all_time_installs"],
                 "detail_url": str(
-                    item.get("url", "")
-                    or item.get("detailUrl", "")
-                    or item.get("pageUrl", "")
-                    or item.get("permalink", "")
+                    item_map.get("url", "")
+                    or item_map.get("detailUrl", "")
+                    or item_map.get("pageUrl", "")
+                    or item_map.get("permalink", "")
                 ).strip(),
                 "repo_url": str(
-                    item.get("repoUrl", "")
-                    or item.get("repository", "")
-                    or item.get("repo", "")
+                    item_map.get("repoUrl", "")
+                    or item_map.get("repository", "")
+                    or item_map.get("repo", "")
                 ).strip(),
             }
         )
+    _fill_guessed_install_stats(results)
     _enrich_results_with_skill_details(
         items=results,
         registry_url=registry_url,
         api_token=api_token,
-        max_items=min(limit, 8),
+        max_items=min(limit, _DETAIL_ENRICH_MAX_ITEMS),
     )
-    return _decorate_results(items=results, registry_url=registry_url)
+    return _sort_results_by_stats(results)
 
 
 def _enrich_results_with_skill_details(
@@ -1218,70 +1060,84 @@ def _enrich_results_with_skill_details(
 ) -> None:
     if not items or max_items <= 0:
         return
-    base = registry_url.rstrip("/") + "/"
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
-    checked = 0
-    with httpx.Client(timeout=12, follow_redirects=True) as client:
-        for row in items:
-            if checked >= max_items:
-                break
-            checked += 1
-            slug = str(row.get("slug", "")).strip()
-            if not slug or _has_any_stats(row):
-                continue
-            try:
-                resp = client.get(
-                    f"{base}api/v1/skills/{quote(slug, safe='')}",
-                    headers=headers,
-                )
-                if resp.status_code >= 400:
-                    continue
-                payload = resp.json()
-            except Exception:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            skill = payload.get("skill")
-            if isinstance(skill, dict):
-                stats = _extract_stats(skill)
-                for key, value in stats.items():
-                    if value is not None:
-                        row[key] = value
-            if not row.get("version"):
-                latest = payload.get("latestVersion")
-                if isinstance(latest, dict):
-                    ver = str(latest.get("version", "")).strip()
-                    if ver:
-                        row["version"] = ver
-            if _has_any_stats(row):
-                continue
-            cli_stats = _inspect_skill_stats_via_cli(
-                slug=slug,
+    candidates: list[dict[str, object]] = []
+    for row in items:
+        if len(candidates) >= max_items:
+            break
+        slug = str(row.get("slug", "")).strip()
+        if not slug or _has_primary_stats(row):
+            continue
+        cached = _detail_cache_get(
+            registry_url=registry_url,
+            slug=slug,
+            api_token=api_token,
+        )
+        if cached is not None:
+            row.update(cached)
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return
+
+    max_workers = min(_DETAIL_ENRICH_MAX_WORKERS, len(candidates))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _fetch_skill_detail_enrichment,
+                slug=str(row.get("slug", "")).strip(),
+                detail_url=str(row.get("detail_url", "")).strip(),
                 registry_url=registry_url,
                 api_token=api_token,
-            )
-            for key, value in cli_stats.items():
-                if value is not None:
-                    row[key] = value
-            if _has_any_stats(row):
-                continue
-            detail_url = str(row.get("detail_url", "")).strip()
-            if not detail_url:
-                detail_url = f"{base}skills/{quote(slug, safe='')}"
+                include_cli=False,
+            ): row
+            for row in candidates
+        }
+        for future in as_completed(future_map):
+            row = future_map[future]
             try:
-                page_resp = client.get(
-                    detail_url,
-                    headers={"Accept": "text/html,*/*"},
-                )
-                if page_resp.status_code < 400:
-                    page_stats = _extract_stats_from_html(page_resp.text)
-                    for key, value in page_stats.items():
-                        if value is not None:
-                            row[key] = value
+                detail_updates = future.result()
             except Exception:
                 continue
+            if not detail_updates:
+                continue
+            row.update(detail_updates)
+            slug = str(row.get("slug", "")).strip()
+            if slug:
+                _detail_cache_put(
+                    registry_url=registry_url,
+                    slug=slug,
+                    api_token=api_token,
+                    payload=detail_updates,
+                )
+
+    cli_checked = 0
+    for row in candidates:
+        if _has_primary_stats(row):
+            continue
+        if cli_checked >= _CLI_INSPECT_FALLBACK_MAX_ITEMS:
+            break
+        cli_checked += 1
+        slug = str(row.get("slug", "")).strip()
+        if not slug:
+            continue
+        detail_updates: dict[str, object] = {}
+        cli_stats = _inspect_skill_stats_via_cli(
+            slug=slug,
+            registry_url=registry_url,
+            api_token=api_token,
+        )
+        for key, value in cli_stats.items():
+            if value is not None:
+                row[key] = value
+                detail_updates[key] = value
+        if detail_updates:
+            _detail_cache_put(
+                registry_url=registry_url,
+                slug=slug,
+                api_token=api_token,
+                payload=detail_updates,
+            )
 
 
 def _inspect_skill_stats_via_cli(
@@ -1319,7 +1175,8 @@ def _inspect_skill_stats_via_cli(
             "current_installs": None,
             "all_time_installs": None,
         }
-    skill = payload.get("skill")
+    payload_map = cast(dict[object, object], payload)
+    skill = payload_map.get("skill")
     if not isinstance(skill, dict):
         return {
             "stars": None,
@@ -1327,7 +1184,99 @@ def _inspect_skill_stats_via_cli(
             "current_installs": None,
             "all_time_installs": None,
         }
-    return _extract_stats(skill)
+    skill_map = {
+        str(key): value
+        for key, value in cast(dict[object, object], skill).items()
+        if isinstance(key, str)
+    }
+    return _extract_stats(skill_map)
+
+
+def _fetch_skill_detail_enrichment(
+    *,
+    slug: str,
+    detail_url: str,
+    registry_url: str,
+    api_token: str | None,
+    include_cli: bool = False,
+) -> dict[str, object]:
+    if not slug:
+        return {}
+    base = registry_url.rstrip("/") + "/"
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    detail_updates: dict[str, object] = {}
+    with httpx.Client(timeout=8, follow_redirects=True) as client:
+        try:
+            resp = client.get(
+                f"{base}api/v1/skills/{quote(slug, safe='')}",
+                headers=headers,
+            )
+            if resp.status_code < 400:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    payload_map = cast(dict[object, object], payload)
+                    skill = payload_map.get("skill")
+                    if isinstance(skill, dict):
+                        skill_map = {
+                            str(key): value
+                            for key, value in cast(dict[object, object], skill).items()
+                            if isinstance(key, str)
+                        }
+                        stats = _extract_stats(skill_map)
+                        for key, value in stats.items():
+                            if value is not None:
+                                detail_updates[key] = value
+                    latest = payload_map.get("latestVersion")
+                    if isinstance(latest, dict):
+                        latest_map = {
+                            str(key): value
+                            for key, value in cast(dict[object, object], latest).items()
+                            if isinstance(key, str)
+                        }
+                        ver = str(latest_map.get("version", "")).strip()
+                        if ver:
+                            detail_updates["version"] = ver
+        except Exception:
+            pass
+
+        has_stats = any(
+            detail_updates.get(k) is not None
+            for k in ("stars", "downloads", "current_installs", "all_time_installs")
+        )
+        if has_stats:
+            return detail_updates
+
+        target_detail_url = detail_url or f"{base}skills/{quote(slug, safe='')}"
+        try:
+            page_resp = client.get(
+                target_detail_url,
+                headers={"Accept": "text/html,*/*"},
+            )
+            if page_resp.status_code < 400:
+                page_stats = _extract_stats_from_html(page_resp.text)
+                for key, value in page_stats.items():
+                    if value is not None:
+                        detail_updates[key] = value
+        except Exception:
+            pass
+
+    if include_cli and not any(
+        detail_updates.get(k) is not None
+        for k in ("stars", "downloads", "current_installs", "all_time_installs")
+    ):
+        cli_stats = _inspect_skill_stats_via_cli(
+            slug=slug,
+            registry_url=registry_url,
+            api_token=api_token,
+        )
+        for key, value in cli_stats.items():
+            if value is not None:
+                detail_updates[key] = value
+
+    return detail_updates
 
 
 def _install_via_http(

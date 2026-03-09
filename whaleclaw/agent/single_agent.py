@@ -1,0 +1,3005 @@
+"""Agent main loop — message -> LLM -> tool -> reply (multi-turn).
+
+The loop is provider-agnostic.  Tool invocation follows a single code
+path regardless of whether the provider supports native ``tools`` API:
+
+* **Native mode** — tool schemas are passed via ``tools=`` parameter;
+  the provider returns structured ``ToolCall`` objects in the response.
+* **Fallback mode** — tool descriptions are injected into the system
+  prompt; the LLM outputs a JSON block which the loop parses.
+"""
+
+import asyncio
+import base64
+import re
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+from whaleclaw.agent.context import OnToolCall, OnToolResult
+from whaleclaw.agent.helpers.office_rules import (
+    ABS_FILE_PATH_RE as _ABS_FILE_PATH_RE,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    NON_DELIVERY_EXTS as _NON_DELIVERY_EXTS,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    OFFICE_PATH_RE as _OFFICE_PATH_RE,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    append_office_system_hints as _append_office_system_hints,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    build_image_generation_system_message as _build_image_generation_system_message,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    build_office_path_block_message as _build_office_path_block_message,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    capture_latest_pptx as _capture_latest_pptx,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    extract_artifact_baseline as _extract_artifact_baseline,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    extract_delivery_artifact_paths as _extract_delivery_artifact_paths,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    extract_office_paths as _extract_office_paths,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    extract_round_delivery_section as _extract_round_delivery_section,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    fix_version_suffix as _fix_version_suffix,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    force_include_office_edit_tools as _force_include_office_edit_tools,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    get_default_office_edit_path as _get_default_office_edit_path,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    has_any_last_office_path as _has_any_last_office_path,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    is_followup_edit_message as _is_followup_edit_message,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    is_image_generation_request as _is_image_generation_request,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    is_office_edit_request as _is_office_edit_request,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    mentions_specific_dark_bar_target as _mentions_specific_dark_bar_target,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    remember_office_path as _remember_office_path,
+)
+from whaleclaw.agent.helpers.office_rules import (
+    snapshot_round_artifacts as _snapshot_round_artifacts,
+)
+from whaleclaw.agent.helpers.office_rules import with_round_version_suffix
+from whaleclaw.agent.helpers.skill_lock import (
+    build_nano_banana_execution_system_message as _build_nano_banana_execution_system_message,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    build_skill_lock_system_message as _build_skill_lock_system_message,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    build_skill_param_guard_reply as _build_skill_param_guard_reply,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    detect_assistant_name_update as _detect_assistant_name_update,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    detect_nano_banana_model_display as _detect_nano_banana_model_display,
+)
+from whaleclaw.agent.helpers.skill_lock import guarded_skills as _guarded_skills
+from whaleclaw.agent.helpers.skill_lock import (
+    is_nano_banana_control_message as _is_nano_banana_control_message,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    is_skill_switch_consent as _is_skill_switch_consent,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    is_task_done_confirmation as _is_task_done_confirmation,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    load_saved_nano_banana_model_display as _load_saved_nano_banana_model_display,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    looks_like_skill_activation_message as _looks_like_skill_activation_message,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    nano_banana_missing_required as _nano_banana_missing_required,
+)
+from whaleclaw.agent.helpers.skill_lock import normalize_for_match as _normalize_for_match
+from whaleclaw.agent.helpers.skill_lock import normalize_skill_ids as _normalize_skill_ids
+from whaleclaw.agent.helpers.skill_lock import parse_use_command as _parse_use_command
+from whaleclaw.agent.helpers.skill_lock import preview_text as _preview_text
+from whaleclaw.agent.helpers.skill_lock import (
+    select_native_tool_names as _select_native_tool_names,
+)
+from whaleclaw.agent.helpers.skill_lock import skill_announcement as _skill_announcement
+from whaleclaw.agent.helpers.skill_lock import (
+    skill_explicitly_mentioned as _skill_explicitly_mentioned,
+)
+from whaleclaw.agent.helpers.skill_lock import (
+    skill_trigger_mentioned as _skill_trigger_mentioned,
+)
+from whaleclaw.agent.helpers.skill_lock import update_guard_state as _update_guard_state
+from whaleclaw.agent.helpers.tool_execution import (
+    can_auto_create_parent_for_failure,
+    create_default_registry,
+)
+from whaleclaw.agent.helpers.tool_execution import (
+    execute_tool as _execute_tool,
+)
+from whaleclaw.agent.helpers.tool_execution import (
+    format_tool_output as _format_tool_output,
+)
+from whaleclaw.agent.helpers.tool_execution import (
+    is_transient_cli_usage_error as _is_transient_cli_usage_error,
+)
+from whaleclaw.agent.helpers.tool_execution import (
+    parse_fallback_tool_calls as _parse_fallback_tool_calls,
+)
+from whaleclaw.agent.helpers.tool_execution import (
+    persist_message as _persist_message,
+)
+from whaleclaw.agent.helpers.tool_execution import repair_tool_call as _repair_tool_call
+from whaleclaw.agent.helpers.tool_execution import strip_tool_json as _strip_tool_json
+from whaleclaw.agent.helpers.tool_execution import (
+    validate_tool_call_args as _validate_tool_call_args,
+)
+from whaleclaw.agent.helpers.tool_guards import (
+    ToolGuardState,
+    apply_post_round_guards,
+    apply_tool_result_guards,
+    blocked_tool_reasons,
+    update_planned_image_count,
+)
+from whaleclaw.agent.prompt import PromptAssembler
+from whaleclaw.config.schema import WhaleclawConfig
+from whaleclaw.providers.base import AgentResponse, ImageContent, Message, ToolCall
+from whaleclaw.providers.router import ModelRouter
+from whaleclaw.sessions.compressor import ContextCompressor
+from whaleclaw.sessions.context_window import RECENT_PROTECTED, ContextWindow
+from whaleclaw.sessions.manager import Session, SessionManager
+from whaleclaw.sessions.store import SessionStore
+from whaleclaw.skills.parser import Skill
+from whaleclaw.tools.base import ToolResult
+from whaleclaw.tools.registry import ToolRegistry
+from whaleclaw.types import StreamCallback
+from whaleclaw.utils.log import get_logger
+
+if TYPE_CHECKING:
+    from whaleclaw.memory.manager import MemoryManager
+    from whaleclaw.sessions.group_compressor import SessionGroupCompressor
+
+log = get_logger(__name__)
+
+OnRoundResult = Callable[[int, str], Awaitable[None]]
+
+_assembler = PromptAssembler()
+_context_window = ContextWindow()
+_compressor = ContextCompressor()
+_memory_organizer_tasks: dict[str, asyncio.Task[None]] = {}
+
+_MAX_OUTPUT_TOKENS = 200_000
+_EVOMAP_MAX_TOKENS = 1000
+_EXTRA_MEMORY_COMPRESS_TIMEOUT_SECONDS = 8
+_DEFAULT_ASSISTANT_NAME = "WhaleClaw"
+
+_IMG_MD_RE = re.compile(r"!\[([^\]]*)\]\((/[^)]+)\)")
+_ABS_IMAGE_PATH_RE = re.compile(
+    r"(/[^\s\"')]+?\.(?:png|jpg|jpeg|gif|webp))(?=[\s\"')]|$)",
+    re.IGNORECASE,
+)
+_IMAGE_REFERENCE_RE = re.compile(
+    r"(这张图|这张图片|这幅图|这幅图片|图里|图中|参考图|按这张|基于这张|用这张)",
+    re.IGNORECASE,
+)
+_EVOMAP_LINE_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.+?)\s*$")
+_VERSION_SUFFIX_RE = re.compile(r"_V\d+$", re.IGNORECASE)
+_COORDINATOR_ASK_RE = re.compile(
+    r"(?:你要(?:我|什么)|需要你(?:提供|告诉|回复|回答|确认|选择)|"
+    r"请(?:告诉|选择|提供|告知)我|"
+    r"(?:按|用)(?:下面|以下)(?:模板|格式)(?:回|填|答))",
+)
+_EVOMAP_CHOICE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(?:选|选择)?\s*([ABCabc])\s*$"),
+    re.compile(r"^\s*(?:选|选择)?\s*([123])\s*$"),
+)
+_ASSISTANT_NAME_RESET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"恢复默认名字"),
+    re.compile(r"改回\s*whaleclaw", re.IGNORECASE),
+    re.compile(r"还是叫\s*whaleclaw", re.IGNORECASE),
+)
+_ASSISTANT_NAME_SET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?:以后|从现在起|今后|之后|开始)\s*(?:你|机器人|助手)?\s*(?:就)?(?:叫|改叫|改名叫)\s*([^\s，。！？!?、,]{1,24})"
+    ),
+    re.compile(r"(?:把你|你)\s*(?:改名|改名为|名字改成|名字改为)\s*([^\s，。！？!?、,]{1,24})"),
+    re.compile(r"^\s*(?:你|助手|机器人)\s*(?:就)?叫\s*([^\s，。！？!?、,]{1,24})\s*$"),
+)
+_USE_CMD_RE = re.compile(r"^\s*/use\s+([^\s]+)\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_USE_CLEAR_IDS = {"clear", "none", "off", "default", "reset"}
+_TASK_DONE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*任务完成\s*$"),
+    re.compile(r"^\s*完成了?\s*$"),
+    re.compile(r"^\s*结束了?\s*$"),
+    re.compile(r"^\s*可以了?\s*$"),
+    re.compile(r"^\s*ok\s*$", re.IGNORECASE),
+)
+_SKILL_SWITCH_CONSENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:同意|可以|确认|允许).{0,8}(?:切换|换).{0,8}(?:技能|skill)?", re.IGNORECASE),
+    re.compile(r"(?:切换|换).{0,8}(?:技能|skill).{0,8}(?:吧|可以|行|好的|ok)", re.IGNORECASE),
+    re.compile(r"(?:换成|改用|切到).{0,24}(?:技能|skill)", re.IGNORECASE),
+)
+_SKILL_SWITCH_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:继续|仍然|还是).{0,8}(?:沿用|使用|走).{0,8}(?:原技能|原来的技能|当前技能)"),
+    re.compile(r"(?:不|别).{0,4}(?:切换|换).{0,8}(?:技能|skill)?", re.IGNORECASE),
+    re.compile(r"(?:保持|沿用).{0,8}(?:原技能|当前技能)", re.IGNORECASE),
+)
+_SKILL_ACTIVATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:使用|调用|启动|启用|走|用).{0,24}(?:技能|skill)", re.IGNORECASE),
+    re.compile(r"(?:技能|skill).{0,16}(?:文生图|图生图|处理|执行|联调)", re.IGNORECASE),
+)
+_MULTI_AGENT_CONFIRM_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^\s*(确认|确认开始|开始执行|开始多agent|开始多\s*agent|执行吧|开始吧)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*/multi\s+go\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_CANCEL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(取消|取消执行|先别执行|暂停|停止)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*/multi\s+cancel\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_ROUNDS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?:改为|改成|设为|设置为|设置|调整为|改到)\s*(\d{1,2})\s*轮",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*(\d{1,2})\s*轮\s*$", re.IGNORECASE),
+    re.compile(r"^\s*/multi\s+rounds\s+(\d{1,2})\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_DISCUSS_DONE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(需求确认|确认需求|需求已确认|信息齐了|进入执行确认)\s*$"),
+    re.compile(r"^\s*/multi\s+ready\s*$", re.IGNORECASE),
+)
+_MULTI_AGENT_SCENARIO_LABELS: dict[str, str] = {
+    "product_design": "产品设计",
+    "content_creation": "内容创作",
+    "software_development": "软件开发",
+    "data_analysis_decision": "数据分析决策",
+    "scientific_research": "科研",
+    "intelligent_assistant": "智能助理",
+    "workflow_automation": "自动化工作流",
+}
+
+# Public aliases for cross-module reuse.
+MULTI_AGENT_SCENARIO_LABELS = _MULTI_AGENT_SCENARIO_LABELS
+ABS_FILE_PATH_RE = _ABS_FILE_PATH_RE
+NON_DELIVERY_EXTS = _NON_DELIVERY_EXTS
+OFFICE_PATH_RE = _OFFICE_PATH_RE
+COORDINATOR_ASK_RE = _COORDINATOR_ASK_RE
+_with_round_version_suffix = with_round_version_suffix
+_can_auto_create_parent_for_failure = can_auto_create_parent_for_failure
+
+_TOOL_HINTS: dict[str, str] = {
+    "browser": "搜索相关资料",
+    "web_fetch": "抓取网页正文",
+    "desktop_capture": "点亮并截图桌面",
+    "bash": "执行命令",
+    "process": "查看或结束进程",
+    "file_write": "生成文件",
+    "file_read": "读取文件",
+    "file_edit": "编辑文件",
+    "patch_apply": "应用补丁",
+    "ppt_edit": "修改现有PPT",
+    "docx_edit": "修改现有Word",
+    "xlsx_edit": "修改现有Excel",
+    "memory_search": "检索长期记忆",
+    "memory_add": "写入长期记忆",
+    "memory_list": "查看长期记忆",
+    "skill": "查找技能",
+}
+
+def _is_evomap_enabled(config: WhaleclawConfig) -> bool:
+    plugins_cfg = getattr(config, "plugins", None)
+    if not isinstance(plugins_cfg, dict):
+        return False
+    evomap_cfg_raw: object = plugins_cfg.get("evomap", None)  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+    if not isinstance(evomap_cfg_raw, dict):
+        return False
+    evomap_cfg: dict[str, object] = evomap_cfg_raw  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+    return bool(evomap_cfg.get("enabled", False))
+
+
+def _is_evomap_status_question(text: str) -> bool:
+    q = text.lower().strip()
+    if not q:
+        return False
+    if "evomap" not in q and "evo map" not in q:
+        return False
+    status_hints = (
+        "开着",
+        "开启",
+        "启用",
+        "打开",
+        "关闭",
+        "状态",
+        "on",
+        "off",
+        "enabled",
+    )
+    return any(h in q for h in status_hints)
+
+
+def _build_memory_system_message(recalled: str) -> Message:
+    """Wrap recalled memory as durable preference/fact context."""
+    return Message(
+        role="system",
+        content=(
+            "以下是从长期记忆召回的历史信息，包含用户长期偏好、稳定约束与历史事实。\n"
+            "执行规则：\n"
+            "1) 若内容属于长期偏好/写作与产出规则，且不与本轮用户要求冲突，请默认执行；\n"
+            "2) 若内容属于历史事实且你不确定当前是否仍然有效，可先向用户确认。\n"
+            f"{recalled}"
+        ),
+    )
+
+
+def _build_global_style_system_message(style_directive: str) -> Message:
+    return Message(
+        role="system",
+        content=(
+            "以下是用户长期稳定的全局回复风格偏好，请默认遵守：\n"
+            f"{style_directive.strip()}\n"
+            "若用户在本轮消息中明确提出不同风格/长度要求，以本轮用户要求为准。"
+        ),
+    )
+
+
+def _build_external_memory_system_message(extra_memory: str) -> Message:
+    return Message(
+        role="system",
+        content=(
+            "以下是来自协作网络的外部经验候选，仅作为补充参考：\n"
+            f"{extra_memory.strip()}\n"
+            "若与用户本轮明确要求冲突，以用户本轮要求为准；"
+            "若与本地长期记忆冲突，以本地长期记忆为准。"
+        ),
+    )
+
+
+def _est_tokens(text: str) -> int:
+    return max(0, len(text) // 3)
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    if max_tokens <= 0:
+        return ""
+    char_cap = max_tokens * 3
+    if len(text) <= char_cap:
+        return text
+    return text[:char_cap]
+
+
+async def _compress_external_memory_with_llm(
+    *,
+    router: ModelRouter,
+    model_id: str,
+    text: str,
+    max_tokens: int,
+) -> str:
+    sys_prompt = (
+        "你是外部经验压缩器。"
+        "请将输入经验压缩到给定 token 上限内，保留可执行做法与约束。"
+        "禁止新增事实。输出纯文本。"
+    )
+    user_prompt = f"目标上限约 {max_tokens} tokens。\n输入如下：\n{text}\n\n请输出压缩结果。"
+    try:
+        resp = await router.chat(
+            model_id,
+            [
+                Message(role="system", content=sys_prompt),
+                Message(role="user", content=user_prompt),
+            ],
+        )
+    except Exception:
+        return ""
+    out = resp.content.strip()
+    if not out:
+        return ""
+    if _est_tokens(out) <= max_tokens:
+        return out
+    return _truncate_to_tokens(out, max_tokens)
+
+
+def _merge_recall_blocks(profile: str, raw: str) -> str:
+    blocks = [x.strip() for x in (profile, raw) if x.strip()]
+    return "\n".join(blocks)
+
+
+def _is_creation_task_message(text: str) -> bool:
+    low = text.lower().strip()
+    if not low:
+        return False
+    keys = (
+        "ppt",
+        "幻灯片",
+        "演示文稿",
+        "文档",
+        "报告",
+        "方案",
+        "写",
+        "生成",
+        "制作",
+        "整理",
+        "设计",
+        "润色",
+        "总结",
+        "改写",
+        "脚本",
+        "代码",
+        "html",
+        "页面",
+        "海报",
+        "计划",
+        "create",
+        "generate",
+        "draft",
+        "design",
+        "write",
+        "build",
+        "compose",
+    )
+    return any(k in low for k in keys)
+
+
+async def _llm_judge_task_phase(
+    router: "ModelRouter",
+    model_id: str,
+    *,
+    session: Session | None,
+    message: str,
+) -> str:
+    """Use the main model to classify task phase: NEW_TASK or EDITING."""
+    system = Message(
+        role="system",
+        content=(
+            "你是任务阶段分类器，只输出一个标签：NEW_TASK 或 EDITING。\n"
+            "NEW_TASK=开始一个全新主要任务/新主题/新产物。\n"
+            "EDITING=在已有任务上修改/补充/继续/讨论细节。\n"
+            "只输出标签，不要解释。"
+        ),
+    )
+    context: list[Message] = [system]
+    if session is not None and session.messages:
+        recent: list[Message] = []
+        for msg in session.messages[-6:]:
+            if msg.role not in {"user", "assistant"}:
+                continue
+            recent.append(
+                Message(role=msg.role, content=_preview_text(msg.content or "", limit=400))
+            )
+        context.extend(recent)
+    context.append(
+        Message(role="user", content=f"当前用户消息：{_preview_text(message, limit=600)}")
+    )
+    try:
+        resp = await router.chat(model_id, context, tools=None, on_stream=None)
+    except Exception:
+        return "EDITING"
+    raw = (resp.content or "").strip().upper()
+    if "NEW_TASK" in raw:
+        return "NEW_TASK"
+    if "EDITING" in raw:
+        return "EDITING"
+    return "EDITING"
+
+
+def _is_tasky_message_for_evomap(text: str) -> bool:
+    low = _normalize_for_match(text)
+    if not low:
+        return False
+    keys = (
+        "做",
+        "制作",
+        "生成",
+        "写",
+        "整理",
+        "设计",
+        "计划",
+        "PPT",
+        "ppt",
+        "幻灯片",
+        "演示文稿",
+        "报告",
+        "文档",
+        "方案",
+        "简历",
+        "海报",
+        "脚本",
+        "代码",
+        "页面",
+        "表格",
+        "excel",
+        "xlsx",
+        "word",
+        "docx",
+        "evomap",
+        "evo map",
+        "方案库",
+        "协作经验",
+    )
+    return any(k in low for k in keys)
+
+
+def _infer_task_kind(text: str) -> str:
+    low = text.lower()
+    if any(k in low for k in ("ppt", "幻灯片", "演示文稿", "slides", "deck")):
+        return "ppt"
+    if any(k in low for k in ("网页", "网站", "html", "web", "landing page", "前端")):
+        return "web"
+    if any(k in low for k in ("检索", "汇总", "调研", "信息", "collect", "research", "summarize")):
+        return "research"
+    return "general"
+
+
+def _extract_topic_terms(text: str, *, limit: int = 2) -> list[str]:
+    low = _normalize_for_match(text)
+    stop = {
+        "做",
+        "制作",
+        "生成",
+        "创建",
+        "一个",
+        "关于",
+        "给我",
+        "帮我",
+        "ppt",
+        "网页",
+        "网站",
+        "html",
+        "web",
+        "方案",
+        "检索",
+        "汇总",
+        "信息",
+        "today",
+        "todays",
+        "today's",
+    }
+    terms: list[str] = []
+    for t in re.findall(r"[\w\u4e00-\u9fff]{2,8}", low):
+        if t in stop:
+            continue
+        if t not in terms:
+            terms.append(t)
+        if len(terms) >= max(1, limit):
+            break
+    return terms
+
+
+def _recommended_evomap_signals(text: str) -> str:  # pyright: ignore[reportUnusedFunction]
+    kind = _infer_task_kind(text)
+    if kind == "ppt":
+        base = [
+            "ppt",
+            "presentation",
+            "slides",
+            "storyline",
+            "deck structure",
+            "visual layout",
+            "python-pptx",
+        ]
+    elif kind == "web":
+        base = [
+            "web page",
+            "html",
+            "css",
+            "frontend",
+            "responsive layout",
+            "content structure",
+        ]
+    elif kind == "research":
+        base = [
+            "information retrieval",
+            "multi-source collection",
+            "source validation",
+            "structured summary",
+            "fact-check",
+        ]
+    else:
+        base = [
+            "workflow",
+            "execution plan",
+            "quality checklist",
+        ]
+    return ",".join(base + _extract_topic_terms(text, limit=2))
+
+
+def _extra_memory_has_evomap_hint(extra_memory: str) -> bool:
+    text = extra_memory.strip()
+    if not text:
+        return False
+    return "EvoMap 协作经验候选" in text
+
+
+def _is_no_match_evomap_output(result: ToolResult) -> bool:
+    if not result.success:
+        return False
+    out = (result.output or "").strip()
+    if not out:
+        return True
+    hints = ("未找到匹配方案", "暂无可用任务", "无已认领任务")
+    return any(h in out for h in hints)
+
+
+def _build_evomap_first_system_message() -> Message:
+    return Message(
+        role="system",
+        content=(
+            "执行策略：本轮是流程任务，优先复用 EvoMap 成功经验。\n"
+            "1) 必须先调用 evomap_fetch 获取经验候选；\n"
+            "2) 只有当 evomap_fetch 无命中或失败时，才可调用 browser；\n"
+            "3) 若 evomap_fetch 命中，请先按命中方案执行。"
+        ),
+    )
+
+
+def _extract_evomap_choice_index(text: str, options_count: int) -> int | None:
+    if options_count <= 0:
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    for p in _EVOMAP_CHOICE_PATTERNS:
+        m = p.match(raw)
+        if not m:
+            continue
+        token = m.group(1).strip().upper()
+        if token in {"A", "B", "C"}:
+            idx = ord(token) - ord("A")
+        elif token.isdigit():
+            idx = int(token) - 1
+        else:
+            return None
+        if 0 <= idx < options_count:
+            return idx
+    return None
+
+
+def _parse_evomap_fetch_candidates(output: str) -> list[tuple[str, str]]:
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    items: list[tuple[str, str]] = []
+    for ln in lines:
+        m = _EVOMAP_LINE_RE.match(ln)
+        if not m:
+            continue
+        aid = m.group(1).strip()
+        summary = m.group(2).strip()
+        if not aid and not summary:
+            continue
+        items.append((aid, summary))
+    return items
+
+
+def _pick_top_evomap_candidates(
+    user_message: str,
+    candidates: list[tuple[str, str]],
+    *,
+    limit: int = 3,
+) -> list[tuple[str, str]]:
+    query = _normalize_for_match(user_message)
+    terms = {t for t in re.findall(r"[\w\u4e00-\u9fff]{2,}", query)}
+
+    scored: list[tuple[int, tuple[str, str]]] = []
+    for item in candidates:
+        aid, summary = item
+        hay = _normalize_for_match(f"{aid} {summary}")
+        score = 0
+        for t in terms:
+            if t in hay:
+                score += 1
+        scored.append((score, item))
+
+    scored.sort(key=lambda x: (-x[0], x[1][0]))
+    return [item for _score, item in scored[: max(1, limit)]]
+
+
+def _build_evomap_choice_prompt(candidates: list[tuple[str, str]]) -> str:
+    labels = ("A", "B", "C")
+    lines = ["EvoMap 命中了多条可用方案，请先选一个我再执行："]
+    for idx, item in enumerate(candidates[:3]):
+        aid, summary = item
+        label = labels[idx]
+        lines.append(f"{label}. {aid} — {summary}")
+    lines.append("请直接回复：选A / 选B / 选C")
+    return "\n".join(lines)
+
+
+def _schedule_memory_organizer_task(
+    session_id: str,
+    *,
+    memory_manager: "MemoryManager",
+    router: ModelRouter,
+    model_id: str,
+    organizer_min_new_entries: int,
+    organizer_interval_seconds: int,
+    organizer_max_raw_window: int,
+    keep_profile_versions: int,
+    max_raw_entries: int,
+) -> None:
+    running = _memory_organizer_tasks.get(session_id)
+    if running is not None and not running.done():
+        return
+
+    async def _run() -> None:
+        try:
+            organized = await memory_manager.organize_if_needed(
+                router=router,
+                model_id=model_id,
+                organizer_min_new_entries=organizer_min_new_entries,
+                organizer_interval_seconds=organizer_interval_seconds,
+                organizer_max_raw_window=organizer_max_raw_window,
+                keep_profile_versions=keep_profile_versions,
+                max_raw_entries=max_raw_entries,
+            )
+            if organized:
+                log.info("agent.memory_organized", session_id=session_id)
+        except Exception as exc:
+            log.debug("agent.memory_organize_failed", error=str(exc), session_id=session_id)
+
+    task = asyncio.create_task(_run(), name=f"memory-organizer:{session_id}")
+    _memory_organizer_tasks[session_id] = task
+
+    def _cleanup(_task: asyncio.Task[None]) -> None:
+        current = _memory_organizer_tasks.get(session_id)
+        if current is _task:
+            _memory_organizer_tasks.pop(session_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+def _make_plan_hint(tool_names: list[str], user_msg: str) -> str:
+    """Generate a brief plan message when LLM jumps straight to tool calls."""
+    steps: list[str] = []
+    seen: set[str] = set()
+    for name in tool_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        steps.append(_TOOL_HINTS.get(name, f"调用 {name}"))
+    plan = "、".join(steps)
+    return f"好的，我来处理。正在{plan}…\n\n"
+
+
+def _fix_image_paths(text: str, known_paths: list[str] | None = None) -> str:
+    """Validate image paths in markdown; fix fabricated paths using known real ones."""
+    from pathlib import Path
+
+    unused_real = list(known_paths or [])
+
+    def _replace(m: re.Match[str]) -> str:
+        alt, raw_path = m.group(1), m.group(2)
+        fp = Path(raw_path)
+        if fp.is_file():
+            return m.group(0)
+
+        # Priority 1: match from tool-returned real paths (by hash or order)
+        for i, real in enumerate(unused_real):
+            rp = Path(real)
+            if rp.is_file():
+                unused_real.pop(i)
+                log.info("fix_image_path.known", original=raw_path, found=real)
+                return f"![{alt}]({real})"
+
+        # Priority 2: fuzzy match by hash suffix
+        stem = fp.stem
+        hash_m = re.search(r"_([0-9a-f]{6,8})$", stem)
+        if hash_m and fp.parent.is_dir():
+            suffix = hash_m.group(0) + fp.suffix
+            for candidate in fp.parent.iterdir():
+                if candidate.name.endswith(suffix) and candidate.is_file():
+                    log.info("fix_image_path.fuzzy", original=raw_path, found=str(candidate))
+                    return f"![{alt}]({candidate})"
+
+        # Priority 3: most recent file in same directory
+        if fp.parent.is_dir():
+            files = sorted(
+                (f for f in fp.parent.iterdir() if f.is_file() and f.suffix == fp.suffix),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True,
+            )
+            if files:
+                best = files[0]
+                log.info("fix_image_path.recent", original=raw_path, found=str(best))
+                return f"![{alt}]({best})"
+
+        log.warning("fix_image_path.removed", path=raw_path)
+        return f"[图片未找到: {alt}]"
+
+    return _IMG_MD_RE.sub(_replace, text)
+
+
+def _message_may_need_prior_images(message: str) -> bool:
+    """Detect whether the user is referring to a previously uploaded image."""
+    return bool(_IMAGE_REFERENCE_RE.search(message))
+
+
+def _skill_requires_images(skills: list[Skill]) -> bool:
+    """Return whether any active skill explicitly requires image inputs."""
+    for skill in skills:
+        guard = skill.param_guard
+        if guard is None or not guard.enabled:
+            continue
+        for param in guard.params:
+            if param.type.strip().lower() == "images":
+                return True
+    return False
+
+
+def _mime_from_image_path(path: Path) -> str:
+    """Infer an image mime type from the local file suffix."""
+    suffix = path.suffix.lower()
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _recover_recent_session_images(
+    session: Session | None,
+    *,
+    limit: int = 4,
+) -> list[ImageContent]:
+    """Reload recent local image references from prior user messages."""
+    paths = _recover_recent_session_image_paths(session, limit=limit)
+    recovered: list[ImageContent] = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        recovered.append(ImageContent(
+            mime=_mime_from_image_path(path),
+            data=base64.b64encode(data).decode("ascii"),
+        ))
+    return recovered
+
+
+def _recover_recent_session_image_paths(
+    session: Session | None,
+    *,
+    limit: int = 4,
+) -> list[str]:
+    """Collect recent valid local image paths, preferring latest generated outputs."""
+    if session is None:
+        return []
+
+    recovered: list[str] = []
+    seen_paths: set[str] = set()
+
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    latest_generated = str(metadata.get("last_generated_image_path", "")).strip()
+    if latest_generated:
+        path = Path(latest_generated).expanduser()
+        if path.is_file():
+            seen_paths.add(str(path))
+            recovered.append(str(path))
+            if len(recovered) >= limit:
+                return recovered
+
+    for msg in reversed(session.messages):
+        if msg.role not in {"user", "assistant"} or not msg.content:
+            continue
+        markdown_paths = [match.group(2).strip() for match in _IMG_MD_RE.finditer(msg.content)]
+        plain_paths = [match.group(1).strip() for match in _ABS_IMAGE_PATH_RE.finditer(msg.content)]
+        for raw_path in [*markdown_paths, *plain_paths]:
+            path = Path(raw_path).expanduser()
+            resolved = str(path)
+            if resolved in seen_paths or not path.is_file():
+                continue
+            seen_paths.add(resolved)
+            recovered.append(resolved)
+            if len(recovered) >= limit:
+                return recovered
+    return recovered
+
+
+def _multi_agent_cfg(config: WhaleclawConfig) -> dict[str, object]:
+    plugins_raw = config.plugins
+    plugins: dict[str, object] = plugins_raw if isinstance(plugins_raw, dict) else {}  # pyright: ignore[reportAssignmentType, reportUnnecessaryIsInstance]
+    raw_ma = plugins.get("multi_agent", {})
+    if not isinstance(raw_ma, dict):
+        return {"enabled": False, "mode": "parallel", "max_rounds": 1, "roles": []}
+
+    raw: dict[str, object] = raw_ma  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+    enabled = bool(raw.get("enabled", False))
+    mode_raw = str(raw.get("mode", "parallel")).strip().lower()
+    mode = mode_raw if mode_raw in {"parallel", "serial"} else "parallel"
+
+    try:
+        max_rounds = int(raw.get("max_rounds", 1))  # pyright: ignore[reportArgumentType]
+    except Exception:
+        max_rounds = 1
+    max_rounds = max(1, min(max_rounds, 10))
+
+    roles_raw = raw.get("roles")
+    roles: list[dict[str, object]] = []
+    if isinstance(roles_raw, list):
+        for idx, item in enumerate(roles_raw[:20], start=1):  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+            if not isinstance(item, dict):
+                continue
+            role_item: dict[str, object] = item  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+            rid = str(role_item.get("id", f"role_{idx}")).strip().lower()
+            rid = "".join(ch for ch in rid if ch.isalnum() or ch in {"_", "-"})
+            if not rid:
+                rid = f"role_{idx}"
+            name = str(role_item.get("name", f"角色{idx}")).strip() or f"角色{idx}"
+            model = str(role_item.get("model", "")).strip()
+            system_prompt = str(role_item.get("system_prompt", "")).strip()
+            roles.append(
+                {
+                    "id": rid[:64],
+                    "name": name[:50],
+                    "enabled": bool(role_item.get("enabled", True)),
+                    "model": model[:100],
+                    "system_prompt": system_prompt[:3000],
+                }
+            )
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "max_rounds": max_rounds,
+        "roles": roles,
+}
+
+
+def _scenario_discuss_focus(scenario: str) -> str:
+    if scenario == "product_design":
+        return (
+            "重点和用户确认：产品目标、目标用户、核心场景、关键流程、约束条件、"
+            "以及交付物类型（如 PRD 文档、流程图图片、原型说明、里程碑计划）。"
+        )
+    if scenario == "content_creation":
+        return (
+            "重点和用户确认：受众人群、内容主题、语气风格、发布渠道、篇幅限制、"
+            "素材来源与交付物类型（文章/脚本/海报文案/配图说明）。"
+        )
+    if scenario == "software_development":
+        return (
+            "重点和用户确认：功能目标、技术栈、运行环境、改动范围、验收标准、"
+            "交付物类型（代码补丁、命令步骤、测试报告、部署说明）。"
+        )
+    if scenario == "data_analysis_decision":
+        return (
+            "重点和用户确认：决策问题、指标口径、数据来源、时间窗口、可信度要求、"
+            "交付物类型（分析报告、图表、结论摘要、决策建议表）。"
+        )
+    if scenario == "scientific_research":
+        return (
+            "重点和用户确认：研究问题、假设、实验条件、对照设计、评估指标、"
+            "交付物类型（研究提纲、实验方案、结果解读、论文结构草稿）。"
+        )
+    if scenario == "intelligent_assistant":
+        return (
+            "重点和用户确认：任务目标、时效要求、可调用工具、执行边界、"
+            "交付物类型（行动计划、提醒清单、消息草稿、执行结果汇总）。"
+        )
+    if scenario == "workflow_automation":
+        return (
+            "重点和用户确认：触发条件、上下游系统、字段映射、失败重试、监控告警、"
+            "交付物类型（流程设计文档、自动化脚本、运行手册、告警规则清单）。"
+        )
+    return "重点和用户确认目标、约束、验收标准与最终交付物类型。"
+
+
+def _scenario_delivery_focus(scenario: str) -> str:  # pyright: ignore[reportUnusedFunction]
+    if scenario == "product_design":
+        return (
+            "最终答复必须包含：\n"
+            "1) 产品方案摘要\n"
+            "2) 结构化交付物清单（文档/图片/表格）\n"
+            "3) 每个交付物的建议文件名与路径（例如 /tmp/product_prd.md）\n"
+            "4) 执行优先级与里程碑\n"
+            "5) 风险与备选方案"
+        )
+    if scenario == "content_creation":
+        return (
+            "最终答复必须包含：\n"
+            "1) 内容策略与目标受众\n"
+            "2) 成品文案或脚本草案\n"
+            "3) 渠道适配版本（至少 2 个）\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/content_plan.md）\n"
+            "5) 发布节奏与复盘指标"
+        )
+    if scenario == "software_development":
+        return (
+            "最终答复必须包含：\n"
+            "1) 技术方案与实现路径\n"
+            "2) 关键代码改动点或命令步骤\n"
+            "3) 测试与回归计划\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/impl_plan.md）\n"
+            "5) 风险、回滚与上线注意项"
+        )
+    if scenario == "data_analysis_decision":
+        return (
+            "最终答复必须包含：\n"
+            "1) 数据结论与关键洞察\n"
+            "2) 指标口径说明与分析过程摘要\n"
+            "3) 决策选项对比与推荐方案\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/analysis_report.md）\n"
+            "5) 风险假设与后续验证计划"
+        )
+    if scenario == "scientific_research":
+        return (
+            "最终答复必须包含：\n"
+            "1) 研究目标与假设\n"
+            "2) 方法设计与实验步骤\n"
+            "3) 结果解读框架与可信度边界\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/research_plan.md）\n"
+            "5) 下一步实验与论文化建议"
+        )
+    if scenario == "intelligent_assistant":
+        return (
+            "最终答复必须包含：\n"
+            "1) 任务拆解与优先级\n"
+            "2) 可执行动作清单\n"
+            "3) 关键提醒与时间节点\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/assistant_actions.md）\n"
+            "5) 异常处理与后续跟进建议"
+        )
+    if scenario == "workflow_automation":
+        return (
+            "最终答复必须包含：\n"
+            "1) 自动化流程设计（触发-处理-输出）\n"
+            "2) 集成接口与字段映射说明\n"
+            "3) 失败重试与告警策略\n"
+            "4) 交付物清单与建议文件名/路径（如 /tmp/workflow_spec.md）\n"
+            "5) 上线运行与运维检查清单"
+        )
+    return (
+        "最终答复必须包含：结论、可执行清单、交付物清单（含建议文件名/路径）、"
+        "风险与回滚建议。"
+    )
+
+
+def _resolve_multi_agent_cfg(
+    config: WhaleclawConfig,
+    session: Session | None,
+) -> dict[str, object]:
+    """Build effective multi-agent config with optional session overrides."""
+    cfg = _multi_agent_cfg(config)
+    plugins_raw2 = config.plugins
+    plugins2: dict[str, object] = plugins_raw2 if isinstance(plugins_raw2, dict) else {}  # pyright: ignore[reportAssignmentType, reportUnnecessaryIsInstance]
+    raw = plugins2.get("multi_agent", {})
+    if isinstance(raw, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raw_typed: dict[str, object] = raw  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+        scenario = str(raw_typed.get("scenario", "software_development")).strip()
+        cfg["scenario"] = scenario or "software_development"
+    else:
+        cfg["scenario"] = "software_development"
+    if session is None or not isinstance(session.metadata, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return cfg
+
+    metadata = session.metadata
+    if isinstance(metadata.get("multi_agent_enabled"), bool):
+        cfg["enabled"] = bool(metadata["multi_agent_enabled"])
+
+    mode_raw = str(metadata.get("multi_agent_mode", "")).strip().lower()
+    if mode_raw in {"parallel", "serial"}:
+        cfg["mode"] = mode_raw
+
+    rounds_raw = metadata.get("multi_agent_max_rounds")
+    if isinstance(rounds_raw, int):
+        cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+
+    return cfg
+
+
+def _is_multi_agent_confirm(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _MULTI_AGENT_CONFIRM_PATTERNS)
+
+
+def _is_multi_agent_cancel(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _MULTI_AGENT_CANCEL_PATTERNS)
+
+
+def _extract_multi_agent_rounds(text: str) -> int | None:
+    t = text.strip()
+    if not t:
+        return None
+    for p in _MULTI_AGENT_ROUNDS_PATTERNS:
+        m = p.search(t)
+        if not m:
+            continue
+        try:
+            value = int(m.group(1))
+        except Exception:
+            return None
+        if 1 <= value <= 10:
+            return value
+    return None
+
+
+def _attach_rounds_marker(topic: str, rounds: int) -> str:
+    clean = re.sub(r"\[MA_ROUNDS=\d{1,2}\]\s*", "", topic).strip()
+    return f"[MA_ROUNDS={rounds}] {clean}".strip()
+
+
+def _extract_rounds_marker(topic: str) -> tuple[str, int | None]:
+    m = re.search(r"\[MA_ROUNDS=(\d{1,2})\]", topic)
+    if not m:
+        return (topic, None)
+    try:
+        value = int(m.group(1))
+    except Exception:
+        value = None
+    clean = re.sub(r"\[MA_ROUNDS=\d{1,2}\]\s*", "", topic).strip()
+    if value is None or not (1 <= value <= 10):
+        return (clean, None)
+    return (clean, value)
+
+
+def _is_multi_agent_discuss_done(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _MULTI_AGENT_DISCUSS_DONE_PATTERNS)
+
+
+def _format_multi_agent_preflight_text(  # pyright: ignore[reportUnusedFunction]
+    *,
+    cfg: dict[str, object],
+    topic: str,
+) -> str:
+    roles = [
+        role
+        for role in cast(list[dict[str, object]], cfg["roles"])
+        if bool(role.get("enabled", True))
+    ]
+    mode = cast(str, cfg["mode"])
+    rounds = cast(int, cfg["max_rounds"])
+    mode_cn = "并行" if mode == "parallel" else "串行"
+    lines = [
+        "已进入多Agent准备阶段（尚未开始执行）。",
+        f"- 当前模式: {mode_cn}（{mode}）",
+        f"- 计划回合: {rounds}",
+        f"- 角色数量: {len(roles)}",
+        "",
+        "角色分工:",
+    ]
+    for role in roles:
+        name = str(role.get("name", role.get("id", "角色"))).strip() or "角色"
+        duty = _multi_agent_system_prompt(role)
+        lines.append(f"- {name}: {_compact_role_output(duty, 120)}")
+    lines.extend(
+        [
+            "",
+            "主控建议:",
+            "- 先确认目标、交付形式、截止时间与约束。",
+            "- 若希望更快出结论，可先改为 2 轮；若任务复杂建议 4 轮以上。",
+            "",
+            f"当前议题: {topic.strip() or '(未提供)'}",
+            "",
+            "回复以下任一指令继续:",
+            "- 回复“确认开始”：按当前配置启动多Agent执行",
+            "- 回复“改为N轮”：修改回合后继续等待确认",
+            "- 回复“取消”：退出本次多Agent执行",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _multi_agent_module():
+    from whaleclaw.agent import multi_agent
+
+    return multi_agent
+
+
+def multi_agent_system_prompt(role: dict[str, object]) -> str:
+    return _multi_agent_module().multi_agent_system_prompt(role)
+
+
+def compact_role_output(text: str, max_chars: int = 600) -> str:
+    return _multi_agent_module().compact_role_output(text, max_chars)
+
+
+def looks_like_bad_coordinator_output(text: str) -> bool:
+    return _multi_agent_module().looks_like_bad_coordinator_output(text)
+
+
+def looks_like_role_stall_output(text: str) -> bool:
+    return _multi_agent_module().looks_like_role_stall_output(text)
+
+
+def need_image_output(user_message: str) -> bool:
+    return _multi_agent_module().need_image_output(user_message)
+
+
+def extract_requested_deliverables(user_message: str) -> list[str]:
+    return _multi_agent_module().extract_requested_deliverables(user_message)
+
+
+def build_multi_agent_requirement_baseline(
+    *,
+    message: str,
+    scenario: str,
+    mode: str,
+    max_rounds: int,
+    requested_deliverables: list[str],
+) -> str:
+    return _multi_agent_module().build_multi_agent_requirement_baseline(
+        message=message,
+        scenario=scenario,
+        mode=mode,
+        max_rounds=max_rounds,
+        requested_deliverables=requested_deliverables,
+    )
+
+
+_multi_agent_system_prompt = multi_agent_system_prompt
+_compact_role_output = compact_role_output
+_looks_like_bad_coordinator_output = looks_like_bad_coordinator_output
+_looks_like_role_stall_output = looks_like_role_stall_output
+_need_image_output = need_image_output
+_extract_requested_deliverables = extract_requested_deliverables
+_build_multi_agent_requirement_baseline = build_multi_agent_requirement_baseline
+
+
+scenario_discuss_focus = _scenario_discuss_focus
+truncate_to_tokens = _truncate_to_tokens
+resolve_multi_agent_cfg = _resolve_multi_agent_cfg
+is_multi_agent_confirm = _is_multi_agent_confirm
+extract_multi_agent_rounds = _extract_multi_agent_rounds
+is_multi_agent_discuss_done = _is_multi_agent_discuss_done
+select_native_tool_names = _select_native_tool_names
+extract_round_delivery_section = _extract_round_delivery_section
+extract_delivery_artifact_paths = _extract_delivery_artifact_paths
+fix_version_suffix = _fix_version_suffix
+snapshot_round_artifacts = _snapshot_round_artifacts
+extract_artifact_baseline = _extract_artifact_baseline
+
+
+async def _persist_session_metadata(
+    session: Session | None,
+    session_manager: SessionManager | None,
+) -> bool:
+    if session is None or session_manager is None:
+        return False
+    try:
+        await session_manager.update_metadata(session, session.metadata)
+    except Exception:
+        return False
+    return True
+
+
+async def _sync_multi_agent_compression_boundary(
+    session: Session | None,
+    session_manager: SessionManager | None,
+    group_compressor: "SessionGroupCompressor | None" = None,
+    *,
+    ma_enabled: bool,
+) -> None:
+    """Track MA on/off transition and set compression boundary on MA -> single.
+
+    When MA is enabled, mark current session as MA-active.
+    When MA turns off, record a fixed message-index boundary so future
+    group-compression only applies to newly produced messages.
+    """
+    if session is None or not isinstance(session.metadata, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return None
+    metadata = session.metadata
+    prev_active = bool(metadata.get("multi_agent_active_prev", False))
+    changed = False
+    if ma_enabled:
+        if not prev_active:
+            metadata["multi_agent_active_prev"] = True
+            changed = True
+    else:
+        if prev_active:
+            metadata["multi_agent_active_prev"] = False
+            metadata["compression_resume_message_index"] = len(session.messages)
+            changed = True
+    if group_compressor is not None:  # session already checked above
+        try:
+            await group_compressor.set_session_suspended(
+                session_id=session.id,
+                suspended=ma_enabled,
+            )
+        except Exception as exc:
+            log.debug(
+                "agent.multi_agent_compressor_toggle_failed",
+                session_id=session.id,
+                error=str(exc),
+                enabled=ma_enabled,
+            )
+    if changed:
+        await _persist_session_metadata(session, session_manager)
+    if session_manager is None:
+        return None
+    try:
+        await asyncio.wait_for(
+            session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                session.id,
+                metadata=session.metadata,
+            ),
+            timeout=1.5,
+        )
+        return None
+    except Exception as exc:
+        log.warning(
+            "agent.multi_agent_metadata_persist_failed",
+            session_id=session.id,
+            error=str(exc),
+        )
+        return None
+
+
+async def _run_multi_agent_controller_discussion(
+    *,
+    user_message: str,
+    pending_topic: str,
+    cfg: dict[str, object],
+    session_id: str,
+    config: WhaleclawConfig,
+    router: ModelRouter,
+    registry: ToolRegistry,
+    extra_memory: str,
+    trigger_event_id: str,
+    trigger_text_preview: str,
+    include_intro: bool,
+) -> str:
+    from whaleclaw.agent import multi_agent as _multi_agent
+
+    return await _multi_agent.run_multi_agent_controller_discussion(
+        user_message=user_message,
+        pending_topic=pending_topic,
+        cfg=cfg,
+        session_id=session_id,
+        config=config,
+        router=router,
+        registry=registry,
+        extra_memory=extra_memory,
+        trigger_event_id=trigger_event_id,
+        trigger_text_preview=trigger_text_preview,
+        include_intro=include_intro,
+    )
+
+
+async def _run_multi_agent_executor(
+    *,
+    message: str,
+    session_id: str,
+    config: WhaleclawConfig,
+    on_stream: StreamCallback | None,
+    router: ModelRouter,
+    registry: ToolRegistry,
+    images: list[ImageContent] | None,
+    extra_memory: str,
+    trigger_event_id: str,
+    trigger_text_preview: str,
+    ma_cfg: dict[str, object],
+    on_round_result: OnRoundResult | None = None,
+) -> str:
+    from whaleclaw.agent import multi_agent as _multi_agent
+
+    return await _multi_agent.run_multi_agent_executor(
+        message=message,
+        session_id=session_id,
+        config=config,
+        on_stream=on_stream,
+        router=router,
+        registry=registry,
+        images=images,
+        extra_memory=extra_memory,
+        trigger_event_id=trigger_event_id,
+        trigger_text_preview=trigger_text_preview,
+        ma_cfg=ma_cfg,
+        on_round_result=on_round_result,
+    )
+
+
+async def run_agent(
+    message: str,
+    session_id: str,
+    config: WhaleclawConfig,
+    on_stream: StreamCallback | None = None,
+    *,
+    session: Session | None = None,
+    router: ModelRouter | None = None,
+    registry: ToolRegistry | None = None,
+    on_tool_call: OnToolCall | None = None,
+    on_tool_result: OnToolResult | None = None,
+    on_round_result: OnRoundResult | None = None,
+    images: list[ImageContent] | None = None,
+    session_manager: SessionManager | None = None,
+    session_store: SessionStore | None = None,
+    memory_manager: "MemoryManager | None" = None,
+    extra_memory: str = "",
+    trigger_event_id: str = "",
+    trigger_text_preview: str = "",
+    group_compressor: "SessionGroupCompressor | None" = None,
+    multi_agent_internal: bool = False,
+) -> str:
+    """Run the Agent loop with tool support and multi-turn context.
+
+    The loop is provider-agnostic:
+    1. Check if provider supports native tools API
+    2. If yes  -> pass schemas via ``tools=``; parse structured tool_calls
+    3. If no   -> inject tool descriptions into system prompt; parse JSON text
+    4. Execute tools, append results, loop (until no tool calls or token budget exhausted)
+    5. Return final text reply
+    """
+    agent_cfg = config.agent
+    models_cfg = config.models
+    summarizer_cfg = agent_cfg.summarizer
+
+    model_id: str = session.model if session else agent_cfg.model
+    if router is None:
+        router = ModelRouter(models_cfg)
+    if registry is None:
+        registry = create_default_registry()
+
+    if not multi_agent_internal:
+        ma_cfg = _resolve_multi_agent_cfg(config, session)
+        await _sync_multi_agent_compression_boundary(
+            session,
+            session_manager,
+            group_compressor,
+            ma_enabled=bool(ma_cfg.get("enabled", False)),
+        )
+        if bool(ma_cfg.get("enabled", False)):
+            if session is not None:
+                state = str(session.metadata.get("multi_agent_state", "")).strip().lower()
+                waiting = state == "confirm" or (state == "" and bool(
+                    session.metadata.get("multi_agent_waiting_confirm", False)
+                ))
+                intro_done = bool(session.metadata.get("multi_agent_intro_done", False))
+                pending_topic = str(session.metadata.get("multi_agent_pending_topic", "")).strip()
+
+                if waiting and _is_multi_agent_cancel(message):
+                    session.metadata.pop("multi_agent_state", None)
+                    session.metadata.pop("multi_agent_waiting_confirm", None)
+                    session.metadata.pop("multi_agent_intro_done", None)
+                    session.metadata.pop("multi_agent_pending_topic", None)
+                    session.metadata.pop("multi_agent_pending_rounds", None)
+                    await _persist_session_metadata(session, session_manager)
+                    return "已取消本次多Agent执行。你可以继续普通对话，或发新需求后再确认启动。"
+
+                rounds_override = _extract_multi_agent_rounds(message)
+                if rounds_override is not None and waiting:
+                    session.metadata["multi_agent_pending_rounds"] = rounds_override
+                    topic = _attach_rounds_marker(pending_topic or message, rounds_override)
+                    session.metadata["multi_agent_pending_topic"] = topic
+                    await _persist_session_metadata(session, session_manager)
+                    ma_cfg["max_rounds"] = rounds_override
+                    return await _run_multi_agent_controller_discussion(
+                        user_message=message,
+                        pending_topic=topic,
+                        cfg=ma_cfg,
+                        session_id=session_id,
+                        config=config,
+                        router=router,
+                        registry=registry,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        include_intro=not intro_done,
+                    )
+
+                if state == "discuss":
+                    if _is_multi_agent_cancel(message):
+                        session.metadata.pop("multi_agent_state", None)
+                        session.metadata.pop("multi_agent_intro_done", None)
+                        session.metadata.pop("multi_agent_pending_topic", None)
+                        session.metadata.pop("multi_agent_pending_rounds", None)
+                        await _persist_session_metadata(session, session_manager)
+                        return "已取消本次多Agent讨论。你可以继续普通对话。"
+
+                    topic = pending_topic
+
+                    if _is_multi_agent_discuss_done(message):
+                        rounds_raw = session.metadata.get("multi_agent_pending_rounds")
+                        if isinstance(rounds_raw, int):
+                            ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+                        cleaned_topic, marker_rounds = _extract_rounds_marker(topic or "")
+                        if not isinstance(rounds_raw, int) and marker_rounds is not None:
+                            ma_cfg["max_rounds"] = marker_rounds
+                        session.metadata.pop("multi_agent_state", None)
+                        session.metadata.pop("multi_agent_waiting_confirm", None)
+                        session.metadata.pop("multi_agent_intro_done", None)
+                        session.metadata.pop("multi_agent_pending_topic", None)
+                        session.metadata.pop("multi_agent_pending_rounds", None)
+                        await _persist_session_metadata(session, session_manager)
+                        return await _run_multi_agent_executor(
+                            message=cleaned_topic or "（请补充你的任务目标）",
+                            session_id=session_id,
+                            config=config,
+                            on_stream=on_stream,
+                            router=router,
+                            registry=registry,
+                            images=images,
+                            extra_memory=extra_memory,
+                            trigger_event_id=trigger_event_id,
+                            trigger_text_preview=trigger_text_preview,
+                            ma_cfg=ma_cfg,
+                            on_round_result=on_round_result,
+                        )
+
+                    if message.strip():
+                        if topic:
+                            topic = f"{topic}\n补充要求: {message.strip()}".strip()
+                        else:
+                            topic = message.strip()
+                        session.metadata["multi_agent_pending_topic"] = topic
+                    if rounds_override is not None:
+                        session.metadata["multi_agent_pending_rounds"] = rounds_override
+                        session.metadata["multi_agent_pending_topic"] = _attach_rounds_marker(
+                            topic or message,
+                            rounds_override,
+                        )
+                        topic = str(session.metadata["multi_agent_pending_topic"])
+                        ma_cfg["max_rounds"] = rounds_override
+
+                    include_intro = not bool(session.metadata.get("multi_agent_intro_done", False))
+                    if include_intro:
+                        session.metadata["multi_agent_intro_done"] = True
+                    await _persist_session_metadata(session, session_manager)
+                    return await _run_multi_agent_controller_discussion(
+                        user_message=message,
+                        pending_topic=topic or message,
+                        cfg=ma_cfg,
+                        session_id=session_id,
+                        config=config,
+                        router=router,
+                        registry=registry,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        include_intro=include_intro,
+                    )
+
+                if waiting and _is_multi_agent_confirm(message):
+                    topic = pending_topic or "（请补充你的任务目标）"
+                    rounds_raw = session.metadata.get("multi_agent_pending_rounds")
+                    if isinstance(rounds_raw, int):
+                        ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+                    cleaned_topic, marker_rounds = _extract_rounds_marker(topic or "")
+                    if not isinstance(rounds_raw, int) and marker_rounds is not None:
+                        ma_cfg["max_rounds"] = marker_rounds
+                    session.metadata.pop("multi_agent_state", None)
+                    session.metadata.pop("multi_agent_waiting_confirm", None)
+                    session.metadata.pop("multi_agent_intro_done", None)
+                    session.metadata.pop("multi_agent_pending_topic", None)
+                    session.metadata.pop("multi_agent_pending_rounds", None)
+                    await _persist_session_metadata(session, session_manager)
+                    return await _run_multi_agent_executor(
+                        message=cleaned_topic or topic,
+                        session_id=session_id,
+                        config=config,
+                        on_stream=on_stream,
+                        router=router,
+                        registry=registry,
+                        images=images,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        ma_cfg=ma_cfg,
+                        on_round_result=on_round_result,
+                    )
+
+                if waiting and not _is_multi_agent_confirm(message):
+                    topic = pending_topic
+                    if message.strip() and not _is_multi_agent_cancel(message):
+                        topic = f"{topic}\n补充要求: {message.strip()}".strip()
+                        session.metadata["multi_agent_pending_topic"] = topic
+                        await _persist_session_metadata(session, session_manager)
+                    rounds_raw = session.metadata.get("multi_agent_pending_rounds")
+                    if isinstance(rounds_raw, int):
+                        ma_cfg["max_rounds"] = max(1, min(rounds_raw, 10))
+                    else:
+                        _, marker_rounds = _extract_rounds_marker(topic or "")
+                        if marker_rounds is not None:
+                            ma_cfg["max_rounds"] = marker_rounds
+                    topic = topic or "（请补充你的任务目标）"
+                    return await _run_multi_agent_controller_discussion(
+                        user_message=message,
+                        pending_topic=topic,
+                        cfg=ma_cfg,
+                        session_id=session_id,
+                        config=config,
+                        router=router,
+                        registry=registry,
+                        extra_memory=extra_memory,
+                        trigger_event_id=trigger_event_id,
+                        trigger_text_preview=trigger_text_preview,
+                        include_intro=False,
+                    )
+
+                session.metadata["multi_agent_state"] = "discuss"
+                session.metadata["multi_agent_waiting_confirm"] = False
+                session.metadata["multi_agent_intro_done"] = True
+                session.metadata["multi_agent_pending_topic"] = message.strip() or message
+                session.metadata.pop("multi_agent_pending_rounds", None)
+                await _persist_session_metadata(session, session_manager)
+                return await _run_multi_agent_controller_discussion(
+                    user_message=message,
+                    pending_topic=message.strip() or message,
+                    cfg=ma_cfg,
+                    session_id=session_id,
+                    config=config,
+                    router=router,
+                    registry=registry,
+                    extra_memory=extra_memory,
+                    trigger_event_id=trigger_event_id,
+                    trigger_text_preview=trigger_text_preview,
+                    include_intro=True,
+                )
+
+            return await _run_multi_agent_executor(
+                message=message,
+                session_id=session_id,
+                config=config,
+                on_stream=on_stream,
+                router=router,
+                registry=registry,
+                images=images,
+                extra_memory=extra_memory,
+                trigger_event_id=trigger_event_id,
+                trigger_text_preview=trigger_text_preview,
+                ma_cfg=ma_cfg,
+                on_round_result=on_round_result,
+            )
+
+    if _is_evomap_status_question(message):
+        enabled = _is_evomap_enabled(config)
+        switch_text = "已开启" if enabled else "已关闭"
+        return (
+            f"当前 EvoMap 开关{switch_text}（本地配置状态）。"
+            "如果你要我检查远端服务连通性，我可以再单独做一次连通检测。"
+        )
+
+    metadata_dirty = False
+
+    llm_message = message
+    locked_skill_ids: list[str] = []
+    previous_locked_skill_ids: list[str] = []
+    lock_is_explicit = False
+    pending_lock_skill_ids: list[str] = []
+    lock_waiting_done = False
+    skill_announce_pending = False
+    routed_skills: list[Skill] = []
+    routed_skill_ids: list[str] = []
+    if not multi_agent_internal:
+        if session is not None:
+            raw_locked = session.metadata.get("locked_skill_ids")
+            if isinstance(raw_locked, list):
+                locked_skill_ids = [
+                    str(x).strip().lower()  # pyright: ignore[reportUnknownArgumentType]
+                    for x in raw_locked  # pyright: ignore[reportUnknownVariableType]
+                    if isinstance(x, str) and str(x).strip()
+                ]
+                if locked_skill_ids:
+                    lock_is_explicit = True
+            elif isinstance(session.metadata.get("forced_skill_id"), str):
+                legacy_forced = str(session.metadata.get("forced_skill_id", "")).strip().lower()
+                if legacy_forced:
+                    locked_skill_ids = [legacy_forced]
+                    lock_is_explicit = True
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata.pop("forced_skill_id", None)
+                    metadata_dirty = True
+            raw_waiting = session.metadata.get("skill_lock_waiting_done")
+            lock_waiting_done = bool(raw_waiting)
+            skill_announce_pending = bool(session.metadata.get("skill_lock_announce_pending"))
+            raw_pending_switch_ids = session.metadata.get("pending_skill_switch_ids")
+            raw_pending_switch_message = session.metadata.get("pending_skill_switch_message")
+        previous_locked_skill_ids = list(locked_skill_ids)
+        pending_switch_skill_ids: list[str] = []
+        pending_switch_message = ""
+        if session is not None:
+            if isinstance(raw_pending_switch_ids, list):
+                pending_switch_skill_ids = [
+                    str(x).strip().lower()
+                    for x in raw_pending_switch_ids
+                    if isinstance(x, str) and str(x).strip()
+                ]
+            if isinstance(raw_pending_switch_message, str):
+                pending_switch_message = raw_pending_switch_message.strip()
+
+        if pending_switch_skill_ids and pending_switch_message:
+            if _is_skill_switch_consent(
+                message,
+                skill_switch_consent_patterns=_SKILL_SWITCH_CONSENT_PATTERNS,
+            ):
+                previous_locked_skill_ids = list(locked_skill_ids)
+                locked_skill_ids = pending_switch_skill_ids
+                lock_is_explicit = True
+                lock_waiting_done = False
+                skill_announce_pending = True
+                llm_message = pending_switch_message
+                if session is not None:
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata["skill_lock_waiting_done"] = False
+                    session.metadata["skill_lock_announce_pending"] = True
+                    session.metadata.pop("pending_skill_switch_ids", None)
+                    session.metadata.pop("pending_skill_switch_message", None)
+                    metadata_dirty = True
+            elif any(pattern.search(message.strip()) for pattern in _SKILL_SWITCH_KEEP_PATTERNS):
+                llm_message = pending_switch_message
+                if session is not None:
+                    session.metadata.pop("pending_skill_switch_ids", None)
+                    session.metadata.pop("pending_skill_switch_message", None)
+                    metadata_dirty = True
+            elif message.strip():
+                requested_skills = "、".join(pending_switch_skill_ids)
+                current_skills = "、".join(locked_skill_ids)
+                return (
+                    f"当前会话仍锁定在 {current_skills} 技能。"
+                    f"如果你确实要切换到 {requested_skills}，请明确回复“同意切换技能”；"
+                    "如果要继续原流程，请回复“继续沿用原技能”。"
+                )
+
+        use_cmd = _parse_use_command(message, use_cmd_re=_USE_CMD_RE)
+        if use_cmd is not None:
+            use_skill_ids, remainder = use_cmd
+            if len(use_skill_ids) == 1 and use_skill_ids[0] in _USE_CLEAR_IDS:
+                locked_skill_ids = []
+                lock_is_explicit = False
+                pending_lock_skill_ids = []
+                lock_waiting_done = False
+                skill_announce_pending = False
+                if session is not None:
+                    session.metadata.pop("locked_skill_ids", None)
+                    session.metadata.pop("skill_lock_waiting_done", None)
+                    session.metadata.pop("skill_lock_announce_pending", None)
+                    session.metadata.pop("pending_skill_switch_ids", None)
+                    session.metadata.pop("pending_skill_switch_message", None)
+                    session.metadata.pop("skill_param_state", None)
+                    metadata_dirty = True
+                if remainder:
+                    llm_message = remainder
+            else:
+                locked_skill_ids = use_skill_ids
+                lock_is_explicit = True
+                lock_waiting_done = False
+                skill_announce_pending = True
+                if session is not None:
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata["skill_lock_waiting_done"] = False
+                    session.metadata["skill_lock_announce_pending"] = True
+                    metadata_dirty = True
+                llm_message = remainder or f"使用技能 {', '.join(locked_skill_ids)} 处理当前请求。"
+        elif lock_waiting_done and _is_task_done_confirmation(
+            message,
+            task_done_patterns=_TASK_DONE_PATTERNS,
+        ):
+            locked_skill_ids = []
+            lock_is_explicit = False
+            lock_waiting_done = False
+            if session is not None:
+                session.metadata.pop("locked_skill_ids", None)
+                session.metadata.pop("skill_lock_waiting_done", None)
+                session.metadata.pop("skill_lock_announce_pending", None)
+                session.metadata.pop("pending_skill_switch_ids", None)
+                session.metadata.pop("pending_skill_switch_message", None)
+                session.metadata.pop("skill_param_state", None)
+                if session_manager is not None:
+                    await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                        session.id,
+                        metadata=session.metadata,
+                    )
+            return "已确认任务完成，已解除本轮技能锁定。"
+        elif lock_waiting_done:
+            lock_waiting_done = False
+            if session is not None:
+                session.metadata["skill_lock_waiting_done"] = False
+                metadata_dirty = True
+
+        routed_skills = _assembler.route_skills(llm_message)
+        routed_skill_ids = _normalize_skill_ids(routed_skills)
+
+        if (
+            not locked_skill_ids
+            and routed_skill_ids
+            and (
+                _looks_like_skill_activation_message(
+                    message,
+                    skill_activation_patterns=_SKILL_ACTIVATION_PATTERNS,
+                )
+                or any(_skill_trigger_mentioned(skill, message) for skill in routed_skills)
+            )
+        ):
+            locked_skill_ids = routed_skill_ids
+            lock_is_explicit = True
+            lock_waiting_done = False
+            skill_announce_pending = True
+            if session is not None:
+                session.metadata["locked_skill_ids"] = locked_skill_ids
+                session.metadata["skill_lock_waiting_done"] = False
+                session.metadata["skill_lock_announce_pending"] = True
+                metadata_dirty = True
+        elif not locked_skill_ids and routed_skill_ids:
+            pending_lock_skill_ids = routed_skill_ids
+
+        if (
+            lock_is_explicit
+            and locked_skill_ids
+            and routed_skill_ids
+            and routed_skill_ids != locked_skill_ids
+        ):
+            switch_requested = any(
+                _skill_explicitly_mentioned(skill, message)
+                for skill in routed_skills
+                if skill.id.strip().lower() not in set(locked_skill_ids)
+            )
+            if not switch_requested:
+                routed_skill_ids = []
+                routed_skills = []
+            elif _is_skill_switch_consent(
+                message,
+                skill_switch_consent_patterns=_SKILL_SWITCH_CONSENT_PATTERNS,
+            ):
+                locked_skill_ids = routed_skill_ids
+                lock_waiting_done = False
+                skill_announce_pending = True
+                if session is not None:
+                    session.metadata["locked_skill_ids"] = locked_skill_ids
+                    session.metadata["skill_lock_waiting_done"] = False
+                    session.metadata["skill_lock_announce_pending"] = True
+                    metadata_dirty = True
+            else:
+                requested_skills = "、".join(routed_skill_ids)
+                current_skills = "、".join(locked_skill_ids)
+                if session is not None:
+                    session.metadata["pending_skill_switch_ids"] = routed_skill_ids
+                    session.metadata["pending_skill_switch_message"] = llm_message
+                    metadata_dirty = True
+                return (
+                    f"当前会话仍锁定在 {current_skills} 技能。"
+                    f"如果你确实要切换到 {requested_skills}，请明确回复“同意切换技能”；"
+                    "如果要继续原流程，请回复“继续沿用原技能”。"
+                )
+
+        active_skills_for_images = routed_skills
+        if lock_is_explicit and locked_skill_ids:
+            active_skills_for_images = _assembler.route_skills(
+                llm_message, forced_skill_ids=locked_skill_ids
+            )
+        if (
+            not images
+            and (
+                _message_may_need_prior_images(llm_message)
+                or _skill_requires_images(active_skills_for_images)
+            )
+        ):
+            recovered_images = _recover_recent_session_images(session)
+            if recovered_images:
+                images = recovered_images
+                log.info(
+                    "agent.reused_recent_images",
+                    session_id=session_id,
+                    count=len(recovered_images),
+                )
+
+        if lock_is_explicit and locked_skill_ids and not lock_waiting_done and session is not None:
+            locked_skills = _assembler.route_skills(llm_message, forced_skill_ids=locked_skill_ids)
+            guards = _guarded_skills(locked_skills)
+            if guards:
+                state_map_raw = session.metadata.get("skill_param_state")
+                state_map: dict[str, dict[str, object]] = {}
+                if isinstance(state_map_raw, dict):
+                    raw_state_map = cast(dict[object, object], state_map_raw)
+                    for key, value in raw_state_map.items():
+                        if not isinstance(key, str) or not isinstance(value, dict):
+                            continue
+                        normalized_value: dict[str, object] = {
+                            str(k): v for k, v in value.items() if isinstance(k, str)
+                        }
+                        state_map[key] = normalized_value
+                missing_any = False
+                for skill in guards:
+                    guard = skill.param_guard
+                    if guard is None:
+                        continue
+                    skill_state_raw = state_map.get(skill.id, {})
+                    skill_state: dict[str, object] = (
+                        skill_state_raw.copy()  # pyright: ignore[reportUnknownMemberType]
+                        if isinstance(skill_state_raw, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+                        else {}
+                    )
+                    updated, missing = _update_guard_state(
+                        guard.params, skill_state, llm_message, images
+                    )
+                    if skill.id == "nano-banana-image-t8":
+                        control_message_only = _is_nano_banana_control_message(llm_message)
+                        if control_message_only and "prompt" in updated:
+                            updated["prompt"] = skill_state.get("prompt")
+                        previous_model = str(
+                            skill_state.get(
+                                "__model_display__",
+                                _load_saved_nano_banana_model_display(),
+                            )
+                        )
+                        updated["__model_display__"] = _detect_nano_banana_model_display(
+                            llm_message,
+                            previous=previous_model,
+                        )
+                        missing = _nano_banana_missing_required(
+                            updated,
+                            control_message_only=control_message_only,
+                        )
+                    state_map[skill.id] = updated
+                    missing_any = missing_any or missing
+                session.metadata["skill_param_state"] = state_map
+                metadata_dirty = True
+                if missing_any:
+                    if session_manager is not None:
+                        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                            session.id,
+                            metadata=session.metadata,
+                        )
+                    blocks = [
+                        _build_skill_param_guard_reply(
+                            s.id, s.param_guard.params, state_map.get(s.id, {})  # pyright: ignore[reportUnknownArgumentType]
+                        )
+                        for s in guards
+                        if s.param_guard is not None
+                    ]
+                    return "\n\n".join(blocks)
+
+    if session is not None:
+        pending_raw = session.metadata.get("evomap_pending_choices")
+        if isinstance(pending_raw, dict):
+            options_raw: object = pending_raw.get("options")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            options: list[dict[str, str]] = []
+            if isinstance(options_raw, list):
+                for item in options_raw:  # pyright: ignore[reportUnknownVariableType]
+                    if not isinstance(item, dict):
+                        continue
+                    opt: dict[str, object] = item  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
+                    aid = str(opt.get("asset_id", "")).strip()
+                    summary = str(opt.get("summary", "")).strip()
+                    if not summary and not aid:
+                        continue
+                    options.append({"asset_id": aid, "summary": summary})
+            choice_idx = _extract_evomap_choice_index(message, len(options))
+            if choice_idx is not None and options:
+                selected = options[choice_idx]
+                selected_hint = (
+                    f"【EvoMap 已选方案】\n- {selected['asset_id']}: {selected['summary']}"
+                )
+                extra_memory = (
+                    f"{selected_hint}\n{extra_memory}" if extra_memory.strip() else selected_hint
+                )
+                origin_message = str(pending_raw.get("origin_message", "")).strip()  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                if origin_message:
+                    llm_message = (
+                        f"{origin_message}\n"
+                        f"用户已选择方案：{selected['summary']}。\n"
+                        "请按该方案执行。"
+                    )
+                session.metadata.pop("evomap_pending_choices", None)
+                if session_manager is not None:
+                    await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                        session.id,
+                        metadata=session.metadata,
+                    )
+
+    assistant_name = _DEFAULT_ASSISTANT_NAME
+    if memory_manager is not None:
+        try:
+            current_name = await memory_manager.get_assistant_name()
+            if current_name:
+                assistant_name = current_name
+        except Exception as exc:
+            log.debug("agent.assistant_name_load_failed", session_id=session_id, error=str(exc))
+    name_action, requested_name = _detect_assistant_name_update(
+        message,
+        reset_patterns=_ASSISTANT_NAME_RESET_PATTERNS,
+        set_patterns=_ASSISTANT_NAME_SET_PATTERNS,
+    )
+    if name_action == "set":
+        assistant_name = requested_name
+        if memory_manager is not None:
+            try:
+                changed = await memory_manager.set_assistant_name(
+                    requested_name,
+                    source=f"session:{session_id}",
+                )
+                if changed:
+                    log.info(
+                        "agent.assistant_name_updated",
+                        session_id=session_id,
+                        assistant_name=requested_name,
+                    )
+            except Exception as exc:
+                log.debug(
+                    "agent.assistant_name_save_failed",
+                    session_id=session_id,
+                    error=str(exc),
+                )
+    elif name_action == "reset":
+        assistant_name = _DEFAULT_ASSISTANT_NAME
+        if memory_manager is not None:
+            try:
+                removed = await memory_manager.clear_assistant_name()
+                log.info(
+                    "agent.assistant_name_reset",
+                    session_id=session_id,
+                    removed=removed,
+                )
+            except Exception as exc:
+                log.debug(
+                    "agent.assistant_name_reset_failed",
+                    session_id=session_id,
+                    error=str(exc),
+                )
+
+    native_tools = router.supports_native_tools(model_id)
+    selected_tool_names: set[str] | None = None
+    evomap_enabled = _is_evomap_enabled(config) and not multi_agent_internal
+    evomap_phase = "editing"
+    if session is not None:
+        raw_phase = session.metadata.get("evomap_phase")
+        if isinstance(raw_phase, str) and raw_phase.strip():
+            evomap_phase = raw_phase.strip().lower()
+    if _is_tasky_message_for_evomap(llm_message):
+        # First-turn task requests are treated as NEW_TASK directly to avoid
+        # an extra classifier LLM call before normal planning/execution.
+        if session is None or not session.messages:
+            phase = "NEW_TASK"
+        else:
+            phase = await _llm_judge_task_phase(
+                router,
+                model_id,
+                session=session,
+                message=llm_message,
+            )
+    else:
+        phase = "EDITING"
+    if session is not None and session_manager is not None:
+        desired = "start" if phase == "NEW_TASK" else "editing"
+        if desired != evomap_phase:
+            session.metadata["evomap_phase"] = desired
+            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                session.id,
+                metadata=session.metadata,
+            )
+    evomap_allowed_for_turn = evomap_enabled and phase == "NEW_TASK"
+    available_tool_names = {d.name for d in registry.list_tools()}
+    evo_first_mode = evomap_allowed_for_turn and "evomap_fetch" in available_tool_names
+    evomap_hint_hit = _extra_memory_has_evomap_hint(extra_memory)
+
+    if native_tools:
+        selected_tool_names = _select_native_tool_names(registry, llm_message)
+        selected_tool_names = _force_include_office_edit_tools(
+            selected_tool_names,
+            available=available_tool_names,
+            session=session,
+            llm_message=llm_message,
+        )
+        if not evomap_allowed_for_turn:
+            selected_tool_names = {
+                name for name in selected_tool_names if not name.startswith("evomap_")
+            }
+        elif evo_first_mode:
+            selected_tool_names.add("evomap_fetch")
+        tool_schemas = registry.to_llm_schemas(include_names=selected_tool_names)
+        dropped_names = sorted(available_tool_names - selected_tool_names)
+        log.info(
+            "agent.tools_selected",
+            session_id=session_id,
+            selected=sorted(selected_tool_names),
+            selected_count=len(selected_tool_names),
+            dropped_count=len(dropped_names),
+            dropped=dropped_names,
+        )
+    else:
+        tool_schemas = None
+    fallback_names: set[str] | None = None
+    if not native_tools and not evomap_allowed_for_turn:
+        fallback_names = {d.name for d in registry.list_tools() if not d.name.startswith("evomap_")}
+    fallback_text = (
+        "" if native_tools else registry.to_prompt_fallback(include_names=fallback_names)
+    )
+
+    effective_skill_ids = locked_skill_ids or pending_lock_skill_ids or None
+    system_messages = _assembler.build(
+        config,
+        llm_message,
+        tool_fallback_text=fallback_text,
+        assistant_name=assistant_name,
+        forced_skill_ids=effective_skill_ids,
+    )
+    if lock_is_explicit and locked_skill_ids:
+        system_messages.append(_build_skill_lock_system_message(locked_skill_ids))
+        if "nano-banana-image-t8" in locked_skill_ids:
+            skill_state_raw = (
+                session.metadata.get("skill_param_state", {})
+                if session is not None
+                else {}
+            )
+            current_model = _load_saved_nano_banana_model_display()
+            if isinstance(skill_state_raw, dict):
+                nano_state = skill_state_raw.get("nano-banana-image-t8")
+                if isinstance(nano_state, dict):
+                    current_model = str(
+                        nano_state.get("__model_display__", current_model)
+                    ).strip() or current_model
+            system_messages.append(
+                _build_nano_banana_execution_system_message(
+                    current_model,
+                    _recover_recent_session_image_paths(session),
+                )
+            )
+    _append_office_system_hints(system_messages, session, llm_message)
+    image_api_probe_guard_enabled = _is_image_generation_request(llm_message)
+    if image_api_probe_guard_enabled:
+        system_messages.append(_build_image_generation_system_message())
+    if evo_first_mode:
+        system_messages.append(_build_evomap_first_system_message())
+        if session is not None and session_manager is not None:
+            session.metadata["evomap_phase"] = "editing"
+            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                session.id,
+                metadata=session.metadata,
+            )
+    import time as _time
+
+    _t_pre_llm_start = _time.monotonic()
+    _memory_stage_ms = 0
+    _extra_memory_stage_ms = 0
+    _group_compress_stage_ms = 0
+    if memory_manager is not None and agent_cfg.memory.enabled:
+        _t_memory_start = _time.monotonic()
+        memory_cfg = agent_cfg.memory
+        try:
+            style_directive = (
+                await memory_manager.get_global_style_directive()
+                if memory_cfg.global_style_enabled
+                else ""
+            )
+            if style_directive:
+                system_messages.append(_build_global_style_system_message(style_directive))
+                log.info(
+                    "agent.memory_style_applied",
+                    session_id=session_id,
+                    chars=len(style_directive),
+                )
+        except Exception as exc:
+            log.debug("agent.memory_style_load_failed", error=str(exc), session_id=session_id)
+        try:
+            should_recall, include_raw = memory_manager.recall_policy(llm_message)
+            if not should_recall and _is_creation_task_message(llm_message):
+                should_recall = True
+                include_raw = False
+            recalled = ""
+            if should_recall:
+                profile_block = await memory_manager.build_profile_for_injection(
+                    max_tokens=memory_cfg.recall_profile_max_tokens,
+                    router=router,
+                    model_id=memory_cfg.organizer_model,
+                    exclude_style=bool(style_directive.strip()),
+                )
+                raw_block = ""
+                if include_raw:
+                    raw_block = await memory_manager.recall(
+                        llm_message,
+                        max_tokens=memory_cfg.recall_raw_max_tokens,
+                        limit=memory_cfg.recall_limit,
+                        include_profile=False,
+                        include_raw=True,
+                    )
+                recalled = _merge_recall_blocks(profile_block, raw_block)
+            if recalled.strip():
+                system_messages.append(_build_memory_system_message(recalled))
+                log.info("agent.memory_recalled", session_id=session_id, chars=len(recalled))
+        except Exception as exc:
+            log.debug("agent.memory_recall_failed", error=str(exc), session_id=session_id)
+        _memory_stage_ms = int((_time.monotonic() - _t_memory_start) * 1000)
+    if extra_memory.strip():
+        _t_extra_start = _time.monotonic()
+        normalized_extra = extra_memory.strip()
+        compress_model = summarizer_cfg.model.strip()
+        can_compress = bool(compress_model)
+        should_compress_extra = _est_tokens(normalized_extra) > _EVOMAP_MAX_TOKENS
+        if can_compress and should_compress_extra:
+            try:
+                router.resolve(compress_model)
+                compressed = await asyncio.wait_for(
+                    _compress_external_memory_with_llm(
+                        router=router,
+                        model_id=compress_model,
+                        text=normalized_extra,
+                        max_tokens=_EVOMAP_MAX_TOKENS,
+                    ),
+                    timeout=_EXTRA_MEMORY_COMPRESS_TIMEOUT_SECONDS,
+                )
+                if compressed:
+                    normalized_extra = compressed
+                else:
+                    normalized_extra = _truncate_to_tokens(
+                        normalized_extra,
+                        _EVOMAP_MAX_TOKENS,
+                    )
+            except Exception:
+                normalized_extra = _truncate_to_tokens(
+                    normalized_extra,
+                    _EVOMAP_MAX_TOKENS,
+                )
+        else:
+            normalized_extra = _truncate_to_tokens(
+                normalized_extra,
+                _EVOMAP_MAX_TOKENS,
+            )
+        system_messages.append(_build_external_memory_system_message(normalized_extra))
+        _extra_memory_stage_ms = int((_time.monotonic() - _t_extra_start) * 1000)
+
+    conversation: list[Message] = []
+    if session:
+        conversation = list(session.messages)
+    conversation.append(Message(role="user", content=llm_message, images=images))
+    conversation_message_count = len(conversation)
+
+    if (
+        group_compressor is not None
+        and session_store is not None
+        and session is not None
+        and summarizer_cfg.model.strip()
+    ):
+        _t_group_start = _time.monotonic()
+        try:
+            conversation_for_compress = conversation
+            if isinstance(session.metadata, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raw_cutoff = session.metadata.get("compression_resume_message_index")
+                if isinstance(raw_cutoff, int) and raw_cutoff > 0:
+                    cutoff = max(0, min(raw_cutoff, len(conversation) - 1))
+                    if cutoff > 0:
+                        conversation_for_compress = conversation[cutoff:]
+            conversation = await group_compressor.build_window_messages(
+                session_id=session_id,
+                messages=conversation_for_compress,
+                router=router,
+                model_id=summarizer_cfg.model.strip(),
+            )
+        except Exception as exc:
+            log.debug("agent.group_compress_failed", session_id=session_id, error=str(exc))
+        _group_compress_stage_ms = int((_time.monotonic() - _t_group_start) * 1000)
+
+    _pre_llm_elapsed_ms = int((_time.monotonic() - _t_pre_llm_start) * 1000)
+    log.debug(
+        "agent.pre_llm_stages",
+        session_id=session_id,
+        memory_ms=_memory_stage_ms,
+        extra_memory_ms=_extra_memory_stage_ms,
+        group_compress_ms=_group_compress_stage_ms,
+        total_ms=_pre_llm_elapsed_ms,
+    )
+
+    model_short: str = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    trigger_preview = trigger_text_preview.strip() or _preview_text(llm_message)
+
+    log.info(
+        "agent.run",
+        model=model_id,
+        session_id=session_id,
+        native_tools=native_tools,
+        history_messages=len(conversation),
+        trigger_event_id=trigger_event_id,
+        trigger_preview=trigger_preview,
+    )
+
+    final_text_parts: list[str] = []
+    real_image_paths: list[str] = []
+    total_input = 0
+    total_output = 0
+    announced_plan = False
+    db_summaries = []
+    pending_office_paths: list[str] = []
+    if session_store and summarizer_cfg.enabled:
+        try:
+            db_summaries = await session_store.get_summaries(session_id)
+        except Exception as exc:
+            log.debug("agent.summaries_load_failed", error=str(exc))
+
+    guard_state = ToolGuardState()
+    invalid_tool_rounds = 0
+    empty_reply_rounds = 0
+    office_block_bash_probe = False
+    office_loop_guard_enabled = False
+    office_block_message = ""
+    office_edit_only = False
+    office_edit_path = ""
+    if session is not None:
+        is_office_request = _is_office_edit_request(llm_message) or (
+            _is_followup_edit_message(llm_message) and _has_any_last_office_path(session.metadata)
+        )
+        office_loop_guard_enabled = is_office_request
+        if is_office_request and _has_any_last_office_path(session.metadata):
+            office_block_bash_probe = True
+            office_block_message = _build_office_path_block_message(session.metadata)
+            last_pptx = session.metadata.get("last_pptx_path")
+            if isinstance(last_pptx, str) and last_pptx.strip():
+                office_edit_only = True
+                office_edit_path = last_pptx.strip()
+    max_tool_rounds = max(1, int(agent_cfg.max_tool_rounds))
+
+    round_idx = -1
+    successful_tool_calls = 0
+    browser_locked_by_evomap = evo_first_mode and not evomap_hint_hit
+    while total_output < _MAX_OUTPUT_TOKENS:
+        round_idx += 1
+        if round_idx >= max_tool_rounds:
+            final_text_parts.append(
+                f"工具调用轮次已达上限（{max_tool_rounds} 轮），"
+                "为避免长时间卡住已暂停。请让我改用更直接的编辑方式继续。"
+            )
+            break
+        if db_summaries:
+            all_messages = _context_window.trim_with_summaries(
+                [*system_messages, *conversation],
+                model_short,
+                db_summaries,
+            )
+        else:
+            all_messages = _context_window.trim(
+                [*system_messages, *conversation],
+                model_short,
+            )
+
+        _llm_t0 = _time.monotonic()
+        response: AgentResponse = await router.chat(
+            model_id,
+            all_messages,
+            tools=tool_schemas or None,
+            on_stream=on_stream,
+        )
+        _llm_ms = int((_time.monotonic() - _llm_t0) * 1000)
+        round_input = response.input_tokens
+        round_output = response.output_tokens
+        total_input += round_input
+        total_output += round_output
+        log.info(
+            "agent.llm_call",
+            round=round_idx,
+            elapsed_ms=_llm_ms,
+            model=model_id,
+            round_input_tokens=round_input,
+            round_output_tokens=round_output,
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            trigger_event_id=trigger_event_id,
+            trigger_preview=trigger_preview,
+            session_id=session_id,
+        )
+
+        tool_calls = response.tool_calls
+        if not tool_calls and not native_tools and response.content:
+            tool_calls = _parse_fallback_tool_calls(response.content)
+        if tool_calls:
+            valid_tool_calls = [tc for tc in tool_calls if tc.name.strip()]
+            dropped = len(tool_calls) - len(valid_tool_calls)
+            if dropped > 0:
+                if valid_tool_calls:
+                    log.debug(
+                        "agent.invalid_tool_calls_dropped",
+                        dropped=dropped,
+                        kept=len(valid_tool_calls),
+                        session_id=session_id,
+                    )
+                else:
+                    log.warning(
+                        "agent.invalid_tool_calls_dropped",
+                        dropped=dropped,
+                        kept=0,
+                        session_id=session_id,
+                    )
+            repaired_calls: list[ToolCall] = []
+            for tc in valid_tool_calls:
+                repaired, reason = _repair_tool_call(tc, message)
+                if reason:
+                    log.info(
+                        "agent.tool_call_repaired",
+                        tool=tc.name,
+                        reason=reason,
+                        before=str(tc.arguments)[:200],
+                        after=str(repaired.arguments)[:200],
+                        session_id=session_id,
+                    )
+                repaired_calls.append(repaired)
+            tool_calls = repaired_calls
+            blocked_reasons = blocked_tool_reasons(tool_calls, guard_state)
+            if blocked_reasons:
+                invalid_tool_rounds += 1
+                log.warning(
+                    "agent.blocked_tool_calls_dropped",
+                    reasons=blocked_reasons,
+                    round=round_idx,
+                    session_id=session_id,
+                )
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 该工具已被熔断："
+                            f"{'; '.join(blocked_reasons)}。"
+                            "请改用其他可用工具完成任务。"
+                        ),
+                    )
+                )
+                if invalid_tool_rounds >= 2:
+                    final_text_parts.append("工具调用连续无效，已停止自动重试。请明确参数后重试。")
+                    break
+                continue
+            invalid_reasons = [
+                reason
+                for tc in tool_calls
+                if (reason := _validate_tool_call_args(tc, registry)) is not None
+            ]
+            if invalid_reasons:
+                invalid_tool_rounds += 1
+                log.warning(
+                    "agent.invalid_tool_call_args",
+                    reasons=invalid_reasons,
+                    round=round_idx,
+                    session_id=session_id,
+                )
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 你上一轮的工具调用参数无效："
+                            f"{'; '.join(invalid_reasons)}。"
+                            "请只重发一个有效的工具调用，必填参数必须完整且非空。"
+                        ),
+                    )
+                )
+                if invalid_tool_rounds >= 2:
+                    final_text_parts.append(
+                        "工具调用参数连续无效，已停止自动重试。请明确参数后重试。"
+                    )
+                    break
+                continue
+            invalid_tool_rounds = 0
+
+        content = response.content or ""
+        if content:
+            if guard_state.planned_image_count is None:
+                update_planned_image_count(guard_state, content)
+                if guard_state.planned_image_count is not None:
+                    log.info(
+                        "agent.planned_image_count_detected",
+                        session_id=session_id,
+                        planned_image_count=guard_state.planned_image_count,
+                        search_images_limit=guard_state.search_images_limit,
+                    )
+            empty_reply_rounds = 0
+            if tool_calls and not native_tools:
+                clean = _strip_tool_json(content)
+                if clean:
+                    final_text_parts.append(clean)
+            else:
+                final_text_parts.append(content)
+
+        if not tool_calls and not content.strip():
+            empty_reply_rounds += 1
+            log.warning(
+                "agent.empty_response",
+                session_id=session_id,
+                round=round_idx,
+                model=model_id,
+                empty_reply_rounds=empty_reply_rounds,
+            )
+            if empty_reply_rounds == 1:
+                conversation.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "[系统提示] 你上一轮没有输出任何内容。"
+                            "请直接给出简短回复；如果需求不明确，请先问用户要做什么。"
+                        ),
+                    )
+                )
+                continue
+            final_text_parts.append("我这边没收到模型有效回复。请再发一次需求，我会继续处理。")
+            break
+
+        if not tool_calls:
+            break
+
+        if not announced_plan and on_stream:
+            announced_plan = True
+            has_text = content.strip() if content else ""
+            if not has_text:
+                tool_names = [tc.name for tc in tool_calls]
+                plan = _make_plan_hint(tool_names, llm_message)
+                await on_stream(plan)
+
+        log.info(
+            "agent.tool_calls",
+            round=round_idx,
+            count=len(tool_calls),
+            tools=[tc.name for tc in tool_calls],
+        )
+
+        # Pre-flight: run evomap_fetch first; if it fails, silently remove it
+        # so the LLM never sees the failed call — it just proceeds normally.
+        _evomap_preflight_results: dict[str, tuple[str, ToolResult]] = {}
+        _evomap_failed_ids: set[str] = set()
+        for _pf_tc in tool_calls:
+            if _pf_tc.name != "evomap_fetch":
+                continue
+            _pf_id, _pf_result = await _execute_tool(
+                registry,
+                _pf_tc,
+                evomap_enabled=evomap_allowed_for_turn,
+                browser_allowed=True,
+                office_block_bash_probe=False,
+                office_block_message="",
+                office_edit_only=False,
+                office_edit_path="",
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
+            )
+            if not _pf_result.success:
+                log.info(
+                    "agent.evomap_fetch_failed_fallback",
+                    session_id=session_id,
+                    error=_pf_result.error or _pf_result.output,
+                )
+                _evomap_failed_ids.add(_pf_tc.id)
+            else:
+                _evomap_preflight_results[_pf_tc.id] = (_pf_id, _pf_result)
+
+        if _evomap_failed_ids:
+            tool_calls = [tc for tc in tool_calls if tc.id not in _evomap_failed_ids]
+
+        if not tool_calls:
+            break
+
+        tool_names_str = ", ".join(tc.name for tc in tool_calls)
+        assistant_content = response.content or ""
+        assistant_persist = (
+            assistant_content
+            if assistant_content
+            else f"(调用工具: {tool_names_str}) {assistant_content}".strip()
+        )
+        assistant_msg = Message(
+            role="assistant",
+            content=assistant_content,
+            tool_calls=tool_calls if native_tools else None,
+        )
+        conversation.append(assistant_msg)
+
+        if session_manager and session:
+            await _persist_message(session_manager, session, "assistant", assistant_persist)
+            if assistant_content:
+                for office_path in _extract_office_paths(assistant_content):
+                    if _remember_office_path(session.metadata, office_path):
+                        metadata_dirty = True
+
+        for _tname in ("reminder", "cron"):
+            _tool = registry.get(_tname)
+            if _tool is not None and hasattr(_tool, "current_session_id"):
+                _tool.current_session_id = session_id  # type: ignore[union-attr]
+
+        stop_for_evomap_choice = False
+        stop_for_probe_loop = False
+        for tc in tool_calls:
+            if tc.name == "file_write" and isinstance(tc.arguments.get("content"), str):
+                for office_path in _extract_office_paths(str(tc.arguments.get("content", ""))):
+                    if office_path not in pending_office_paths:
+                        pending_office_paths.append(office_path)
+            if session is not None and tc.name in {"ppt_edit", "docx_edit", "xlsx_edit"}:
+                has_path = isinstance(tc.arguments.get("path"), str) and bool(
+                    str(tc.arguments.get("path", "")).strip()
+                )
+                if not has_path:
+                    default_path = _get_default_office_edit_path(tc.name, session.metadata)
+                    if default_path:
+                        fixed_args = dict(tc.arguments)
+                        fixed_args["path"] = default_path
+                        tc = ToolCall(id=tc.id, name=tc.name, arguments=fixed_args)
+                        log.info(
+                            "agent.office_path_autofill",
+                            tool=tc.name,
+                            path=default_path,
+                            session_id=session_id,
+                        )
+
+            if tc.id in _evomap_preflight_results:
+                tc_id, result = _evomap_preflight_results[tc.id]
+            else:
+                tc_id, result = await _execute_tool(
+                    registry,
+                    tc,
+                    evomap_enabled=evomap_allowed_for_turn,
+                    browser_allowed=not browser_locked_by_evomap,
+                    office_block_bash_probe=office_block_bash_probe,
+                    office_block_message=office_block_message,
+                    office_edit_only=office_edit_only,
+                    office_edit_path=office_edit_path,
+                    on_tool_call=on_tool_call,
+                    on_tool_result=on_tool_result,
+                )
+            if (
+                tc.name == "ppt_edit"
+                and result.success
+                and _mentions_specific_dark_bar_target(llm_message)
+            ):
+                action = str(tc.arguments.get("action", "replace_text")).strip().lower()
+                if action == "apply_business_style" and "重设深色条 0 处" in (result.output or ""):
+                    result = ToolResult(
+                        success=False,
+                        output=result.output,
+                        error="未命中用户指定对象：黑色横条仍未被替换，请继续定向修改该元素",
+                    )
+                elif action == "set_background":
+                    result = ToolResult(
+                        success=False,
+                        output=result.output,
+                        error="用户要求修改黑色横条，仅设置背景不算完成，请继续定向修改该横条",
+                    )
+            if tc.name == "evomap_fetch" and result.success:
+                candidates = _parse_evomap_fetch_candidates(result.output or "")
+                if len(candidates) > 3 and session is not None:
+                    top3 = _pick_top_evomap_candidates(llm_message, candidates, limit=3)
+                    session.metadata["evomap_pending_choices"] = {
+                        "origin_message": llm_message,
+                        "options": [{"asset_id": aid, "summary": summary} for aid, summary in top3],
+                    }
+                    if session_manager is not None:
+                        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                            session.id,
+                            metadata=session.metadata,
+                        )
+                    final_text_parts.append(_build_evomap_choice_prompt(top3))
+                    stop_for_evomap_choice = True
+                    break
+                browser_locked_by_evomap = not _is_no_match_evomap_output(result)
+            guard_update = apply_tool_result_guards(
+                guard_state,
+                tc,
+                result,
+                office_loop_guard_enabled=office_loop_guard_enabled,
+                image_api_probe_guard_enabled=image_api_probe_guard_enabled,
+                session_id=session_id,
+            )
+            for event in guard_update.log_events:
+                getattr(log, event.level)(event.event, **event.fields)
+            for prompt in guard_update.conversation_messages:
+                conversation.append(Message(role="user", content=prompt))
+            final_text_parts.extend(guard_update.final_texts)
+            if guard_update.stop_for_probe_loop:
+                stop_for_probe_loop = True
+                break
+
+            if result.success and result.output:
+                successful_tool_calls += 1
+                for path_match in re.finditer(
+                    r"(/[^\s]+\.(?:jpg|jpeg|png|gif|webp))", result.output
+                ):
+                    image_path = path_match.group(1)
+                    real_image_paths.append(image_path)
+                    if (
+                        session is not None
+                        and Path(image_path).expanduser().is_file()
+                        and session.metadata.get("last_generated_image_path") != image_path
+                    ):
+                        session.metadata["last_generated_image_path"] = image_path
+                        metadata_dirty = True
+            elif result.success:
+                successful_tool_calls += 1
+                if session is not None:
+                    for office_path in _extract_office_paths(result.output):
+                        if _remember_office_path(session.metadata, office_path):
+                            metadata_dirty = True
+            if session is not None and pending_office_paths:
+                for office_path in list(pending_office_paths):
+                    if Path(office_path).expanduser().exists():
+                        if _remember_office_path(session.metadata, office_path):
+                            metadata_dirty = True
+                        pending_office_paths.remove(office_path)
+            if (
+                session is not None
+                and tc.name == "bash"
+                and result.success
+                and _capture_latest_pptx(
+                    session.metadata,
+                    roots=(
+                        Path("/tmp"),
+                        Path("/private/tmp"),
+                        Path.home() / "Downloads",
+                        Path.home() / ".whaleclaw" / "workspace",
+                    ),
+                    window_seconds=240,
+                )
+            ):
+                metadata_dirty = True
+
+            if session is not None and tc.name in {"ppt_edit", "docx_edit", "xlsx_edit"}:
+                arg_path = tc.arguments.get("path")
+                if (
+                    isinstance(arg_path, str)
+                    and arg_path.strip()
+                    and _remember_office_path(session.metadata, arg_path.strip())
+                ):
+                    metadata_dirty = True
+
+            tool_output = _format_tool_output(result)
+
+            if native_tools:
+                tool_msg = Message(
+                    role="tool",
+                    content=tool_output,
+                    tool_call_id=tc_id,
+                )
+            else:
+                tool_msg = Message(
+                    role="user",
+                    content=(f"[工具 {tc.name} 执行结果]\n{tool_output}"),
+                )
+            conversation.append(tool_msg)
+
+            if session_manager and session and not _is_transient_cli_usage_error(result):
+                snippet = tool_output[:500] if len(tool_output) > 500 else tool_output
+                await _persist_message(
+                    session_manager,
+                    session,
+                    "tool",
+                    f"[{tc.name}] {snippet}",
+                    tool_call_id=tc_id,
+                    tool_name=tc.name,
+                )
+
+            log.debug(
+                "agent.tool_result",
+                tool=tc.name,
+                success=result.success,
+                output_len=len(result.output),
+            )
+
+        if stop_for_evomap_choice:
+            break
+        if stop_for_probe_loop:
+            break
+        post_round_update = apply_post_round_guards(
+            guard_state,
+            tool_calls,
+            round_idx=round_idx,
+            session_id=session_id,
+        )
+        for event in post_round_update.log_events:
+            getattr(log, event.level)(event.event, **event.fields)
+        for prompt in post_round_update.conversation_messages:
+            conversation.append(Message(role="user", content=prompt))
+        final_text_parts.extend(post_round_update.final_texts)
+        if metadata_dirty and session is not None and session_manager is not None:
+            await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                session.id,
+                metadata=session.metadata,
+            )
+            metadata_dirty = False
+        if post_round_update.stop_for_repeat_loop:
+            break
+
+        final_text_parts.clear()
+    else:
+        log.warning(
+            "agent.token_budget_exhausted",
+            session_id=session_id,
+            rounds=round_idx + 1,
+            total_output=total_output,
+        )
+
+    final_text = "".join(final_text_parts)
+    final_text = _fix_image_paths(final_text, real_image_paths)
+
+    if lock_is_explicit and locked_skill_ids and skill_announce_pending:
+        announce = _skill_announcement(locked_skill_ids, previous_locked_skill_ids)
+        final_text = f"{announce}\n\n{final_text}" if final_text else announce
+        skill_announce_pending = False
+        if session is not None:
+            session.metadata["skill_lock_announce_pending"] = False
+            metadata_dirty = True
+
+    _lock_confirm_tip = (
+        "如果本轮任务已完成，请回复“任务完成”以解除技能锁定；"
+        "若需继续修改，请直接继续说需求。"
+    )
+
+    # Deferred lock: first run completed with auto-routed skills -> lock them now.
+    if (
+        not lock_is_explicit
+        and pending_lock_skill_ids
+        and session is not None
+        and successful_tool_calls > 0
+    ):
+        locked_skill_ids = pending_lock_skill_ids
+        lock_is_explicit = True
+        session.metadata["locked_skill_ids"] = locked_skill_ids
+        session.metadata["skill_lock_waiting_done"] = True
+        metadata_dirty = True
+        final_text = f"{final_text}\n\n{_lock_confirm_tip}" if final_text else _lock_confirm_tip
+
+    # Explicit lock: require user confirmation to release after successful tool use.
+    elif (
+        lock_is_explicit
+        and locked_skill_ids
+        and session is not None
+        and successful_tool_calls > 0
+        and not lock_waiting_done
+    ):
+        session.metadata["locked_skill_ids"] = locked_skill_ids
+        session.metadata["skill_lock_waiting_done"] = True
+        metadata_dirty = True
+        final_text = f"{final_text}\n\n{_lock_confirm_tip}" if final_text else _lock_confirm_tip
+
+    if metadata_dirty and session is not None and session_manager is not None:
+        await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            session.id,
+            metadata=session.metadata,
+        )
+
+    # Background: generate L0/L1 summaries for older messages if needed
+    if (
+        session_store
+        and router
+        and summarizer_cfg.enabled
+        and session
+        and group_compressor is None
+        and _compressor.should_compress(conversation_message_count)
+    ):
+        try:
+            latest = await session_store.get_latest_summary(session_id, "L0")
+            msg_rows = await session_store.get_messages(session_id)
+
+            already_covered = latest.source_msg_end if latest else 0
+            uncovered = [r for r in msg_rows if r.id > already_covered]
+            protected = min(RECENT_PROTECTED, len(uncovered))
+            to_compress = uncovered[:-protected] if protected < len(uncovered) else []
+
+            if len(to_compress) >= 8:
+                compress_msgs = [
+                    Message(role=r.role if r.role != "tool" else "assistant", content=r.content)  # pyright: ignore[reportArgumentType]
+                    for r in to_compress
+                ]
+                start_id = to_compress[0].id
+                end_id = to_compress[-1].id
+                _store_ref = session_store
+                _router_ref = router
+                _model_ref: str = summarizer_cfg.model
+
+                async def _bg_compress() -> None:
+                    try:
+                        await _compressor.compress_segment(
+                            session_id=session_id,
+                            messages=compress_msgs,
+                            msg_id_start=start_id,
+                            msg_id_end=end_id,
+                            store=_store_ref,
+                            router=_router_ref,
+                            model=_model_ref,
+                        )
+                    except Exception as exc:
+                        log.debug("agent.bg_compress_failed", error=str(exc))
+
+                asyncio.create_task(_bg_compress())
+        except Exception as exc:
+            log.debug("agent.bg_compress_prep_failed", error=str(exc))
+
+    log.info(
+        "agent.done",
+        model=model_id,
+        llm_rounds=max(0, round_idx + 1),
+        input_tokens=total_input,
+        output_tokens=total_output,
+        session_id=session_id,
+        trigger_event_id=trigger_event_id,
+        trigger_preview=trigger_preview,
+    )
+
+    if session_store and total_input + total_output > 0:
+        try:
+            await session_store.record_token_usage(
+                session_id=session_id,
+                model=model_id,
+                input_tokens=total_input,
+                output_tokens=total_output,
+            )
+        except Exception:
+            log.debug("agent.token_usage_save_failed")
+
+    if memory_manager is not None and agent_cfg.memory.enabled:
+        memory_cfg = agent_cfg.memory
+        captured = False
+        organized = False
+        organizer_ready = True
+        try:
+            captured = await memory_manager.auto_capture_user_message(
+                message,
+                source=f"session:{session_id}",
+                mode=memory_cfg.auto_capture_mode,
+                cooldown_seconds=memory_cfg.cooldown_seconds,
+                max_per_hour=memory_cfg.max_per_hour,
+                batch_size=memory_cfg.capture_batch_size,
+                merge_window_seconds=memory_cfg.capture_merge_window_seconds,
+            )
+            if captured:
+                log.info("agent.memory_captured", session_id=session_id)
+        except Exception as exc:
+            log.debug("agent.memory_capture_failed", error=str(exc), session_id=session_id)
+        if memory_cfg.organizer_enabled:
+            try:
+                router.resolve(memory_cfg.organizer_model)
+            except Exception:
+                organizer_ready = False
+            if memory_cfg.organizer_background:
+                if organizer_ready:
+                    _schedule_memory_organizer_task(
+                        session_id,
+                        memory_manager=memory_manager,
+                        router=router,
+                        model_id=memory_cfg.organizer_model,
+                        organizer_min_new_entries=memory_cfg.organizer_min_new_entries,
+                        organizer_interval_seconds=memory_cfg.organizer_interval_seconds,
+                        organizer_max_raw_window=memory_cfg.organizer_max_raw_window,
+                        keep_profile_versions=memory_cfg.keep_profile_versions,
+                        max_raw_entries=memory_cfg.max_raw_entries,
+                    )
+            else:
+                try:
+                    organized = await memory_manager.organize_if_needed(
+                        router=router,
+                        model_id=memory_cfg.organizer_model,
+                        organizer_min_new_entries=memory_cfg.organizer_min_new_entries,
+                        organizer_interval_seconds=memory_cfg.organizer_interval_seconds,
+                        organizer_max_raw_window=memory_cfg.organizer_max_raw_window,
+                        keep_profile_versions=memory_cfg.keep_profile_versions,
+                        max_raw_entries=memory_cfg.max_raw_entries,
+                    )
+                    if organized:
+                        log.info("agent.memory_organized", session_id=session_id)
+                except Exception as exc:
+                    organizer_ready = False
+                    log.debug("agent.memory_organize_failed", error=str(exc), session_id=session_id)
+
+        if captured and (not memory_cfg.organizer_enabled or not organizer_ready or not organized):
+            try:
+                updated = await memory_manager.upsert_profile_from_capture(
+                    message,
+                    router=router,
+                    model_id=model_id,
+                    max_tokens=memory_cfg.recall_profile_max_tokens,
+                    keep_profile_versions=memory_cfg.keep_profile_versions,
+                )
+                if updated:
+                    log.info("agent.memory_profile_fallback_updated", session_id=session_id)
+            except Exception as exc:
+                log.debug(
+                    "agent.memory_profile_fallback_failed",
+                    error=str(exc),
+                    session_id=session_id,
+                )
+
+    return final_text

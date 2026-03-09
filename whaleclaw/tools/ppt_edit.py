@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 from whaleclaw.tools.deps import ensure_tool_dep
@@ -23,6 +23,7 @@ def _add_cropped_picture(
     """
     try:
         from PIL import Image as PILImage
+
         from whaleclaw.utils.image_crop import detect_face_info, smart_crop_box
 
         with PILImage.open(str(img_path)) as im:
@@ -104,7 +105,10 @@ class PptEditTool(Tool):
                 ToolParameter(
                     name="image_index",
                     type="integer",
-                    description="目标图片序号（从 1 开始，replace_image/remove_image 时使用，默认 1 即第一张图）",
+                    description=(
+                        "目标图片序号（从 1 开始，replace_image/remove_image 时使用，"
+                        "默认 1 即第一张图）"
+                    ),
                     required=False,
                 ),
                 ToolParameter(
@@ -146,7 +150,10 @@ class PptEditTool(Tool):
                 ToolParameter(
                     name="image_height",
                     type="number",
-                    description="插图高度（英寸）。同时指定 width+height 时自动裁剪保持比例，不会变形拉伸。",
+                    description=(
+                        "插图高度（英寸）。同时指定 width+height 时自动裁剪保持比例，"
+                        "不会变形拉伸。"
+                    ),
                     required=False,
                 ),
                 ToolParameter(
@@ -209,13 +216,13 @@ class PptEditTool(Tool):
                 return ToolResult(success=False, output="", error="old_text 不能为空")
             replaced = 0
             for shape in slide.shapes:
-                if not hasattr(shape, "text"):
+                text = getattr(shape, "text", None)
+                if not isinstance(text, str):
                     continue
-                text = shape.text or ""
                 count = text.count(old_text)
                 if count <= 0:
                     continue
-                shape.text = text.replace(old_text, new_text)
+                cast(Any, shape).text = text.replace(old_text, new_text)
                 replaced += count
             if replaced == 0:
                 return ToolResult(
@@ -246,6 +253,8 @@ class PptEditTool(Tool):
             output = f"已更新 {path} 第 {slide_index} 页标题"
         elif action == "set_notes":
             notes = slide.notes_slide.notes_text_frame
+            if notes is None:
+                return ToolResult(success=False, output="", error="当前页备注区域不可用")
             notes.clear()
             notes.text = new_text
             output = f"已更新 {path} 第 {slide_index} 页备注"
@@ -311,7 +320,11 @@ class PptEditTool(Tool):
             old_width, old_height = old_shape.width, old_shape.height
 
             sp_elem = old_shape._element  # pyright: ignore[reportPrivateUsage]
-            sp_elem.getparent().remove(sp_elem)
+            sp_elem_any = cast(Any, sp_elem)
+            parent = sp_elem_any.getparent()
+            if parent is None:
+                return ToolResult(success=False, output="", error="无法定位图片父节点")
+            parent.remove(sp_elem_any)
 
             if action == "remove_image":
                 output = f"已删除 {path} 第 {slide_index} 页第 {img_idx} 张图片"
@@ -353,11 +366,15 @@ class PptEditTool(Tool):
                 rgb = getattr(color, "rgb", None)
                 if rgb is None:
                     continue
+                shape_width = getattr(shape, "width", None)
+                shape_height = getattr(shape, "height", None)
+                if not isinstance(shape_width, int) or not isinstance(shape_height, int):
+                    continue
                 # Treat large dark rectangles/bars as candidate overlays.
                 is_dark = rgb[0] <= 50 and rgb[1] <= 50 and rgb[2] <= 50
                 is_large_bar = (
-                    getattr(shape, "width", 0) >= int(prs.slide_width * 0.35)
-                    and getattr(shape, "height", 0) <= int(prs.slide_height * 0.75)
+                    shape_width >= int(cast(int, prs.slide_width) * 0.35)
+                    and shape_height <= int(cast(int, prs.slide_height) * 0.75)
                 )
                 if not (is_dark and is_large_bar):
                     continue
@@ -384,8 +401,11 @@ class PptEditTool(Tool):
         else:
             return ToolResult(success=False, output="", error=f"不支持的 action: {action}")
 
-        sw, sh = prs.slide_width, prs.slide_height
+        sw = cast(int, prs.slide_width)
+        sh = cast(int, prs.slide_height)
         for s in slide.shapes:
+            width_type = type(s.width)
+            height_type = type(s.height)
             overflow_r = s.left + s.width - sw
             overflow_b = s.top + s.height - sh
             if overflow_r > 0 or overflow_b > 0:
@@ -393,16 +413,16 @@ class PptEditTool(Tool):
                 if is_pic and s.width > 0 and s.height > 0:
                     ratio = s.width / s.height
                     if overflow_r > 0:
-                        s.width = sw - s.left
-                        s.height = int(s.width / ratio)
+                        s.width = width_type(sw - s.left)
+                        s.height = height_type(int(s.width / ratio))
                     if s.top + s.height > sh:
-                        s.height = sh - s.top
-                        s.width = int(s.height * ratio)
+                        s.height = height_type(sh - s.top)
+                        s.width = width_type(int(s.height * ratio))
                 else:
                     if overflow_r > 0:
-                        s.width = sw - s.left
+                        s.width = width_type(sw - s.left)
                     if overflow_b > 0:
-                        s.height = sh - s.top
+                        s.height = height_type(sh - s.top)
 
         try:
             prs.save(str(path))

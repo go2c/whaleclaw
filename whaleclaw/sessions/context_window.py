@@ -1,9 +1,9 @@
 """Context window management with fixed-token hierarchical compression.
 
 Policy (user-defined):
-- Keep the latest 3 conversation groups unchanged.
-- Groups ranked from 4th to 10th latest use L1 compression.
-- Groups older than the 10th latest use L0 compression.
+- Keep the latest 5 conversation groups unchanged.
+- Groups ranked from 6th to 12th latest use L1 compression.
+- Groups ranked from 13th to 25th latest use L0 compression.
 - Target total input budget is ~1600 tokens (best effort).
 - If still over budget after physical truncation, compact dropped range into
   a single summary message and feed it back.
@@ -47,16 +47,19 @@ MODEL_MAX_CONTEXT: dict[str, int] = {
 
 _DEFAULT_CONTEXT = 128_000
 TARGET_CONTENT_TOKENS = 1600
-RECENT_PROTECTED = 3
+RECENT_PROTECTED = 5
 _L1_WINDOW = 7
 _MIN_CONTENT_BUDGET = 200
 
 
-def _estimate_tokens(text: str) -> int:
+def estimate_tokens(text: str) -> int:
     """Quick token estimate: ~1.5 chars/token CJK, ~4 chars/token Latin."""
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     latin = len(text) - cjk
     return max(1, int(cjk / 1.5 + latin / 4))
+
+
+_estimate_tokens = estimate_tokens
 
 
 def _total_tokens(msgs: list[Message]) -> int:
@@ -163,7 +166,9 @@ def _build_compacted_range_message(
     return Message(role="assistant", content=f"[历史压缩摘要]\n{body}")
 
 
-def _keep_recent_with_budget(recent: list[Message], budget: int) -> tuple[list[Message], list[Message]]:
+def _keep_recent_with_budget(  # pyright: ignore[reportUnusedFunction]
+    recent: list[Message], budget: int
+) -> tuple[list[Message], list[Message]]:
     kept_rev: list[Message] = []
     used = 0
     for msg in reversed(recent):

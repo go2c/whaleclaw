@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
+from whaleclaw.tools.process_registry import register_background_process
 
 _DANGEROUS_PATTERNS = [
     re.compile(r"\brm\s+-rf\s+/\s*$"),
@@ -57,6 +58,12 @@ class BashTool(Tool):
                     description="Timeout in seconds (default 30, max 300).",
                     required=False,
                 ),
+                ToolParameter(
+                    name="background",
+                    type="boolean",
+                    description="Run command in background and return a session id.",
+                    required=False,
+                ),
             ],
         )
 
@@ -64,6 +71,7 @@ class BashTool(Tool):
         raw_command: str = kwargs.get("command", "")
         command = _prefer_project_python(_strip_control_chars(raw_command))
         timeout: int = int(kwargs.get("timeout", 30))
+        background = bool(kwargs.get("background", False))
 
         if not command.strip():
             return ToolResult(success=False, output="", error="命令为空")
@@ -79,10 +87,26 @@ class BashTool(Tool):
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
+            if background:
+                session = register_background_process(
+                    command=command,
+                    cwd=os.getcwd(),
+                    process=proc,
+                )
+                return ToolResult(
+                    success=True,
+                    output=(
+                        f"后台命令已启动\n"
+                        f"session_id: {session.id}\n"
+                        f"pid: {proc.pid or 0}\n"
+                        f"command: {command}"
+                    ),
+                )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
             return ToolResult(success=False, output="", error=f"命令超时 ({timeout}s)")

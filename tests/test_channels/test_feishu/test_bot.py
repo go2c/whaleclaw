@@ -16,9 +16,13 @@ from whaleclaw.config.schema import ProviderModelEntry, WhaleclawConfig
 
 
 class _StubClient:
+    def __init__(self) -> None:
+        self.replies: list[tuple[str, str, str]] = []
+
     async def reply_message(  # noqa: D401
         self, message_id: str, msg_type: str, content: str
     ) -> dict[str, Any]:
+        self.replies.append((message_id, msg_type, content))
         return {"data": {"message_id": "reply-1"}}
 
     async def download_resource(
@@ -32,6 +36,18 @@ class _StubSessionManager:
     def __init__(self) -> None:
         self.updated_to: str | None = None
         self.updated_metadata: dict[str, Any] | None = None
+        self.session = SimpleNamespace(
+            id="s-feishu-1",
+            channel="feishu",
+            peer_id="ou_xxx",
+            metadata={},
+            model="openai/gpt-5.2",
+        )
+
+    async def get_or_create(self, channel: str, peer_id: str) -> Any:
+        self.session.channel = channel
+        self.session.peer_id = peer_id
+        return self.session
 
     async def update_model(self, session: Any, model: str) -> None:
         session.model = model
@@ -183,6 +199,7 @@ def test_prepare_reply_payload_extracts_bold_pptx_path(tmp_path: Path) -> None:
 async def test_handle_image_message_passes_images_to_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
     captured: dict[str, Any] = {}
+    media_dir = Path("/tmp/whaleclaw-test-feishu-images")
 
     async def _fake_run(
         text: str,
@@ -196,6 +213,7 @@ async def test_handle_image_message_passes_images_to_agent(monkeypatch: pytest.M
         captured["card_msg_id"] = card_msg_id
         captured["images"] = images or []
 
+    monkeypatch.setattr("whaleclaw.channels.feishu.bot._FEISHU_MEDIA_DIR", media_dir)
     monkeypatch.setattr(bot, "_run_agent_and_reply", _fake_run)
 
     await bot.handle_message({
@@ -208,11 +226,182 @@ async def test_handle_image_message_passes_images_to_agent(monkeypatch: pytest.M
         },
     })
 
-    assert captured["text"] == "(用户发送了一张图片)"
+    assert captured["text"].startswith("(用户发送了图片)\n![飞书图片1](")
     assert captured["peer_id"] == "ou_xxx"
     assert len(captured["images"]) == 1
     assert captured["images"][0].mime == "image/png"
     assert captured["images"][0].data == base64.b64encode(b"fake-image-binary").decode("ascii")
+    saved_path = Path(captured["text"].split("](", 1)[1].rstrip(")"))
+    assert saved_path.is_file()
+    assert saved_path.read_bytes() == b"fake-image-binary"
+
+
+@pytest.mark.asyncio
+async def test_handle_image_message_buffers_until_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient()
+    bot = FeishuBot(client, FeishuConfig(dm_policy="open"))
+    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    media_dir = Path("/tmp/whaleclaw-test-feishu-buffer")
+    captured: dict[str, Any] = {}
+
+    async def _fake_run(
+        text: str,
+        peer_id: str,
+        card_msg_id: str,
+        *,
+        images: list[Any] | None = None,
+    ) -> None:
+        captured["text"] = text
+        captured["peer_id"] = peer_id
+        captured["card_msg_id"] = card_msg_id
+        captured["images"] = images or []
+
+    monkeypatch.setattr("whaleclaw.channels.feishu.bot._FEISHU_MEDIA_DIR", media_dir)
+    monkeypatch.setattr(bot, "_run_agent_and_reply", _fake_run)
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-1",
+            "chat_type": "p2p",
+            "message_type": "image",
+            "content": json.dumps({"image_key": "img_key_1"}),
+        },
+    })
+
+    assert "已收到图1" in client.replies[-1][2]
+    assert captured == {}
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-2",
+            "chat_type": "p2p",
+            "message_type": "text",
+            "content": json.dumps({"text": "让图1的男孩骑马 提交"}),
+        },
+    })
+
+    assert "收到，处理中" in client.replies[-1][2]
+    assert captured["peer_id"] == "ou_xxx"
+    assert captured["text"].startswith("让图1的男孩骑马")
+    assert "![飞书图片1](" in captured["text"]
+    assert len(captured["images"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_images_with_prompt_runs_immediately_without_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient()
+    bot = FeishuBot(client, FeishuConfig(dm_policy="open"))
+    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    media_dir = Path("/tmp/whaleclaw-test-feishu-direct-run")
+    captured: dict[str, Any] = {}
+
+    async def _fake_run(
+        text: str,
+        peer_id: str,
+        card_msg_id: str,
+        *,
+        images: list[Any] | None = None,
+    ) -> None:
+        captured["text"] = text
+        captured["peer_id"] = peer_id
+        captured["card_msg_id"] = card_msg_id
+        captured["images"] = images or []
+
+    monkeypatch.setattr("whaleclaw.channels.feishu.bot._FEISHU_MEDIA_DIR", media_dir)
+    monkeypatch.setattr(bot, "_run_agent_and_reply", _fake_run)
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-direct-run-1",
+            "chat_type": "p2p",
+            "message_type": "post",
+            "content": json.dumps({
+                "content": [
+                    [
+                        {"tag": "text", "text": "让图1的男孩骑着图2的马"},
+                    ]
+                ],
+                "image_keys": ["img_key_1", "img_key_2", "img_key_3"],
+            }),
+        },
+    })
+
+    assert "收到，处理中" in client.replies[-1][2]
+    assert captured["peer_id"] == "ou_xxx"
+    assert captured["text"].startswith("让图1的男孩骑着图2的马")
+    assert captured["text"].count("![飞书图片") == 3
+    assert len(captured["images"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_handle_buffered_images_then_prompt_runs_immediately_without_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient()
+    bot = FeishuBot(client, FeishuConfig(dm_policy="open"))
+    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    media_dir = Path("/tmp/whaleclaw-test-feishu-buffer-then-run")
+    captured: dict[str, Any] = {}
+
+    async def _fake_run(
+        text: str,
+        peer_id: str,
+        card_msg_id: str,
+        *,
+        images: list[Any] | None = None,
+    ) -> None:
+        captured["text"] = text
+        captured["peer_id"] = peer_id
+        captured["card_msg_id"] = card_msg_id
+        captured["images"] = images or []
+
+    monkeypatch.setattr("whaleclaw.channels.feishu.bot._FEISHU_MEDIA_DIR", media_dir)
+    monkeypatch.setattr(bot, "_run_agent_and_reply", _fake_run)
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-run-1",
+            "chat_type": "p2p",
+            "message_type": "image",
+            "content": json.dumps({"image_key": "img_key_1"}),
+        },
+    })
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-run-2",
+            "chat_type": "p2p",
+            "message_type": "image",
+            "content": json.dumps({"image_key": "img_key_2"}),
+        },
+    })
+
+    assert "已收到图2" in client.replies[-1][2]
+    assert captured == {}
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-run-3",
+            "chat_type": "p2p",
+            "message_type": "text",
+            "content": json.dumps({"text": "图2的巨型三花猫正好奇地拨弄着图1的寺庙"}),
+        },
+    })
+
+    assert "收到，处理中" in client.replies[-1][2]
+    assert captured["peer_id"] == "ou_xxx"
+    assert captured["text"].startswith("图2的巨型三花猫正好奇地拨弄着图1的寺庙")
+    assert captured["text"].count("![飞书图片") == 2
+    assert len(captured["images"]) == 2
 
 
 @pytest.mark.asyncio

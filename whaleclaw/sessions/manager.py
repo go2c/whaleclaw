@@ -38,6 +38,10 @@ class SessionManager:
         self._store = store
         self._config = config
 
+    @property
+    def store(self) -> SessionStore:
+        return self._store
+
     async def create(self, channel: str, peer_id: str) -> Session:
         """Create a new session."""
         now = datetime.now(UTC)

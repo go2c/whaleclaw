@@ -74,9 +74,9 @@ class SkillManager:
             if forced:
                 return forced
         if forced_skill_id:
-            forced = next((s for s in available if s.id == forced_skill_id), None)
-            if forced is not None:
-                return [forced]
+            forced_skill = next((s for s in available if s.id == forced_skill_id), None)
+            if forced_skill is not None:
+                return [forced_skill]
         return self._router.route(user_message, available, max_skills=max_skills)
 
     def format_for_prompt(self, skills: list[Skill], budget: int) -> str:

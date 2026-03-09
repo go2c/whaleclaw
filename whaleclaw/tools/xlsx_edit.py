@@ -41,6 +41,7 @@ class XlsxEditTool(Tool):
             return ToolResult(success=False, output="", error="缺少依赖 openpyxl")
 
         from openpyxl import load_workbook
+        from openpyxl.cell.cell import Cell
 
         raw_path = str(kwargs.get("path", "")).strip()
         sheet_name = str(kwargs.get("sheet", "")).strip()
@@ -97,6 +98,8 @@ class XlsxEditTool(Tool):
             for ws in sheets:
                 for row in ws.iter_rows():
                     for cell in row:
+                        if not isinstance(cell, Cell):
+                            continue
                         if not isinstance(cell.value, str):
                             continue
                         count = cell.value.count(old_text)

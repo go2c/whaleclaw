@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 class MemorySearchTool(Tool):
-    """Search memory by query."""
+    """Search long-term knowledge memory by query."""
 
     def __init__(self, manager: MemoryManager) -> None:
         self._manager = manager
@@ -21,7 +21,7 @@ class MemorySearchTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="memory_search",
-            description="按关键词搜索记忆",
+            description="按关键词搜索长期知识记忆",
             parameters=[
                 ToolParameter(name="query", type="string", description="搜索关键词"),
                 ToolParameter(
@@ -38,7 +38,7 @@ class MemorySearchTool(Tool):
         limit = int(kwargs.get("limit", 5)) if kwargs.get("limit") is not None else 5
         if not query.strip():
             return ToolResult(success=False, output="", error="搜索关键词为空")
-        result = await self._manager.recall(query, max_tokens=1000, limit=limit)
+        result = await self._manager.recall_knowledge(query, max_tokens=1000, limit=limit)
         return ToolResult(success=True, output=result or "未找到相关记忆")
 
 

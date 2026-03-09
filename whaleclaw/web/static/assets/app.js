@@ -80,12 +80,15 @@ createApp({
     const pendingFiles = ref([]);
     const memoryStyle = ref('');
     const memoryStyleEnabled = ref(true);
+    const memoryStyleSource = ref('none');
     const memoryStyleLoading = ref(false);
     const memoryStyleSaving = ref(false);
     const memoryStyleLastRefresh = ref('');
     const memoryStyleRefreshNote = ref('');
     const evomapEnabled = ref(false);
     const evomapLoading = ref(false);
+    const browserVisible = ref(true);
+    const browserVisibleLoading = ref(false);
 
     const currentModel = ref('');
     const thinkingLevel = ref('off');
@@ -136,6 +139,7 @@ createApp({
     const publishSlugInput = ref('');
     const publishVersionInput = ref('0.1.0');
     const uiAlertMessage = ref('');
+    const pendingClearMemoryStyle = ref(false);
 
     const activeSession = computed(() =>
       sessions.value.find((s) => s.id === activeSessionId.value)
@@ -194,6 +198,14 @@ createApp({
 
     function closeUiAlert() {
       uiAlertMessage.value = '';
+    }
+
+    function openClearMemoryStyleDialog() {
+      pendingClearMemoryStyle.value = true;
+    }
+
+    function closeClearMemoryStyleDialog() {
+      pendingClearMemoryStyle.value = false;
     }
 
     /* ── Auth ── */
@@ -1065,11 +1077,20 @@ createApp({
         const data = await apiFetch('/api/memory/style');
         memoryStyleEnabled.value = data.enabled !== false;
         memoryStyle.value = data.style_directive || '';
+        memoryStyleSource.value = String(data.source || 'none');
         memoryStyleLastRefresh.value = _formatClock(new Date());
         if (showFeedback) {
-          memoryStyleRefreshNote.value = memoryStyle.value.trim()
-            ? '已刷新（已读取当前全局风格）'
-            : '已刷新（当前尚未生成全局风格）';
+          if (memoryStyleSource.value === 'cleared') {
+            memoryStyleRefreshNote.value = '已刷新（当前回复风格已清空，后续可由新对话重新生成）';
+          } else if (!memoryStyle.value.trim()) {
+            memoryStyleRefreshNote.value = '已刷新（当前还没有可用的回复风格）';
+          } else if (memoryStyleSource.value === 'manual') {
+            memoryStyleRefreshNote.value = '已刷新（当前显示的是手动覆盖的回复风格）';
+          } else if (memoryStyleSource.value === 'saved') {
+            memoryStyleRefreshNote.value = '已刷新（当前显示的是已保存的回复风格）';
+          } else {
+            memoryStyleRefreshNote.value = '已刷新（当前显示的是从长期记忆画像自动派生的回复风格）';
+          }
         }
       } catch (e) {
         if (showFeedback) {
@@ -1096,6 +1117,8 @@ createApp({
           method: 'POST',
           body: JSON.stringify({ style_directive: memoryStyle.value.trim() }),
         });
+        memoryStyleSource.value = 'manual';
+        showUiAlert('保存成功');
       } catch (e) {
         showUiAlert('保存失败: ' + (e.message || e));
       } finally {
@@ -1103,12 +1126,14 @@ createApp({
       }
     }
 
-    async function clearMemoryStyle() {
-      if (!confirm('确定清除全局回复风格吗？')) return;
+    async function confirmClearMemoryStyle() {
       memoryStyleSaving.value = true;
       try {
         await apiFetch('/api/memory/style', { method: 'DELETE' });
         memoryStyle.value = '';
+        memoryStyleSource.value = 'cleared';
+        closeClearMemoryStyleDialog();
+        showUiAlert('清空成功');
       } catch (e) {
         showUiAlert('清除失败: ' + (e.message || e));
       } finally {
@@ -1142,6 +1167,33 @@ createApp({
         showUiAlert('EvoMap 开关更新失败: ' + (e.message || e));
       } finally {
         evomapLoading.value = false;
+      }
+    }
+
+    async function loadBrowserVisibilitySetting() {
+      browserVisibleLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/browser');
+        browserVisible.value = data.visible !== false;
+      } catch { /* ignore */ }
+      finally {
+        browserVisibleLoading.value = false;
+      }
+    }
+
+    async function setBrowserVisible(enabled) {
+      if (browserVisibleLoading.value) return;
+      browserVisibleLoading.value = true;
+      try {
+        const data = await apiFetch('/api/plugins/browser', {
+          method: 'POST',
+          body: JSON.stringify({ visible: enabled }),
+        });
+        browserVisible.value = data.visible !== false;
+      } catch (e) {
+        showUiAlert('浏览器可视开关更新失败: ' + (e.message || e));
+      } finally {
+        browserVisibleLoading.value = false;
       }
     }
 
@@ -1190,11 +1242,26 @@ createApp({
       system: '系统',
       file: '文件操作',
       browser: '浏览器',
+      device: '设备与界面',
       session: '会话管理',
       automation: '自动化',
+      memory: '记忆',
+      skill: '技能',
+      integration: '集成与插件',
       other: '其他',
     };
-    const _TOOL_CATEGORY_ORDER = ['system', 'file', 'browser', 'session', 'automation', 'other'];
+    const _TOOL_CATEGORY_ORDER = [
+      'system',
+      'file',
+      'browser',
+      'device',
+      'session',
+      'automation',
+      'memory',
+      'skill',
+      'integration',
+      'other',
+    ];
 
     const groupedTools = computed(() => {
       const groups = {};
@@ -1859,6 +1926,7 @@ createApp({
       loadTools();
       loadMemoryStyle();
       loadEvomapSetting();
+      loadBrowserVisibilitySetting();
     }
 
     onMounted(async () => {
@@ -1924,9 +1992,10 @@ createApp({
       loadMultiAgentConfig, saveMultiAgentConfig, toggleMultiAgentEnabled, addMultiAgentRole, removeMultiAgentRole,
       onMultiAgentScenarioChange, addCustomMultiAgentScenario, removeCustomMultiAgentScenario,
       toolDetail,
-      memoryStyle, memoryStyleEnabled, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
-      loadMemoryStyle, onMemoryStyleRefresh, saveMemoryStyle, clearMemoryStyle,
+      memoryStyle, memoryStyleEnabled, memoryStyleSource, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
+      loadMemoryStyle, onMemoryStyleRefresh, saveMemoryStyle, pendingClearMemoryStyle, openClearMemoryStyleDialog, closeClearMemoryStyleDialog, confirmClearMemoryStyle,
       evomapEnabled, evomapLoading, loadEvomapSetting, setEvomapEnabled,
+      browserVisible, browserVisibleLoading, loadBrowserVisibilitySetting, setBrowserVisible,
       createSession, deleteSession, switchSession,
       sendMessage, handleKeydown, switchModel, loadModels,
       toggleTheme, formatTime, renderMarkdown,
@@ -2415,27 +2484,44 @@ createApp({
           </div>
         </div>
         <div class="setting-group">
+          <div class="setting-row">
+            <div>
+              <label style="margin-bottom:2px">浏览器可视操作</label>
+              <p class="setting-hint" style="margin:0">开启后可看到 browser 工具操作窗口；关闭后后台无界面运行（下次启动 browser 生效）</p>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                :checked="browserVisible"
+                :disabled="browserVisibleLoading"
+                @change="setBrowserVisible($event.target.checked)"
+              >
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="setting-group">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-            <label style="margin:0">全局回复风格（自动生成，可手动覆盖）</label>
+            <label style="margin:0">当前回复风格（自动派生，可手动覆盖）</label>
             <button class="btn-mini" @click="onMemoryStyleRefresh" :disabled="memoryStyleLoading">{{ memoryStyleLoading ? '刷新中…' : '刷新' }}</button>
           </div>
           <p class="setting-hint" v-if="memoryStyleLastRefresh" style="margin-top:0">上次刷新：{{ memoryStyleLastRefresh }}</p>
           <p class="setting-hint" v-if="memoryStyleRefreshNote" style="margin-top:0">{{ memoryStyleRefreshNote }}</p>
-          <p class="setting-hint" v-if="memoryStyleEnabled">系统会根据多轮对话自动提炼并填入；你也可以在这里手动修正。每轮默认应用，用户本轮明确要求优先。</p>
-          <p class="setting-hint">“刷新”只会重新读取已保存的全局风格，不会立刻触发新生成。</p>
+          <p class="setting-hint" v-if="memoryStyleEnabled">这里显示的是当前实际生效的回复风格：你可以手动写入并覆盖当前风格；也可能由系统根据后续对话重新生成。每轮默认应用，用户本轮明确要求优先。</p>
+          <p class="setting-hint">“刷新”会重新读取当前生效风格；手动保存后会直接覆盖当前风格，清空后当前不再应用回复风格，直到后续对话生成出新的风格。</p>
           <p class="setting-hint" v-if="!memoryStyleEnabled">全局风格功能已关闭（config: agent.memory.global_style_enabled=false）。</p>
           <textarea
             class="setting-textarea"
             v-model="memoryStyle"
             rows="4"
-            placeholder="自动生成后会显示在这里；也可手动输入，例如：回答风格：简洁明了，先结论后细节，优先要点列表。"
+            placeholder="这里会显示当前生效的回复风格；也可手动输入覆盖，例如：普通问答默认简洁紧凑，避免冗余客套和过多空行；需要展开时可自然展开。"
           ></textarea>
           <div class="setting-actions">
             <button class="btn-pill" @click="saveMemoryStyle" :disabled="memoryStyleSaving || !memoryStyleEnabled || !memoryStyle.trim()">
-              {{ memoryStyleSaving ? '保存中…' : '手动覆盖保存' }}
+              {{ memoryStyleSaving ? '保存中…' : '保存并覆盖当前风格' }}
             </button>
-            <button class="btn-outline" @click="clearMemoryStyle" :disabled="memoryStyleSaving || !memoryStyleEnabled || !memoryStyle.trim()">
-              清除当前风格
+            <button class="btn-outline" @click="openClearMemoryStyleDialog" :disabled="memoryStyleSaving || !memoryStyleEnabled || !memoryStyle.trim()">
+              清空当前风格
             </button>
           </div>
         </div>
@@ -2459,6 +2545,24 @@ createApp({
             <p>{{ uiAlertMessage }}</p>
             <div class="confirm-actions">
               <button class="btn-pill" @click="closeUiAlert()">确定</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="pendingClearMemoryStyle" class="detail-overlay" @click.self="closeClearMemoryStyleDialog()">
+        <div class="detail-modal confirm-modal">
+          <div class="detail-modal-header">
+            <h2>确认清空</h2>
+            <button class="btn-icon" @click="closeClearMemoryStyleDialog()" title="关闭">✕</button>
+          </div>
+          <div class="detail-modal-body">
+            <p>确定清空当前回复风格吗？清空后当前不再应用回复风格，后续可由新对话重新生成。</p>
+            <div class="confirm-actions">
+              <button class="btn-outline" @click="closeClearMemoryStyleDialog()">取消</button>
+              <button class="btn-pill" @click="confirmClearMemoryStyle()" :disabled="memoryStyleSaving">
+                {{ memoryStyleSaving ? '清空中…' : '确定清空' }}
+              </button>
             </div>
           </div>
         </div>
