@@ -169,10 +169,54 @@ async def test_memory_style_rest_api(tmp_path, monkeypatch) -> None:  # noqa: AN
         resp = await client.get("/api/memory/style")
         assert resp.status_code == 200
         assert "简洁明了" in resp.json()["style_directive"]
+        assert resp.json()["source"] == "manual"
 
         resp = await client.delete("/api/memory/style")
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
+
+        resp = await client.get("/api/memory/style")
+        assert resp.status_code == 200
+        assert resp.json()["style_directive"] == ""
+        assert resp.json()["source"] == "cleared"
+
+
+@pytest.mark.asyncio
+async def test_memory_style_rest_api_falls_back_to_l1_profile(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import whaleclaw.gateway.app as app_mod
+    import whaleclaw.sessions.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_DB_PATH", tmp_path / "sessions.db")
+    monkeypatch.setattr(app_mod, "_UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(app_mod, "_CRON_DB_PATH", tmp_path / "cron.db")
+    monkeypatch.setattr(app_mod, "MEMORY_DIR", tmp_path / "memory")
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "memory.json").write_text(
+        (
+            '{"entries":[{"id":"p1","content":"普通问答默认简洁紧凑，避免冗余客套和过多空行；'
+            '制作PPT时图片仅允许裁剪和等比缩放","source":"memory_organizer",'
+            '"tags":["memory_profile","level:L1","curated"],"importance":0.5,'
+            '"created_at":"2026-03-09T00:00:00+00:00","last_accessed":"2026-03-09T00:00:00+00:00",'
+            '"access_count":0,"embedding":null}]}'
+        ),
+        encoding="utf-8",
+    )
+
+    config = WhaleclawConfig()
+    test_app = create_app(config)
+    transport = ASGITransport(app=test_app)  # type: ignore[arg-type]
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        test_app.router.lifespan_context(test_app),
+    ):
+        resp = await client.get("/api/memory/style")
+        assert resp.status_code == 200
+        assert resp.json()["has_style"] is True
+        assert "普通问答默认简洁紧凑" in resp.json()["style_directive"]
+        assert "制作PPT" not in resp.json()["style_directive"]
+        assert resp.json()["source"] == "derived"
 
 
 @pytest.mark.asyncio

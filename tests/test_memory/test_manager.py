@@ -62,6 +62,38 @@ async def test_auto_capture_balanced_style_preference(
     assert ok is True
     recent = await store.list_recent(limit=10)
     assert any("简洁明了" in e.content for e in recent)
+    assert any("memory_kind:profile" in e.tags for e in recent)
+
+
+@pytest.mark.asyncio
+async def test_auto_capture_routes_operational_rule_to_knowledge_memory(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    ok = await manager.auto_capture_user_message(
+        "截图前必须先点亮屏幕，不要黑屏截图",
+        source="session:s1",
+        mode="balanced",
+        cooldown_seconds=0,
+        max_per_hour=100,
+        batch_size=1,
+    )
+    assert ok is True
+    recent = await store.list_recent(limit=10)
+    entry = next(e for e in recent if "memory_kind:knowledge" in e.tags)
+    assert "memory_kind:knowledge" in entry.tags
+
+
+@pytest.mark.asyncio
+async def test_auto_capture_rejects_single_turn_generation_prompt(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    ok = await manager.auto_capture_user_message(
+        "把画面变成宫崎骏风格",
+        source="session:s1",
+        mode="balanced",
+    )
+    assert ok is False
+    assert await store.list_recent(limit=10) == []
 
 
 @pytest.mark.asyncio
@@ -205,6 +237,51 @@ async def test_recall_includes_latest_l1_profile(
 
 
 @pytest.mark.asyncio
+async def test_recall_skips_dirty_transient_raw_entries(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    await store.add(
+        "把画面变成宫崎骏风格",
+        source="session:s1",
+        tags=["auto_capture", "mode:balanced", "batched"],
+    )
+    await store.add(
+        "截图前必须先点亮屏幕",
+        source="session:s1",
+        tags=["auto_capture", "mode:balanced", "batched", "memory_kind:knowledge"],
+    )
+
+    recalled = await manager.recall(
+        "截图",
+        max_tokens=500,
+        include_profile=False,
+        include_raw=True,
+    )
+    assert "点亮屏幕" in recalled
+    assert "宫崎骏风格" not in recalled
+
+
+@pytest.mark.asyncio
+async def test_recall_returns_knowledge_memory_only_for_raw_channel(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    await store.add(
+        "截图前必须先点亮屏幕",
+        source="session:s1",
+        tags=["auto_capture", "mode:balanced", "batched", "memory_kind:knowledge"],
+    )
+    await store.add(
+        "以后回复保持简洁明了",
+        source="session:s1",
+        tags=["auto_capture", "mode:balanced", "batched", "memory_kind:profile"],
+    )
+
+    recalled = await manager.recall_knowledge("截图", max_tokens=500, limit=5)
+    assert "点亮屏幕" in recalled
+    assert "简洁明了" not in recalled
+
+
+@pytest.mark.asyncio
 async def test_build_profile_for_injection_prefers_l1_text_when_within_budget(
     manager: MemoryManager, store: SimpleMemoryStore
 ) -> None:
@@ -220,6 +297,37 @@ async def test_build_profile_for_injection_prefers_l1_text_when_within_budget(
     )
     assert "长期记忆画像" in out
     assert "回答先给结论" in out
+
+
+@pytest.mark.asyncio
+async def test_build_profile_for_injection_can_exclude_style_clauses(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    await store.add(
+        "普通问答默认简洁紧凑，避免冗余客套和过多空行；制作PPT时图片仅允许裁剪和等比缩放",
+        source="memory_organizer",
+        tags=["memory_profile", "level:L1", "curated"],
+    )
+    out = await manager.build_profile_for_injection(
+        max_tokens=1600,
+        exclude_style=True,
+    )
+    assert "制作PPT时图片仅允许裁剪和等比缩放" in out
+    assert "简洁紧凑" not in out
+
+
+@pytest.mark.asyncio
+async def test_get_global_style_directive_falls_back_to_latest_l1_profile(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    await store.add(
+        "普通问答默认简洁紧凑，避免冗余客套和过多空行；制作PPT时图片仅允许裁剪和等比缩放",
+        source="memory_organizer",
+        tags=["memory_profile", "level:L1", "curated"],
+    )
+    style = await manager.get_global_style_directive()
+    assert "普通问答默认简洁紧凑" in style
+    assert "制作PPT" not in style
 
 
 @pytest.mark.asyncio
@@ -242,8 +350,36 @@ async def test_set_and_clear_global_style_directive(
     removed = await manager.clear_global_style_directive()
     assert removed >= 1
     assert await manager.get_global_style_directive() == ""
+    assert await manager.get_global_style_source() == "cleared"
     recent = await store.list_recent(limit=20)
-    assert not any("style:global" in e.tags for e in recent)
+    assert any("style:global" in e.tags for e in recent)
+    assert any("style:disabled" in e.tags for e in recent)
+
+
+@pytest.mark.asyncio
+async def test_clear_global_style_directive_temporarily_hides_derived_style_until_new_style_saved(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    await store.add(
+        "普通问答默认简洁紧凑，避免冗余客套和过多空行；制作PPT时图片仅允许裁剪和等比缩放",
+        source="memory_organizer",
+        tags=["memory_profile", "level:L1", "curated"],
+    )
+    assert await manager.get_global_style_source() == "derived"
+    assert "普通问答默认简洁紧凑" in await manager.get_global_style_directive()
+
+    removed = await manager.clear_global_style_directive()
+    assert removed == 1
+    assert await manager.get_global_style_directive() == ""
+    assert await manager.get_global_style_source() == "cleared"
+
+    changed = await manager.set_global_style_directive(
+        "回答风格：先结论后细节。",
+        source="test",
+    )
+    assert changed is True
+    assert await manager.get_global_style_source() == "manual"
+    assert "先结论后细节" in await manager.get_global_style_directive()
 
 
 @pytest.mark.asyncio
@@ -287,3 +423,55 @@ async def test_upsert_profile_from_capture_appends_rule_to_single_layer(
         if "memory_profile" in e.tags and "level:L1" in e.tags
     )
     assert "PPT 内容页图片尺寸统一" in l1.content
+
+
+@pytest.mark.asyncio
+async def test_memorize_infers_knowledge_kind_for_manual_rule(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    entry = await manager.memorize(
+        "截图前先点亮屏幕，不要黑屏截图",
+        source="manual",
+    )
+    assert "memory_kind:knowledge" in entry.tags
+
+
+@pytest.mark.asyncio
+async def test_organize_if_needed_ignores_transient_raw_entries(
+    manager: MemoryManager, store: SimpleMemoryStore
+) -> None:
+    for txt in (
+        "回答要简洁明了",
+        "以后请直接给结论",
+        "默认使用要点列表",
+    ):
+        await store.add(
+            txt,
+            source="session:s1",
+            tags=["auto_capture", "mode:balanced", "batched"],
+        )
+
+    for txt in (
+        "把画面变成宫崎骏风格",
+        "巨型蜥蜴在破坏城市，末日风格",
+    ):
+        await store.add(
+            txt,
+            source="session:s1",
+            tags=["auto_capture", "mode:balanced", "batched"],
+        )
+
+    router = _FakeRouter()
+    ok = await manager.organize_if_needed(
+        router=router,  # type: ignore[arg-type]
+        model_id="zhipu/glm-4.7-flash",
+        organizer_min_new_entries=3,
+        organizer_interval_seconds=0,
+    )
+    assert ok is True
+    recent = await store.list_recent(limit=20)
+    profile = next(
+        e for e in recent
+        if "memory_profile" in e.tags and "level:L1" in e.tags
+    )
+    assert "简洁明了" in profile.content

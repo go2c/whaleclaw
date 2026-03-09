@@ -302,15 +302,13 @@ class FeishuBot:
             )
 
         if pending_paths and stripped_text and not submitted:
-            metadata[_PENDING_IMAGE_PATHS_KEY] = pending_paths
-            metadata[_PENDING_PROMPT_KEY] = stripped_text
+            buffered = self._load_buffered_images(pending_paths)
+            metadata.pop(_PENDING_IMAGE_PATHS_KEY, None)
+            metadata.pop(_PENDING_PROMPT_KEY, None)
             await self._session_manager.update_metadata(session, metadata)
-            labels = self._format_image_range(1, len(pending_paths))
-            return (
-                f"已记录提示词，当前已暂存{labels}。发送“提交”后开始执行。",
-                None,
-                None,
-            )
+            markdown = self._build_image_markdown(buffered)
+            full_text = f"{stripped_text}\n\n{markdown}" if markdown else stripped_text
+            return (None, full_text, [item.content for item in buffered])
 
         if pending_paths and submitted:
             prompt = stripped_text or pending_prompt

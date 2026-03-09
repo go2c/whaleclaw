@@ -2199,6 +2199,7 @@ async def run_agent(
                     max_tokens=memory_cfg.recall_profile_max_tokens,
                     router=router,
                     model_id=memory_cfg.organizer_model,
+                    exclude_style=bool(style_directive.strip()),
                 )
                 raw_block = ""
                 if include_raw:

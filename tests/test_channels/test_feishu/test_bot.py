@@ -341,6 +341,70 @@ async def test_handle_images_with_prompt_runs_immediately_without_submit(
 
 
 @pytest.mark.asyncio
+async def test_handle_buffered_images_then_prompt_runs_immediately_without_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient()
+    bot = FeishuBot(client, FeishuConfig(dm_policy="open"))
+    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    media_dir = Path("/tmp/whaleclaw-test-feishu-buffer-then-run")
+    captured: dict[str, Any] = {}
+
+    async def _fake_run(
+        text: str,
+        peer_id: str,
+        card_msg_id: str,
+        *,
+        images: list[Any] | None = None,
+    ) -> None:
+        captured["text"] = text
+        captured["peer_id"] = peer_id
+        captured["card_msg_id"] = card_msg_id
+        captured["images"] = images or []
+
+    monkeypatch.setattr("whaleclaw.channels.feishu.bot._FEISHU_MEDIA_DIR", media_dir)
+    monkeypatch.setattr(bot, "_run_agent_and_reply", _fake_run)
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-run-1",
+            "chat_type": "p2p",
+            "message_type": "image",
+            "content": json.dumps({"image_key": "img_key_1"}),
+        },
+    })
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-run-2",
+            "chat_type": "p2p",
+            "message_type": "image",
+            "content": json.dumps({"image_key": "img_key_2"}),
+        },
+    })
+
+    assert "已收到图2" in client.replies[-1][2]
+    assert captured == {}
+
+    await bot.handle_message({
+        "sender": {"sender_id": {"open_id": "ou_xxx"}},
+        "message": {
+            "message_id": "msg-buffer-run-3",
+            "chat_type": "p2p",
+            "message_type": "text",
+            "content": json.dumps({"text": "图2的巨型三花猫正好奇地拨弄着图1的寺庙"}),
+        },
+    })
+
+    assert "收到，处理中" in client.replies[-1][2]
+    assert captured["peer_id"] == "ou_xxx"
+    assert captured["text"].startswith("图2的巨型三花猫正好奇地拨弄着图1的寺庙")
+    assert captured["text"].count("![飞书图片") == 2
+    assert len(captured["images"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_model_command_lists_configured_models() -> None:
     bot = FeishuBot(_StubClient(), FeishuConfig(dm_policy="open"))
     cfg = WhaleclawConfig()

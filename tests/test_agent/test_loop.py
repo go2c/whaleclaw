@@ -1103,6 +1103,7 @@ class _DummyMemoryManager:
         max_tokens: int,  # noqa: ARG002
         router: Any = None,  # noqa: ARG002
         model_id: str = "",  # noqa: ARG002
+        exclude_style: bool = False,  # noqa: ARG002
     ) -> str:
         self.recall_calls += 1
         return "【长期记忆画像】\n用户偏好简洁。"
@@ -1267,6 +1268,63 @@ async def test_run_agent_injects_global_style_directive() -> None:
         m.role == "system" and "全局回复风格偏好" in m.content
         for m in captured_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_excludes_style_lines_from_profile_when_global_style_exists() -> None:
+    captured_messages: list[Any] = []
+
+    class _StyleAwareMemory(_DummyMemoryManager):
+        async def get_global_style_directive(self) -> str:
+            self.style_calls += 1
+            return "普通问答默认简洁紧凑，避免冗余客套和过多空行。"
+
+        async def build_profile_for_injection(  # noqa: PLR0913
+            self,
+            *,
+            max_tokens: int,  # noqa: ARG002
+            router: Any = None,  # noqa: ARG002
+            model_id: str = "",  # noqa: ARG002
+            exclude_style: bool = False,
+        ) -> str:
+            self.recall_calls += 1
+            if exclude_style:
+                return "【长期记忆画像】\n制作PPT时图片仅允许裁剪和等比缩放。"
+            return (
+                "【长期记忆画像】\n普通问答默认简洁紧凑，避免冗余客套和过多空行；"
+                "制作PPT时图片仅允许裁剪和等比缩放。"
+            )
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        captured_messages[:] = messages
+        return AgentResponse(content="ok", model="test-model")
+
+    router = _make_router(chat_fn=fake_chat)
+    memory: Any = _StyleAwareMemory()
+    cfg = WhaleclawConfig()
+    cfg.agent.memory.organizer_background = False
+
+    _ = await run_agent(
+        message="帮我做一份PPT",
+        session_id="test-memory-style-dedupe",
+        config=cfg,
+        router=router,
+        memory_manager=memory,
+    )
+
+    memory_prompt = next(
+        m.content
+        for m in captured_messages
+        if m.role == "system" and "长期记忆召回" in m.content
+    )
+    assert "制作PPT时图片仅允许裁剪和等比缩放" in memory_prompt
+    assert "普通问答默认简洁紧凑" not in memory_prompt
 
 
 @pytest.mark.asyncio

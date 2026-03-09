@@ -43,6 +43,19 @@ def _has_tag(entry: MemoryEntry, prefix_or_tag: str) -> bool:
     return any(t == prefix_or_tag or t.startswith(prefix_or_tag) for t in entry.tags)
 
 
+def _memory_kind(entry: MemoryEntry) -> str:
+    if _has_tag(entry, "memory_kind:profile"):
+        return "profile"
+    if _has_tag(entry, "memory_kind:knowledge"):
+        return "knowledge"
+    content = entry.content.strip()
+    if _is_profile_memory_candidate(content):
+        return "profile"
+    if _is_knowledge_memory_candidate(content):
+        return "knowledge"
+    return "unknown"
+
+
 def _is_profile_entry(entry: MemoryEntry) -> bool:
     return _has_tag(entry, "memory_profile")
 
@@ -51,8 +64,22 @@ def _is_raw_entry(entry: MemoryEntry) -> bool:
     return _has_tag(entry, "auto_capture") or _has_tag(entry, "compact")
 
 
+def _is_profile_raw_entry(entry: MemoryEntry) -> bool:
+    return _is_raw_entry(entry) and _memory_kind(entry) == "profile"
+
+
+def _is_knowledge_entry(entry: MemoryEntry) -> bool:
+    if _is_profile_entry(entry):
+        return False
+    return _memory_kind(entry) == "knowledge"
+
+
 def _is_style_profile_entry(entry: MemoryEntry) -> bool:
     return _is_profile_entry(entry) and _has_tag(entry, "style:global")
+
+
+def _is_style_disabled_entry(entry: MemoryEntry) -> bool:
+    return _is_style_profile_entry(entry) and _has_tag(entry, "style:disabled")
 
 
 def _is_identity_name_entry(entry: MemoryEntry) -> bool:
@@ -132,8 +159,9 @@ def _matches_capture_signal(
 
     if mode == "balanced":
         keys = (
-            "记住", "记得", "偏好", "风格", "语气", "以后", "下次", "默认",
-            "请用", "请按", "请保持", "回答", "回复", "称呼", "叫我",
+            "记住", "记得", "偏好", "语气", "以后", "下次", "默认",
+            "请用", "请按", "请保持", "称呼", "叫我",
+            "必须", "不要", "避免", "严禁", "只能",
             "prefer", "preference", "from now on", "call me", "please answer",
         )
         if any(k in t or k in low for k in keys):
@@ -159,6 +187,137 @@ def _is_force_flush_capture(text: str) -> bool:
     return bool(re.search(r"(回答|回复).*(简洁|简短|直接|要点|明了)", text))
 
 
+def _has_durable_memory_signal(text: str) -> bool:
+    low = text.lower()
+    signals = (
+        "记住", "记得", "以后", "下次", "默认", "长期", "一直", "每次",
+        "偏好", "习惯", "喜欢", "不喜欢", "请按", "请用", "请保持",
+        "回答", "回复", "称呼", "叫我", "我是", "我叫",
+        "from now on", "default", "prefer", "call me",
+    )
+    if any(s in text or s in low for s in signals):
+        return True
+    return _looks_like_rule_statement(text) or bool(
+        re.search(
+            r"(回答|回复).*(简洁|简短|直接|要点|明了|专业|口语|详细)|"
+            r"(以后|下次|默认).*(请|用|按|保持)|"
+            r"(称呼|叫).*(我|助手)",
+            text,
+        )
+    )
+
+
+def _looks_like_rule_statement(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(做|制作).*(PPT|幻灯片).*(时).*(统一|不要|避免|保持|仅|只能|严禁)|"
+            r"(PPT|幻灯片).*(统一|不要|避免|保持|仅|只能|严禁)",
+            text,
+        )
+    )
+
+
+def _looks_like_knowledge_rule(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(截图前|发图前|发送文件|做|制作).*(先|必须|不要|避免|保持|仅|只能|严禁)|"
+            r"(必须|不要|避免|保持|仅|只能|严禁).*(截图|发图|发送文件|PPT|封面|图片)",
+            text,
+        )
+    )
+
+
+def _looks_like_transient_task(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if _looks_like_rule_statement(stripped):
+        return False
+    if _looks_like_knowledge_rule(stripped):
+        return False
+    if "![" in stripped or "/Users/" in stripped or "(用户发送了图片)" in stripped:
+        return True
+    if re.search(r"https?://|[A-Za-z]:\\\\", stripped):
+        return True
+    if stripped.endswith(("?", "？")):
+        return True
+    prompt_like = (
+        r"^(把|将|给我|帮我|来个|生成|画|做|写|改成|换成|优化|打开|发送|删除|搜索|查找|截图|发一张)"
+    )
+    if re.search(prompt_like, stripped):
+        return True
+    if re.search(
+        r"(这张|这次|这个|上次|当前|今天|刚才|现在).*(太|有点|不行|不好|难看|慢)",
+        stripped,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"(图片|照片|视频|音频|封面|发型|背景|裤子|尺寸|风格).*(改|换|变成|生成)",
+            stripped,
+        )
+    )
+
+
+def _is_preference_memory_candidate(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 6:
+        return False
+    if not _has_durable_memory_signal(stripped):
+        return False
+    return not (
+        _looks_like_transient_task(stripped)
+        and "记住" not in stripped
+        and "以后" not in stripped
+    )
+
+
+def _is_profile_memory_candidate(text: str) -> bool:
+    return _is_preference_memory_candidate(text)
+
+
+def _is_knowledge_memory_candidate(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 6:
+        return False
+    if _is_profile_memory_candidate(stripped):
+        return False
+    if _looks_like_transient_task(stripped):
+        return False
+    if stripped.endswith(("?", "？")):
+        return False
+    return _looks_like_knowledge_rule(stripped)
+
+
+def _infer_memory_kind_from_text(text: str) -> str | None:
+    if _is_profile_memory_candidate(text):
+        return "profile"
+    if _is_knowledge_memory_candidate(text):
+        return "knowledge"
+    return None
+
+
+def _should_exclude_from_long_term_memory(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if _looks_like_transient_task(stripped):
+        return not _is_preference_memory_candidate(stripped)
+    if re.search(r"(图发来|发图|截图给我).*(贴|markdown)", stripped):
+        return False
+    return False
+
+
+def _with_memory_kind_tags(content: str, tags: list[str] | None = None) -> list[str]:
+    out = list(tags or [])
+    if any(tag.startswith("memory_kind:") for tag in out):
+        return out
+    kind = _infer_memory_kind_from_text(content)
+    if kind is not None:
+        out.append(f"memory_kind:{kind}")
+    return out
+
+
 def _style_signal_hits(text: str) -> int:
     patterns = (
         r"(回答|回复).*(简洁|简短|直接|要点|明了)",
@@ -166,6 +325,8 @@ def _style_signal_hits(text: str) -> int:
         r"(先结论|先说结论|结论先行)",
         r"(控制在|不超过).*(字|条|段)",
         r"(默认|以后|下次).*(回答|回复|输出)",
+        r"(以后|下次|默认).*(结论|要点|列表|简洁|简短|直接)",
+        r"(别写太长|不要太长)",
     )
     return sum(1 for p in patterns if re.search(p, text))
 
@@ -179,6 +340,42 @@ def _infer_style_from_l0(l0: str) -> str:
     if any(k in txt for k in ("详细", "展开", "全面")):
         return "回答风格：先概览再展开，结构化分点说明，覆盖关键背景与步骤。"
     return ""
+
+
+def _split_profile_clauses(text: str) -> list[str]:
+    parts = re.split(r"[\n；;。]+", text)
+    clauses: list[str] = []
+    for raw in parts:
+        clause = re.sub(r"^\s*[-*•]+\s*", "", raw).strip(" \t\r\n-:：")
+        if clause:
+            clauses.append(clause)
+    return clauses
+
+
+def _is_style_clause(text: str) -> bool:
+    clause = text.strip()
+    if not clause:
+        return False
+    patterns = (
+        r"(回答|回复|回话|输出).*(简洁|简短|直接|紧凑|空行|客套|段落|结论|要点|列表|展开|详细)",
+        r"(不要|避免).*(空行|客套|冗余|废话|建议)",
+        r"(语气|风格).*(专业|严谨|友好|口语|自然)",
+        r"(普通问答|默认).*(简洁|紧凑|展开|详细)",
+        r"(先结论|结论先行|优先要点列表)",
+    )
+    return any(re.search(pattern, clause) for pattern in patterns)
+
+
+def _extract_style_directive_from_profile(text: str) -> str:
+    style_clauses = [clause for clause in _split_profile_clauses(text) if _is_style_clause(clause)]
+    if not style_clauses:
+        return ""
+    return "；".join(dict.fromkeys(style_clauses))
+
+
+def _remove_style_clauses_from_profile(text: str) -> str:
+    kept = [clause for clause in _split_profile_clauses(text) if not _is_style_clause(clause)]
+    return "；".join(dict.fromkeys(kept))
 
 
 class MemoryManager:
@@ -247,8 +444,16 @@ class MemoryManager:
             for r in ranked:
                 if len(parts) >= limit + (1 if include_profile else 0):
                     break
+                kind = _memory_kind(r.entry)
+                if include_profile:
+                    if kind not in {"profile", "knowledge"}:
+                        continue
+                elif not _is_knowledge_entry(r.entry):
+                    continue
                 content = r.entry.content.strip()
                 if _is_low_signal_text(content):
+                    continue
+                if _should_exclude_from_long_term_memory(content):
                     continue
                 txt = f"- {content}"
                 need = _est_tokens(txt)
@@ -264,6 +469,7 @@ class MemoryManager:
         max_tokens: int,
         router: ModelRouter | None = None,
         model_id: str = "",
+        exclude_style: bool = False,
     ) -> str:
         """Build profile injection text from latest L1, compressing by LLM if needed."""
         recent = await self._store.list_recent(limit=300)
@@ -277,7 +483,11 @@ class MemoryManager:
         )
         blocks: list[str] = []
         if latest_l1 and latest_l1.content.strip():
-            blocks.append(f"【长期记忆画像】\n{latest_l1.content.strip()}")
+            content = latest_l1.content.strip()
+            if exclude_style:
+                content = _remove_style_clauses_from_profile(content)
+            if content:
+                blocks.append(f"【长期记忆画像】\n{content}")
         if not blocks:
             return ""
 
@@ -318,6 +528,20 @@ class MemoryManager:
 
         # Fallback: physical truncation.
         return _truncate_to_tokens(profile_text, max_tokens)
+
+    async def recall_knowledge(
+        self,
+        query: str,
+        max_tokens: int = 500,
+        limit: int = 10,
+    ) -> str:
+        return await self.recall(
+            query,
+            max_tokens=max_tokens,
+            limit=limit,
+            include_profile=False,
+            include_raw=True,
+        )
 
     @staticmethod
     def _profile_cache_key(
@@ -386,6 +610,8 @@ class MemoryManager:
         text = content.strip()
         if len(text) < 6:
             return False
+        if not _is_preference_memory_candidate(text):
+            return False
 
         sys_prompt = (
             "你是长期画像规则分类器。"
@@ -410,7 +636,7 @@ class MemoryManager:
             return False
         accept = bool(obj.get("accept", False))
         rule = str(obj.get("rule", "")).strip()
-        if not accept or not rule:
+        if not accept or not rule or not _is_preference_memory_candidate(rule):
             return False
 
         recent = await self._store.list_recent(limit=300)
@@ -440,13 +666,15 @@ class MemoryManager:
     async def memorize(
         self, content: str, source: str, tags: list[str] | None = None
     ) -> MemoryEntry:
-        return await self._store.add(content, source, tags or [])
+        return await self._store.add(content, source, _with_memory_kind_tags(content, tags))
 
     async def compact(self, messages: list[dict[str, str]], source: str) -> str:
         summary = await self._summarizer.summarize(messages)
         facts = await self._summarizer.extract_facts(messages)
         for fact in facts:
-            await self._store.add(fact, source, tags=["compact"])
+            tags = _with_memory_kind_tags(fact, ["compact"])
+            if any(tag.startswith("memory_kind:") for tag in tags):
+                await self._store.add(fact, source, tags=tags)
         return summary
 
     async def auto_capture_user_message(
@@ -467,6 +695,9 @@ class MemoryManager:
         if text.startswith(("/", "{", "[")):
             return False
         if not _matches_capture_signal(text, mode):
+            return False
+        kind = _infer_memory_kind_from_text(text)
+        if kind is None:
             return False
 
         now = datetime.now(UTC)
@@ -500,6 +731,9 @@ class MemoryManager:
         pending = 0
         seen_new: set[str] = set()
         for fact in candidates:
+            fact_kind = _infer_memory_kind_from_text(fact)
+            if fact_kind is None or fact_kind != kind:
+                continue
             norm = _normalize_text(fact)
             if not norm or norm in seen_new:
                 continue
@@ -561,7 +795,10 @@ class MemoryManager:
                 await self._store.add(
                     item,
                     source=src,
-                    tags=["auto_capture", f"mode:{mode}", "batched"],
+                    tags=_with_memory_kind_tags(
+                        item,
+                        ["auto_capture", f"mode:{mode}", "batched"],
+                    ),
                 )
                 written += 1
             self._pending_by_source[src].clear()
@@ -596,13 +833,22 @@ class MemoryManager:
             if elapsed < max(0, organizer_interval_seconds):
                 return False
 
-        raw_entries = [e for e in recent if _is_raw_entry(e)]
+        raw_entries = [e for e in recent if _is_profile_raw_entry(e)]
         if latest_profile is not None:
             raw_entries = [e for e in raw_entries if e.created_at > latest_profile.created_at]
         if len(raw_entries) < max(1, organizer_min_new_entries):
             return False
 
-        raw_entries = sorted(raw_entries, key=lambda x: x.created_at)[-organizer_max_raw_window:]
+        filtered_raw_entries = [
+            e for e in raw_entries if not _should_exclude_from_long_term_memory(e.content)
+        ]
+        if len(filtered_raw_entries) < max(1, organizer_min_new_entries):
+            return False
+
+        raw_entries = sorted(
+            filtered_raw_entries,
+            key=lambda x: x.created_at,
+        )[-organizer_max_raw_window:]
         old_l1 = latest_profile.content if latest_profile is not None else ""
         raw_text = "\n".join(f"- {e.content}" for e in raw_entries)
 
@@ -660,9 +906,40 @@ class MemoryManager:
     async def get_global_style_directive(self) -> str:
         recent = await self._store.list_recent(limit=200)
         style = next((e for e in recent if _is_style_profile_entry(e)), None)
-        if style is None:
+        if style is not None:
+            if _is_style_disabled_entry(style):
+                return ""
+            return style.content.strip()
+        latest_l1 = next(
+            (
+                e
+                for e in recent
+                if _is_profile_entry(e) and any(t == "level:L1" for t in e.tags)
+            ),
+            None,
+        )
+        if latest_l1 is None:
             return ""
-        return style.content.strip()
+        return _extract_style_directive_from_profile(latest_l1.content)
+
+    async def get_global_style_source(self) -> str:
+        recent = await self._store.list_recent(limit=200)
+        style = next((e for e in recent if _is_style_profile_entry(e)), None)
+        if style is not None:
+            if _is_style_disabled_entry(style):
+                return "cleared"
+            return "manual" if _has_tag(style, "manual_override") else "saved"
+        latest_l1 = next(
+            (
+                e
+                for e in recent
+                if _is_profile_entry(e) and any(t == "level:L1" for t in e.tags)
+            ),
+            None,
+        )
+        if latest_l1 is None:
+            return "none"
+        return "derived" if _extract_style_directive_from_profile(latest_l1.content) else "none"
 
     async def set_global_style_directive(
         self,
@@ -681,18 +958,21 @@ class MemoryManager:
             source=source,
             tags=["memory_profile", "style:global", "curated", "manual_override"],
         )
-        await self._prune_style_profiles(keep_versions=5)
+        await self._prune_style_profiles(keep_versions=1)
         return True
 
     async def clear_global_style_directive(self) -> int:
-        entries = await self._store.list_recent(limit=500)
-        styles = [e for e in entries if _is_style_profile_entry(e)]
-        removed = 0
-        for entry in styles:
-            ok = await self._store.delete(entry.id)
-            if ok:
-                removed += 1
-        return removed
+        current_source = await self.get_global_style_source()
+        current_directive = await self.get_global_style_directive()
+        if current_source == "cleared":
+            return 0
+        await self._store.add(
+            "",
+            source="manual",
+            tags=["memory_profile", "style:global", "style:disabled", "curated", "manual_override"],
+        )
+        await self._prune_style_profiles(keep_versions=1)
+        return 1 if current_directive or current_source == "derived" else 0
 
     async def get_assistant_name(self) -> str:
         entries = await self._store.list_recent(limit=200)

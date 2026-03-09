@@ -117,18 +117,22 @@ async def test_build_window_messages_schedules_background_generation(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_recent_over_budget_downgrades_2_and_3_to_l0(tmp_path) -> None:  # noqa: ANN001
+async def test_recent_over_budget_keeps_latest_two_raw_and_downgrades_3_to_5_to_l0(
+    tmp_path,
+) -> None:  # noqa: ANN001
     store = await _mk_store(tmp_path)
     try:
         compressor = SessionGroupCompressor(store)
         groups = [
             _mk_group(1, "旧历史"),
-            _mk_group(2, "最近第3组 " + ("超长内容 " * 600)),
-            _mk_group(3, "最近第2组 " + ("超长内容 " * 600)),
-            _mk_group(4, "最近第1组 " + ("超长内容 " * 600)),
+            _mk_group(2, "最近第5组 " + ("超长内容 " * 600)),
+            _mk_group(3, "最近第4组 " + ("超长内容 " * 600)),
+            _mk_group(4, "最近第3组 " + ("超长内容 " * 600)),
+            _mk_group(5, "最近第2组 " + ("超长内容 " * 600)),
+            _mk_group(6, "最近第1组 " + ("超长内容 " * 600)),
         ]
         plan = compressor._window_plan(_flatten(groups))  # noqa: SLF001
-        assert [x.level for x in plan][-3:] == ["L0", "L0", "L2"]
+        assert [x.level for x in plan][-5:] == ["L0", "L0", "L0", "L2", "L2"]
     finally:
         await store.close()
 
@@ -178,7 +182,92 @@ async def test_build_window_messages_outputs_structured_blocks(tmp_path) -> None
         assert "【历史摘要" in text
         assert "【最近对话原文" in text
         assert "【当前任务状态】" in text
-        assert output[-1].role == "user"
-        assert "当前轮用户请求" in output[-1].content
+        block_titles = [m.content.splitlines()[0] for m in output]
+        assert block_titles == [
+            "【最近对话原文（最近5轮）】",
+            "【当前任务状态】",
+            "【历史摘要（第1~1轮）】",
+        ]
+        recent_block = next(m.content for m in output if "【最近对话原文" in m.content)
+        assert "第6轮:" in recent_block
+        assert "当前轮用户请求" in recent_block
+        assert not any(m.role == "user" and "当前轮用户请求" in m.content for m in output)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_window_messages_keeps_current_plus_previous_four_raw_groups(
+    tmp_path,
+) -> None:  # noqa: ANN001
+    store = await _mk_store(tmp_path)
+    try:
+        compressor = SessionGroupCompressor(store)
+        now = datetime.now(UTC).isoformat()
+        await store.save_session(
+            session_id="s3",
+            channel="webchat",
+            peer_id="u3",
+            model="qwen/qwen3.5-plus",
+            created_at=now,
+            updated_at=now,
+        )
+        groups = [_mk_group(i, "历史消息") for i in range(1, 8)]
+        groups.append([Message(role="user", content="u8:当前轮用户请求")])
+        output = await compressor.build_window_messages(
+            session_id="s3",
+            messages=_flatten(groups),
+            router=_NoopRouter(),  # type: ignore[arg-type]
+            model_id="",
+        )
+
+        recent_block = next(m.content for m in output if "【最近对话原文" in m.content)
+        history_block = next(m.content for m in output if "【历史摘要" in m.content)
+        assert recent_block.find("第8轮:") < recent_block.find("第7轮:")
+        assert history_block.find("第3轮:") < history_block.find("第2轮:")
+        for i in range(4, 8):
+            assert f"u{i}:历史消息" in recent_block
+        assert "u8:当前轮用户请求" in recent_block
+        assert "u3:历史消息" not in recent_block
+        assert not any(m.role == "user" and "u8:当前轮用户请求" in m.content for m in output)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_task_status_block_includes_current_progress_and_next_step(tmp_path) -> None:  # noqa: ANN001
+    store = await _mk_store(tmp_path)
+    try:
+        compressor = SessionGroupCompressor(store)
+        now = datetime.now(UTC).isoformat()
+        await store.save_session(
+            session_id="s4",
+            channel="webchat",
+            peer_id="u4",
+            model="qwen/qwen3.5-plus",
+            created_at=now,
+            updated_at=now,
+        )
+        groups = [_mk_group(i, "历史消息") for i in range(1, 5)]
+        groups.append(
+            [
+                Message(role="user", content="u5:帮我导出最终文件"),
+                Message(role="assistant", content="已定位到目标目录"),
+                Message(role="tool", content="导出成功：/tmp/demo.pptx"),
+            ]
+        )
+        output = await compressor.build_window_messages(
+            session_id="s4",
+            messages=_flatten(groups),
+            router=_NoopRouter(),  # type: ignore[arg-type]
+            model_id="",
+        )
+
+        status_block = next(m.content for m in output if "【当前任务状态】" in m.content)
+        assert "待处理用户请求：u5:帮我导出最终文件" in status_block
+        assert "本轮已知进展：" in status_block
+        assert "- 本轮输出：已定位到目标目录" in status_block
+        assert "- 工具结果：导出成功：/tmp/demo.pptx" in status_block
+        assert "下一步：基于以上本轮进展继续完成当前请求" in status_block
     finally:
         await store.close()

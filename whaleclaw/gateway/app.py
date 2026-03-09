@@ -1305,11 +1305,13 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     async def _api_get_memory_style() -> JSONResponse:
         mgr = _memory_manager()
         style = await mgr.get_global_style_directive()
+        source = await mgr.get_global_style_source()
         return JSONResponse(
             {
                 "enabled": config.agent.memory.global_style_enabled,
                 "style_directive": style,
                 "has_style": bool(style.strip()),
+                "source": source,
             }
         )
 
